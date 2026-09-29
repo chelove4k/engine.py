@@ -125,6 +125,8 @@ class Game(arcade.Window):
         })
 
     def check_queue(self):
+        max_commands = 100
+        processed = 0
         while True:
             try:
                 data = self.render_in_stream.get_nowait()
@@ -132,6 +134,7 @@ class Game(arcade.Window):
                 break
             except (EOFError, BrokenPipeError, OSError):
                 return
+            processed += 1
 
             if data == 'rshow':
                 print(self._sprites_by_render_id)

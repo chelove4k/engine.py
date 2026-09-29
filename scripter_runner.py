@@ -15,13 +15,22 @@ class scripter_runner:
         print(prefix, *args, **kwargs)
 
     def get_script_diff(self, path):
+    
+        if path in self._script_complexity_cache:
+            return self._script_complexity_cache[path]
+
         source_code = open(path).read()
-        visitor = ComplexityVisitor.from_code(source_code)
+
+        visitor = ComplexityVisitor.from_code(
+            source_code
+        )
 
         sum_index = 0
+
         for block in visitor.blocks:
-            score = block.complexity 
-            sum_index += score
+            sum_index += block.complexity
+
+        self._script_complexity_cache[path] = sum_index
 
         return sum_index
 
@@ -46,17 +55,21 @@ class scripter_runner:
         self.core_time = Time
         self.id = id
 
+        self._script_complexity_cache = {}
+
         proccess_status_info[id] = 0
 
         while True:
             if procces_in_stream.qsize() > 0:
+                status_info = [*proccess_status_info]
 
-                if min(proccess_status_info) != proccess_status_info[id]:
+
+                if min(status_info) != status_info[id]:
                     continue
 
-                if proccess_status_info.count(min(proccess_status_info)) > 1:
-                    for i in range(len(proccess_status_info)):
-                        if proccess_status_info[i] == min(proccess_status_info):
+                if status_info.count(min(status_info)) > 1:
+                    for i in range(len(status_info)):
+                        if status_info[i] == min(status_info):
                             if i != id:
                                 continue
 

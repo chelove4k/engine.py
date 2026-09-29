@@ -29,7 +29,7 @@
 },
 {
 "scripting": {
-    "scripts" : ["access\\scripts\\camera.py"],
+    "scripts" : [],
     "network": []
     }
 }

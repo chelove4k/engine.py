@@ -151,8 +151,12 @@ class Stream:
         self.print(f"Процесс {process_count} запущен")
 
     def __init_scene_objects(self, path: Path):
-        with path.open(encoding="utf-8") as scene_file:
-            yield from json.load(scene_file)
+        self.print('Инициализация обьектов...')
+        for i in range(100):
+            for data in json.load(path.open(encoding="utf-8")):
+
+                GameObject(data).register()
+        self.print('Все обьекты инициализированы')
 
     def __check_camera_queue(self):
         while True:
@@ -227,18 +231,25 @@ class Stream:
         self._next_render_id = 0
 
         cpu_count = os.cpu_count() or 1
-        worker_count = max(1, min(5, cpu_count - 1))
+        proccess_count = cpu_count
+        worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 
         threading.Thread(target=self.__check_queue, daemon=True).start()
         threading.Thread(target=self.__check_camera_queue, daemon=True).start()
 
-        scene_path = Path(__file__).parent / "access" / "scenes" / "scene1.json"
-        for i in range(1000):
-            for data in self.__init_scene_objects(scene_path):
-                self.print(self.proccess_status_info)
 
-                GameObject(data).register()
+        GameObject(
+            {
+            "scripting": {
+                "scripts" : ["access\\scripts\\camera.py"],
+                "network": []
+                }
+            }
+        ).register()
+
+        scene_path = Path(__file__).parent / "access" / "scenes" / "scene1.json"
+        self.__init_scene_objects(scene_path)
 
         while True:
             # self.print(Time)
