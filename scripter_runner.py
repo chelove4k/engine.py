@@ -5,6 +5,8 @@ import stream
 import traceback
 import pyengine
 from radon.visitors import ComplexityVisitor
+import queue
+import time
 
 
 class scripter_runner:
@@ -38,6 +40,9 @@ class scripter_runner:
         diff = self.get_script_diff(data['path'])
         self.print(f"Запущен {data['path']}")
 
+        with lock:
+            proccess_status_info[id] += diff
+
         try:
             func(*arg)
 
@@ -60,10 +65,9 @@ class scripter_runner:
         proccess_status_info[id] = 0
 
         while True:
-            if procces_in_stream.qsize() > 0:
+                time.sleep(1/120)
                 status_info = [*proccess_status_info]
-
-
+                
                 if min(status_info) != status_info[id]:
                     continue
 
@@ -74,11 +78,11 @@ class scripter_runner:
                                 continue
 
                 try:
-                    data = procces_in_stream.get()
+                    data = procces_in_stream.get_nowait()
+                except queue.Empty:
+                    continue
 
-                    with lock:
-                        proccess_status_info[id] += self.get_script_diff(data['path'])
-
+                try:
                     module = data['path'].replace('.py', '').replace('\\', '.').replace('/', '.')
                     name = module.split('.')[-1]
                     obj_data = objects_cache[list(objects_cache.keys())[int(data['obj_id'])]]['dict_data']

@@ -59,7 +59,6 @@ class Stream:
     def __register(self, data):
         id = data["id"]
         object = data["obj"]
-
         with self.lock:
             object_id = self._next_object_id
             render_id = self._next_render_id
@@ -149,7 +148,7 @@ class Stream:
             )
             worker.start()
             workers.append(worker)
-        self.print(f"Процесс {process_count} запущен")
+        self.print(f"Процесы в колличестве {process_count} запущены")
 
     def __init_scene_objects(self, path: Path):
         self.print('Инициализация обьектов...')
@@ -232,7 +231,7 @@ class Stream:
         self._next_render_id = 0
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = 3
+        proccess_count = 5
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

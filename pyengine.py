@@ -350,7 +350,7 @@ class GameObject:
     def register(self):
         if self._main_in_stream is None or self._main_out_stream is None:
             raise "Отсутствует подключение GameObject с Stream"
-
+        
         self._main_in_stream.put({
             "command": "register",
             "obj": self.__cache_record(),

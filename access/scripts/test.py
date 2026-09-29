@@ -14,8 +14,6 @@ class test(script):
         self.GameObject.ahsfdlaslfdasdssssssssssssssssssssjlkj = 123
 
     def fixed_update(self):
-        self.GameObject.Visual.position = self.GameObject.Visual.position + Vector2(2, 2)
-        return
         if self.GameObject.Visual.position.x > 300 or self.GameObject.Visual.position.x < -100:
             self.k *= -1
 
