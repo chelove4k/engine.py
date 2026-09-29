@@ -71,6 +71,7 @@ class Stream:
             object["_render_id"] = render_id
             object["_is_render"] = False
             object["_is_changed"] = False
+            object["changes"] = []
             object["dict_data"].update({
                 "object_id": object_id,
                 "render_id": render_id,
@@ -231,7 +232,7 @@ class Stream:
         self._next_render_id = 0
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = cpu_count
+        proccess_count = 3
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

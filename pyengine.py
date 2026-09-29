@@ -209,20 +209,9 @@ class GameObject:
                 if entry.get("_visual") is not None:
                     entry["_visual"][name] = copy.deepcopy(value)
                     entry["_is_changed"] = True
-
-                render_id = entry.get("_render_id")
-                is_rendered = entry.get("_is_render", False)
-
-                visual = copy.deepcopy(entry.get("_visual"))
-
+                    if name not in entry["changes"]:
+                        entry["changes"].append(name)
                 objects_cache[id] = entry
-
-            if is_rendered and render_id is not None and visual:
-                self._[0].put({
-                    "command": "update",
-                    "render_id": render_id,
-                    **visual,
-                })
 
 
     class __Identity(ClassTools):

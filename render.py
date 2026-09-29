@@ -67,6 +67,7 @@ class Game(arcade.Window):
 
         self.render_in_stream = queues[0]
         self.main_in_stream = queues[1]
+        self.object_cache = queues[2]
 
         self.camera = Camera(
             width=self.width,
@@ -155,21 +156,13 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-                case 'update':
-                    self._waiting_updates[data['render_id']] = data
-
                 case 'camera_update':
                     self._update_camera(data)
 
-        for render_id, update in list(self._waiting_updates.items()):
+        for _, object in self.object_cache.items():
 
-            sprite = self._sprites_by_render_id.get(render_id)
-            if sprite is None:
-                continue
-
-            self._apply_update(sprite, update)
-
-            del self._waiting_updates[render_id]
+            if object["_is_changed"]:
+                self._apply_update(self._sprites_by_render_id[object["_render_id"]], object)
 
     def _update_camera(self, data):
         changed = False
@@ -250,17 +243,16 @@ class Game(arcade.Window):
         self._world_data_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
 
-    def _apply_update(self, sprite, update):
+    def _apply_update(self, sprite, object):
 
-        render_id = update['render_id']
-
+        render_id = object["_render_id"]
         world_data = self._world_data_by_render_id.get(render_id)
 
         if world_data is None:
             return
 
-        if 'sprite' in update:
-            path = update['sprite']
+        if 'sprite' in object['changes']:
+            path = object['_visual']['sprite']
             texture = self._textures.get(path)
 
             if texture is None:
@@ -269,18 +261,19 @@ class Game(arcade.Window):
 
             sprite.texture = texture
 
-        if 'position' in update:
-            position = update['position']
+        if 'position' in object['changes']:
+            position = object['_visual']['position']
             world_data['position'] = position.x, position.y
 
-        if 'scale' in update:
-            world_data['scale'] = update['scale']
+        if 'scale' in object['changes']:
+            world_data['scale'] = object['_visual']['scale']
 
-        if 'rotation' in update:
-            world_data['rotation'] = update['rotation']
+        if 'rotation' in object['changes']:
+            world_data['rotation'] = object['_visual']['rotation']
 
-        if 'alpha' in update:
-            world_data['alpha'] = update['alpha']
+        if 'alpha' in object['changes']:
+            world_data['alpha'] = object['_visual']['alpha']
+        object['_is_changed'] = False
 
         self._apply_world_transform(sprite, world_data)
 
@@ -414,7 +407,7 @@ def main():
     ).start()
 
     try:
-        Game([render_in_stream, main_in_stream], Time, width=400, height=400)
+        Game([render_in_stream, main_in_stream, objects_cache], Time, width=400, height=400)
         arcade.run()
 
     finally:
