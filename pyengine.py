@@ -442,3 +442,4 @@ class script:
             if last_time != self.GlobalTime:
                 self.fixed_update()
                 last_time = self.GlobalTime
+        time.sleep(1/120)
