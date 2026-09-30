@@ -162,7 +162,12 @@ class Game(arcade.Window):
         for _, object in self.object_cache.items():
 
             if object["_is_changed"]:
-                self._apply_update(self._sprites_by_render_id[object["_render_id"]], object)
+
+                sprite = self._sprites_by_render_id.get(object["_render_id"])
+
+                if sprite is None:
+                    continue
+                self._apply_update(sprite, object)
 
     def _update_camera(self, data):
         changed = False

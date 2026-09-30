@@ -65,24 +65,27 @@ class scripter_runner:
         proccess_status_info[id] = 0
 
         while True:
-                time.sleep(1/120)
+                data = None
+                time.sleep(1/10)
                 status_info = [*proccess_status_info]
                 
-                if min(status_info) != status_info[id]:
+                minimum = min(status_info)
+
+                if status_info[id] != minimum:
                     continue
 
-                if status_info.count(min(status_info)) > 1:
-                    for i in range(len(status_info)):
-                        if status_info[i] == min(status_info):
-                            if i != id:
-                                continue
+                for i in range(id):
+                    if status_info[i] == minimum:
+                        break
+                else:
+                    try:
+                        data = procces_in_stream.get_nowait()
+                    except Exception as e:
+                        continue
 
                 try:
-                    data = procces_in_stream.get_nowait()
-                except queue.Empty:
-                    continue
-
-                try:
+                    if data == None:
+                        continue
                     module = data['path'].replace('.py', '').replace('\\', '.').replace('/', '.')
                     name = module.split('.')[-1]
                     obj_data = objects_cache[list(objects_cache.keys())[int(data['obj_id'])]]['dict_data']

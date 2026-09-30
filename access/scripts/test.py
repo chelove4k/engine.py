@@ -11,7 +11,6 @@ class test(script):
         self.start_pos = (self.GameObject.Visual.position.x, self.GameObject.Visual.position.y-100)
 
         self.k = 1
-        self.GameObject.ahsfdlaslfdasdssssssssssssssssssssjlkj = 123
 
     def fixed_update(self):
         if self.GameObject.Visual.position.x > 300 or self.GameObject.Visual.position.x < -100:

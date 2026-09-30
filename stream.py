@@ -152,8 +152,7 @@ class Stream:
 
     def __init_scene_objects(self, path: Path):
         self.print('Инициализация обьектов...')
-        for i in range(100):
-            for data in json.load(path.open(encoding="utf-8")):
+        for data in json.load(path.open(encoding="utf-8")):
 
                 GameObject(data).register()
         self.print('Все обьекты инициализированы')
