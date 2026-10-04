@@ -12,6 +12,8 @@ import traceback
 from pyengine import GameObject
 import scripter_runner
 
+from radon.visitors import ComplexityVisitor
+
 
 class Stream:
     def print(self, *args):
@@ -81,7 +83,19 @@ class Stream:
         self.main_out_stream.put({id: (object_id, render_id)})
 
     def __add_script(self, data):
+        diff = self.get_script_diff(data['path'])
+        status_info = [*self.proccess_status_info]
+
+        minimum = min(status_info)
+        id = 0
+        for i in range(len(status_info)):
+            if status_info[i] == minimum:
+                id = i
+                break
+
+        self.proccess_status_info[id] += diff
         self.procces_in_stream.put({
+            'proc_id' : id,
             "path": data["path"],
             "id": data["id"],
             "obj_id" : data["obj_id"],
@@ -157,6 +171,26 @@ class Stream:
                 GameObject(data).register()
         self.print('Все обьекты инициализированы')
 
+    def get_script_diff(self, path):
+        
+            if path in self._script_complexity_cache:
+                return self._script_complexity_cache[path]
+
+            source_code = open(path).read()
+
+            visitor = ComplexityVisitor.from_code(
+                source_code
+            )
+
+            sum_index = 0
+
+            for block in visitor.blocks:
+                sum_index += block.complexity
+
+            self._script_complexity_cache[path] = sum_index
+
+            return sum_index
+    
     def __init__(
         self,
         Time,
@@ -192,6 +226,8 @@ class Stream:
 
         self._next_object_id = 0
         self._next_render_id = 0
+
+        self._script_complexity_cache = {}
 
         cpu_count = os.cpu_count() or 1
         proccess_count = 5

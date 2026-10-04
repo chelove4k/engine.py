@@ -37,11 +37,7 @@ class scripter_runner:
         return sum_index
 
     def wrapper(self, func, arg, proccess_status_info, id, data, lock):
-        diff = self.get_script_diff(data['path'])
         self.print(f"Запущен {data['path']}")
-
-        with lock:
-            proccess_status_info[id] += diff
 
         try:
             func(*arg)
@@ -51,7 +47,7 @@ class scripter_runner:
 
         finally:
             with lock:
-                proccess_status_info[id] -= diff
+                proccess_status_info[id] -= self.get_script_diff(data['path'])
         
             self.print(f"Остановлен {data['path']}")
 
@@ -65,23 +61,15 @@ class scripter_runner:
         proccess_status_info[id] = 0
 
         while True:
-                data = None
                 time.sleep(1/10)
-                status_info = [*proccess_status_info]
-                
-                minimum = min(status_info)
-
-                if status_info[id] != minimum:
+                try:
+                    data = procces_in_stream.get_nowait()
+                except Exception as e:
                     continue
-
-                for i in range(id):
-                    if status_info[i] == minimum:
-                        break
-                else:
-                    try:
-                        data = procces_in_stream.get_nowait()
-                    except Exception as e:
-                        continue
+                if data['proc_id'] != id:
+                    procces_in_stream.put(data)
+                    time.sleep(1/10)
+                    continue
 
                 try:
                     if data == None:

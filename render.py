@@ -232,11 +232,6 @@ class Game(arcade.Window):
         sprite.angle = world_data['rotation']
         sprite.alpha = int(world_data['alpha'] * 255)
 
-    def on_resize(self, width, height):
-
-        super().on_resize(width, height)
-        self._update_all_screen_positions()
-
     def on_draw(self):
 
         self.clear()
