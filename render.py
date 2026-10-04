@@ -52,7 +52,7 @@ class Game(arcade.Window):
     def print(self, *args):
         print(f"[RENDER  : {self.Time.value:.4f}]", *args, flush=True)
 
-    def __init__(self, queues, Time, width=1280, height=720, title='Arcade Window'):
+    def __init__(self, data, Time, width=1280, height=720, title='Arcade Window'):
         super().__init__(
             width,
             height,
@@ -65,9 +65,10 @@ class Game(arcade.Window):
         self.start = time.time()
         self.Time = Time
 
-        self.render_in_stream = queues[0]
-        self.main_in_stream = queues[1]
-        self.object_cache = queues[2]
+        self.render_in_stream = data[0]
+        self.main_in_stream = data[1]
+        self.object_cache = data[2]
+        self.camera_in_stream = data[3]
 
         self.camera = Camera(
             width=self.width,
@@ -98,7 +99,8 @@ class Game(arcade.Window):
 
         self.fps_text.y = self.height - 25
 
-        self.check_queue()
+        self._camera_queue()
+        self._render_queue()
 
     def on_key_press(self, key, modifiers):
         try:
@@ -125,9 +127,7 @@ class Game(arcade.Window):
             'key': key_name
         })
 
-    def check_queue(self):
-        max_commands = 100
-        processed = 0
+    def _render_queue(self):
         while True:
             try:
                 data = self.render_in_stream.get_nowait()
@@ -135,8 +135,7 @@ class Game(arcade.Window):
                 break
             except (EOFError, BrokenPipeError, OSError):
                 return
-            processed += 1
-
+ 
             if data == 'rshow':
                 print(self._sprites_by_render_id)
                 continue
@@ -156,9 +155,6 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-                case 'camera_update':
-                    self._update_camera(data)
-
         for _, object in self.object_cache.items():
 
             if object["_is_changed"]:
@@ -169,17 +165,18 @@ class Game(arcade.Window):
                     continue
                 self._apply_update(sprite, object)
 
-    def _update_camera(self, data):
-        changed = False
+    def _camera_queue(self):
+        while True:
+            try:
+                data = self.camera_in_stream.get_nowait()
+            except queue.Empty:
+                break
+            except (EOFError, BrokenPipeError, OSError):
+                return
+            changed = False
 
-        if 'position' in data:
-            position = data['position']
+            self.print(data)
 
-            if isinstance(position, (list, tuple)):
-                self.camera.set_position(position[0], position[1])
-
-                changed = True
-        else:
             if 'x' in data:
                 self.camera.x = data['x']
                 changed = True
@@ -188,12 +185,12 @@ class Game(arcade.Window):
                 self.camera.y = data['y']
                 changed = True
 
-        if 'zoom' in data:
-            self.camera.set_zoom(data['zoom'])
-            changed = True
+            if 'zoom' in data:
+                self.camera.set_zoom(data['zoom'])
+                changed = True
 
-        if changed:
-            self._update_all_screen_positions()
+            if changed:
+                self._update_all_screen_positions()
 
     def _update_all_screen_positions(self):
 
@@ -412,7 +409,7 @@ def main():
     ).start()
 
     try:
-        Game([render_in_stream, main_in_stream, objects_cache], Time, width=400, height=400)
+        Game([render_in_stream, main_in_stream, objects_cache, camera_queue], Time, width=400, height=400)
         arcade.run()
 
     finally:

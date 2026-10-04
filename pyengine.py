@@ -87,23 +87,18 @@ class _Camera:
         elif isinstance(movement, (list, tuple)):
 
             if len(movement) != 2:
-                raise ValueError(
-                    "Перемещение камеры должно содержать 2 значения"
-                )
+                raise ValueError("Перемещение камеры должно содержать 2 значения")
             dx = movement[0]
             dy = movement[1]
         else:
-            raise TypeError(
-                f"Недопустимое перемещение камеры: {movement!r}"
-            )
+            raise TypeError(f"Недопустимое перемещение камеры: {movement!r}")
 
         self.position = self.position + Vector2(dx, dy)
         
         if self._camera_queue is None:
             return
-
+        
         self._camera_queue.put({
-            "command": "camera_move",
             "x": dx,
             "y": dy,
         })
@@ -350,7 +345,7 @@ class GameObject:
     def register(self):
         if self._main_in_stream is None or self._main_out_stream is None:
             raise "Отсутствует подключение GameObject с Stream"
-        
+
         self._main_in_stream.put({
             "command": "register",
             "obj": self.__cache_record(),
