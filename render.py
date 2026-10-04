@@ -12,42 +12,6 @@ import console
 import stream
 
 
-class Camera:
-    def __init__(self, width: int, height: int):
-        self.x = 0.0
-        self.y = 0.0
-
-        self.zoom = 1.0
-
-        self.width = width
-        self.height = height
-
-    @property
-    def screen_center_x(self):
-        return self.width / 2
-
-    @property
-    def screen_center_y(self):
-        return self.height / 2
-
-    def world_to_screen(self, x: float, y: float):
-
-        screen_x = (x - self.x) * self.zoom + self.screen_center_x
-        screen_y = (y - self.y) * self.zoom + self.screen_center_y
-        return screen_x, screen_y
-
-    def set_position(self, x: float, y: float):
-        self.x = x
-        self.y = y
-
-    def set_zoom(self, zoom: float):
-        self.zoom = max(0.01, zoom)
-
-    def resize(self, width: int, height: int):
-        self.width = width
-        self.height = height
-
-
 class Game(arcade.Window):
     def print(self, *args):
         print(f"[RENDER  : {self.Time.value:.4f}]", *args, flush=True)
@@ -70,11 +34,6 @@ class Game(arcade.Window):
         self.object_cache = data[2]
         self.camera_in_stream = data[3]
 
-        self.camera = Camera(
-            width=self.width,
-            height=self.height
-        )
-
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
         self._world_data_by_render_id = {}
@@ -89,6 +48,9 @@ class Game(arcade.Window):
             font_size=14,
             bold=True,
         )
+
+        self.camera = arcade.Camera2D()
+        self.gui_camera = arcade.Camera2D()
 
     def on_update(self, delta_time):
 
@@ -173,24 +135,16 @@ class Game(arcade.Window):
                 break
             except (EOFError, BrokenPipeError, OSError):
                 return
-            changed = False
 
-            self.print(data)
+            if type(data) != dict:
+                continue
 
-            if 'x' in data:
-                self.camera.x = data['x']
-                changed = True
+            if 'position' in data:
+                x, y = data['position']
+                self.camera.position = (x, y)
 
-            if 'y' in data:
-                self.camera.y = data['y']
-                changed = True
-
-            if 'zoom' in data:
-                self.camera.set_zoom(data['zoom'])
-                changed = True
-
-            if changed:
-                self._update_all_screen_positions()
+            if 'scale' in data:
+                self.camera.zoom = max(0.01, data['scale'])
 
     def _update_all_screen_positions(self):
 
@@ -279,30 +233,28 @@ class Game(arcade.Window):
 
         self._apply_world_transform(sprite, world_data)
 
-    def _apply_world_transform( self, sprite, world_data):
-
+    def _apply_world_transform(self, sprite, world_data):
         world_x, world_y = world_data['position']
-        screen_x, screen_y = self.camera.world_to_screen(world_x, world_y)
 
-        sprite.center_x = screen_x
-        sprite.center_y = screen_y
-        sprite.scale = world_data['scale'] * self.camera.zoom
+        sprite.center_x = world_x
+        sprite.center_y = world_y
+        sprite.scale = world_data['scale']
         sprite.angle = world_data['rotation']
         sprite.alpha = int(world_data['alpha'] * 255)
 
     def on_resize(self, width, height):
 
         super().on_resize(width, height)
-
-        self.camera.resize(width, height)
         self._update_all_screen_positions()
 
     def on_draw(self):
 
         self.clear()
 
-        self.renders.draw()
         self.fps_text.draw()
+
+        self.camera.use()
+        self.renders.draw()
 
 
 class ManagedQueue:

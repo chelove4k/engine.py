@@ -157,42 +157,6 @@ class Stream:
                 GameObject(data).register()
         self.print('Все обьекты инициализированы')
 
-    def __check_camera_queue(self):
-        while True:
-            try:
-                data = self.camera_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            except (EOFError, BrokenPipeError, OSError):
-                return
-
-            if type(data) != dict:
-                continue
-
-            try:
-                match data.get("command"):
-                    case "camera_move":
-                        self.camera_x += data["x"]
-                        self.camera_y += data["y"]
-
-                        self.__send_camera_update()
-
-                    case "camera_scale":
-                        self.camera_scale = max(0.01, data["scale"])
-                        self.__send_camera_update()
-
-            except Exception:
-                traceback.print_exc()
-                self.print("Ошибка ChangeQueue")
-
-    def __send_camera_update(self):
-        self.render_in_stream.put({
-            "command":  "camera_update",
-            "position": [self.camera_x, self.camera_y],
-            "rotation": self.camera_rotation,
-            "scale":    self.camera_scale
-        })
-
     def __init__(
         self,
         Time,
@@ -235,8 +199,6 @@ class Stream:
         self.__start_scripter_runners(worker_count)
 
         threading.Thread(target=self.__check_queue, daemon=True).start()
-        threading.Thread(target=self.__check_camera_queue, daemon=True).start()
-
 
         GameObject(
             {
