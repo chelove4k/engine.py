@@ -141,20 +141,10 @@ class Game(arcade.Window):
 
             if 'position' in data:
                 x, y = data['position']
-                self.camera.position = (x, y)
+                self.camera.position = (self.camera.position.x + x, self.camera.position.y + y)
 
             if 'scale' in data:
                 self.camera.zoom = max(0.01, data['scale'])
-
-    def _update_all_screen_positions(self):
-
-        for render_id, sprite in (self._sprites_by_render_id.items()):
-
-            world_data = (self._world_data_by_render_id.get(render_id))
-            if world_data is None:
-                continue
-
-            self._apply_world_transform(sprite, world_data)
 
     def _clear(self, data):
         self.renders.clear()

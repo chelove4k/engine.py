@@ -99,8 +99,7 @@ class _Camera:
             return
         
         self._camera_queue.put({
-            "x": dx,
-            "y": dy,
+            'position': [dx, dy]
         })
 
     def scale_camera(self, scale: float):
