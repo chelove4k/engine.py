@@ -233,7 +233,6 @@ class Game(arcade.Window):
         sprite.alpha = int(world_data['alpha'] * 255)
 
     def on_draw(self):
-
         self.clear()
 
         self.fps_text.draw()
