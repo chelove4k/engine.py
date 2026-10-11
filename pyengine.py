@@ -172,6 +172,7 @@ class GameObject:
                        self._find_component_in_stack('DictProxy'),
                        self._find_component_in_stack('AcquirerProxy')]
 
+            self._change_list = []
             self.__dict__["_initialized"] = True
 
         def __setattr__(self, name: str, value: Any):
@@ -182,9 +183,10 @@ class GameObject:
                 self.__dict__[name] = Vector2(value)
 
             if name[0] != '_':
-                self.__visual_changed(name)
+                if name not in self._change_list:
+                    self._change_list.append(name)
 
-        def __visual_changed(self, name):
+        def _pul_visual_changed(self):
             objects_cache =     self.__dict__.get("_")[3]
             lock =              self.__dict__.get("_")[4]
             id =        self.__dict__.get("id")
@@ -196,15 +198,16 @@ class GameObject:
                 entry = objects_cache.get(id)
                 if entry is None:
                     return
+                
+                for name in self._change_list:
+                    value = self.__dict__[name]
+                    entry[name] = value
 
-                value = self.__dict__[name]
-                entry[name] = value
-
-                if entry.get("_visual") is not None:
-                    entry["_visual"][name] = copy.deepcopy(value)
-                    entry["_is_changed"] = True
-                    if name not in entry["changes"]:
-                        entry["changes"].append(name)
+                    if entry.get("_visual") is not None:
+                        entry["_visual"][name] = copy.deepcopy(value)
+                        entry["_is_changed"] = True
+                        if name not in entry["changes"]:
+                            entry["changes"].append(name)
                 objects_cache[id] = entry
 
 
@@ -425,4 +428,7 @@ class script:
             if last_time != self.GlobalTime:
                 self.fixed_update()
                 last_time = self.GlobalTime
+
+            if self.GameObject.Visual is not None:
+                self.GameObject.Visual._pul_visual_changed()
             time.sleep(1/120)

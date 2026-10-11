@@ -219,7 +219,9 @@ class Game(arcade.Window):
 
         if 'alpha' in object['changes']:
             world_data['alpha'] = object['_visual']['alpha']
-        object['_is_changed'] = False
+
+        self.object_cache[object['_id']]['_is_changed'] = False
+        self.object_cache[object['_id']]['changes'] = []
 
         self._apply_world_transform(sprite, world_data)
 
