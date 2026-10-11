@@ -231,7 +231,7 @@ class Stream:
         self._script_complexity_cache = {}
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = 999999999999999
+        proccess_count = 5
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

@@ -33,16 +33,12 @@ class Game(arcade.Window):
         self.main_in_stream = data[1]
         self.object_cache = data[2]
         self.camera_in_stream = data[3]
-        self.change_in_stream = data[4]
-        self.lock = data[5]
 
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
         self._world_data_by_render_id = {}
         self._waiting_updates = {}
         self._textures = {}
-
-        self._pending_change_ids = set()
 
         self.fps_text = arcade.Text(
             text='FPS: 0',
@@ -67,7 +63,6 @@ class Game(arcade.Window):
 
         self._camera_queue()
         self._render_queue()
-        self._change_queue()
 
     def on_key_press(self, key, modifiers):
         try:
@@ -122,46 +117,15 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-    def _change_queue(self):
-        
-        while True:  
-            try:
-                object_id = self.change_in_stream.get_nowait()
-            except queue.Empty:
-                break
-            except (EOFError, BrokenPipeError, OSError):
-                return
+        for _, object in self.object_cache.items():
 
-            self._pending_change_ids.add(object_id)
+            if object["_is_changed"]:
 
-
-        for object_id in tuple(self._pending_change_ids):
-
-            with self.lock:
-                obj = self.object_cache.get(object_id)
-
-                if obj is None:
-                    self._pending_change_ids.discard(object_id)
-                    continue
-
-                sprite = self._sprites_by_render_id.get(
-                    obj["_render_id"]
-                )
+                sprite = self._sprites_by_render_id.get(object["_render_id"])
 
                 if sprite is None:
                     continue
-
-                update_data = obj.copy()
-                update_data["changes"] = list(
-                    obj.get("changes", [])
-                )
-
-                obj["_is_changed"] = False
-                obj["changes"] = []
-                self.object_cache[object_id] = obj
-
-            self._apply_update(sprite, update_data, object_id)
-            self._pending_change_ids.discard(object_id)
+                self._apply_update(sprite, object)
 
     def _camera_queue(self):
         while True:
@@ -222,12 +186,10 @@ class Game(arcade.Window):
         if sprite is not None:
             self.renders.remove(sprite)
 
-        # test test test
-
         self._world_data_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
 
-    def _apply_update(self, sprite, object, id):
+    def _apply_update(self, sprite, object):
 
         render_id = object["_render_id"]
         world_data = self._world_data_by_render_id.get(render_id)
@@ -257,8 +219,7 @@ class Game(arcade.Window):
 
         if 'alpha' in object['changes']:
             world_data['alpha'] = object['_visual']['alpha']
-
-        self._pending_change_ids.clear()
+        object['_is_changed'] = False
 
         self._apply_world_transform(sprite, world_data)
 
@@ -301,7 +262,7 @@ class ManagedQueue:
 class RenderInQueue(ManagedQueue):
     pass
 
-class ChangeInQueue(ManagedQueue):
+class RenderOutQueue(ManagedQueue):
     pass
 
 class MainInQueue(ManagedQueue):
@@ -328,7 +289,7 @@ def main():
     manager = multiprocessing.Manager()
 
     render_in_stream = RenderInQueue(manager)
-    change_in_stream = ChangeInQueue(manager)
+    render_out_stream = RenderOutQueue(manager)
 
     main_in_stream = MainInQueue(manager)
     main_out_stream = MainOutQueue(manager)
@@ -348,7 +309,7 @@ def main():
         args=(
             Time,
             render_in_stream,
-            change_in_stream,
+            render_out_stream,
             main_in_stream,
             main_out_stream,
             objects_cache,
@@ -385,7 +346,7 @@ def main():
     ).start()
 
     try:
-        Game([render_in_stream, main_in_stream, objects_cache, camera_queue, change_in_stream, lock], Time, width=400, height=400)
+        Game([render_in_stream, main_in_stream, objects_cache, camera_queue], Time, width=400, height=400)
         arcade.run()
 
     finally:

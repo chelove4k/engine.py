@@ -170,10 +170,8 @@ class GameObject:
                        self._find_component_in_stack("MainInQueue"),
                        self._find_component_in_stack("MainOutQueue"),
                        self._find_component_in_stack('DictProxy'),
-                       self._find_component_in_stack('AcquirerProxy'),
-                       self._find_component_in_stack("ChangeInQueue")]
+                       self._find_component_in_stack('AcquirerProxy')]
 
-            self._change_list = []
             self.__dict__["_initialized"] = True
 
         def __setattr__(self, name: str, value: Any):
@@ -184,49 +182,30 @@ class GameObject:
                 self.__dict__[name] = Vector2(value)
 
             if name[0] != '_':
-                if name not in self._change_list:
-                    self._change_list.append(name)
+                self.__visual_changed(name)
 
-        def _pull_visual_changed(self):
-            if not self._change_list:
-                return
+        def __visual_changed(self, name):
+            objects_cache =     self.__dict__.get("_")[3]
+            lock =              self.__dict__.get("_")[4]
+            id =        self.__dict__.get("id")
 
-            objects_cache = self.__dict__.get("_")[3]
-            lock = self.__dict__.get("_")[4]
-            change_queue = self.__dict__.get("_")[5]
-            object_id = self.id
-
-            if (objects_cache is None or lock is None or change_queue is None or object_id is None):
+            if objects_cache is None or lock is None or id is None:
                 return
 
             with lock:
-                entry = objects_cache.get(object_id)
-
+                entry = objects_cache.get(id)
                 if entry is None:
                     return
 
-                visual = entry.get("_visual")
+                value = self.__dict__[name]
+                entry[name] = value
 
-                if visual is None:
-                    return
-
-                changes = entry.setdefault("changes", [])
-
-                for name in self._change_list:
-                    value = copy.deepcopy(self.__dict__[name])
-
-                    entry[name] = value
-                    visual[name] = copy.deepcopy(value)
-
-                    if name not in changes:
-                        changes.append(name)
-
-                entry["_is_changed"] = True
-                objects_cache[object_id] = entry
-
-                self._change_list.clear()
-
-            change_queue.put(object_id)
+                if entry.get("_visual") is not None:
+                    entry["_visual"][name] = copy.deepcopy(value)
+                    entry["_is_changed"] = True
+                    if name not in entry["changes"]:
+                        entry["changes"].append(name)
+                objects_cache[id] = entry
 
 
     class __Identity(ClassTools):
@@ -293,10 +272,9 @@ class GameObject:
         self.__dict__["_initialized"] = False
 
         self.__dict__["_render_in_stream"] = self.__find_component_in_stack("RenderInQueue")
-        self.__dict__["_change_in_stream"] = self.__find_component_in_stack("ListProxy")
         self.__dict__["_main_in_stream"] = self.__find_component_in_stack("MainInQueue")
         self.__dict__["_main_out_stream"] = self.__find_component_in_stack("MainOutQueue")
-        self.__dict__["_objects_cache"] = self.__find_component_in_stack("ChangeInQueue")
+        self.__dict__["_objects_cache"] = self.__find_component_in_stack('DictProxy')
         self.__dict__["_lock"] = self.__find_component_in_stack('AcquirerProxy')
 
         self.dict_data = copy.deepcopy(source)
@@ -421,7 +399,7 @@ class script:
     def __init__(
         self,
         render_in_stream,
-        change_in_stream,
+        render_out_stream,
         main_in_stream,
         main_out_stream,
         game_object: dict,
@@ -447,7 +425,4 @@ class script:
             if last_time != self.GlobalTime:
                 self.fixed_update()
                 last_time = self.GlobalTime
-
-            if self.GameObject.Visual is not None:
-                self.GameObject.Visual._pull_visual_changed()
             time.sleep(1/120)
