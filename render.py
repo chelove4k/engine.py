@@ -222,6 +222,8 @@ class Game(arcade.Window):
         if sprite is not None:
             self.renders.remove(sprite)
 
+        # test test test
+
         self._world_data_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
 
