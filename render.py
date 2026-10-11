@@ -33,6 +33,8 @@ class Game(arcade.Window):
         self.main_in_stream = data[1]
         self.object_cache = data[2]
         self.camera_in_stream = data[3]
+        self.change_in_stream = data[4]
+        self.lock = data[5]
 
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
@@ -117,15 +119,18 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        for _, object in self.object_cache.items():
-
-            if object["_is_changed"]:
-
+        # print(self.change_in_stream)
+        for id in self.change_in_stream:
+        
+            with self.lock:
+                object = self.object_cache.get(id)
+                print(object['_is_changed'])
                 sprite = self._sprites_by_render_id.get(object["_render_id"])
 
                 if sprite is None:
                     continue
-                self._apply_update(sprite, object)
+                self._apply_update(sprite, object, id)
+        del self.change_in_stream[:]
 
     def _camera_queue(self):
         while True:
@@ -189,7 +194,7 @@ class Game(arcade.Window):
         self._world_data_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
 
-    def _apply_update(self, sprite, object):
+    def _apply_update(self, sprite, object, id):
 
         render_id = object["_render_id"]
         world_data = self._world_data_by_render_id.get(render_id)
@@ -220,8 +225,8 @@ class Game(arcade.Window):
         if 'alpha' in object['changes']:
             world_data['alpha'] = object['_visual']['alpha']
 
-        self.object_cache[object['_id']]['_is_changed'] = False
-        self.object_cache[object['_id']]['changes'] = []
+        self.object_cache[id]['_is_changed'] = False
+        print(self.object_cache)
 
         self._apply_world_transform(sprite, world_data)
 
@@ -263,7 +268,7 @@ class ManagedQueue:
 class RenderInQueue(ManagedQueue):
     pass
 
-class RenderOutQueue(ManagedQueue):
+class ChangeInQueue(ManagedQueue):
     pass
 
 class MainInQueue(ManagedQueue):
@@ -290,7 +295,7 @@ def main():
     manager = multiprocessing.Manager()
 
     render_in_stream = RenderInQueue(manager)
-    render_out_stream = RenderOutQueue(manager)
+    change_in_stream = manager.list()
 
     main_in_stream = MainInQueue(manager)
     main_out_stream = MainOutQueue(manager)
@@ -310,7 +315,7 @@ def main():
         args=(
             Time,
             render_in_stream,
-            render_out_stream,
+            change_in_stream,
             main_in_stream,
             main_out_stream,
             objects_cache,
@@ -347,7 +352,7 @@ def main():
     ).start()
 
     try:
-        Game([render_in_stream, main_in_stream, objects_cache, camera_queue], Time, width=400, height=400)
+        Game([render_in_stream, main_in_stream, objects_cache, camera_queue, change_in_stream, lock], Time, width=400, height=400)
         arcade.run()
 
     finally:

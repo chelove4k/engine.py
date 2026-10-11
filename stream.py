@@ -147,7 +147,7 @@ class Stream:
                     self.stream_time,
                     worker_id,
                     self.render_in_stream,
-                    self.render_out_stream,
+                    self.change_in_stream,
                     self.main_in_stream,
                     self.main_out_stream,
                     self.objects_cache,
@@ -166,7 +166,7 @@ class Stream:
 
     def __init_scene_objects(self, path: Path):
         self.print('Инициализация обьектов...')
-        for i in range(50):
+        for i in range(1):
             for data in json.load(path.open(encoding="utf-8")):
         
                 GameObject(data).register()
@@ -196,7 +196,7 @@ class Stream:
         self,
         Time,
         render_in_stream,
-        render_out_stream,
+        change_in_stream,
         main_in_stream,
         main_out_stream,
         objects_cache,
@@ -208,7 +208,7 @@ class Stream:
         camera_queue,
     ):
         self.render_in_stream = render_in_stream
-        self.render_out_stream = render_out_stream
+        self.change_in_stream = change_in_stream
         self.main_in_stream = main_in_stream
         self.main_out_stream = main_out_stream
         self.objects_cache = objects_cache
@@ -231,7 +231,7 @@ class Stream:
         self._script_complexity_cache = {}
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = 28
+        proccess_count = 2
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

@@ -170,7 +170,8 @@ class GameObject:
                        self._find_component_in_stack("MainInQueue"),
                        self._find_component_in_stack("MainOutQueue"),
                        self._find_component_in_stack('DictProxy'),
-                       self._find_component_in_stack('AcquirerProxy')]
+                       self._find_component_in_stack('AcquirerProxy'),
+                       self._find_component_in_stack("ListProxy")]
 
             self._change_list = []
             self.__dict__["_initialized"] = True
@@ -186,7 +187,7 @@ class GameObject:
                 if name not in self._change_list:
                     self._change_list.append(name)
 
-        def _pul_visual_changed(self):
+        def _pull_visual_changed(self):
             objects_cache =     self.__dict__.get("_")[3]
             lock =              self.__dict__.get("_")[4]
             id =        self.__dict__.get("id")
@@ -196,6 +197,11 @@ class GameObject:
 
             with lock:
                 entry = objects_cache.get(id)
+
+                if self.id not in self._[5]:
+                    self._[5].append(self.id)
+                print(self._[5])
+
                 if entry is None:
                     return
                 
@@ -205,9 +211,7 @@ class GameObject:
 
                     if entry.get("_visual") is not None:
                         entry["_visual"][name] = copy.deepcopy(value)
-                        entry["_is_changed"] = True
-                        if name not in entry["changes"]:
-                            entry["changes"].append(name)
+
                 objects_cache[id] = entry
 
 
@@ -275,6 +279,7 @@ class GameObject:
         self.__dict__["_initialized"] = False
 
         self.__dict__["_render_in_stream"] = self.__find_component_in_stack("RenderInQueue")
+        self.__dict__["_change_in_stream"] = self.__find_component_in_stack("ListProxy")
         self.__dict__["_main_in_stream"] = self.__find_component_in_stack("MainInQueue")
         self.__dict__["_main_out_stream"] = self.__find_component_in_stack("MainOutQueue")
         self.__dict__["_objects_cache"] = self.__find_component_in_stack('DictProxy')
@@ -402,7 +407,7 @@ class script:
     def __init__(
         self,
         render_in_stream,
-        render_out_stream,
+        change_in_stream,
         main_in_stream,
         main_out_stream,
         game_object: dict,
@@ -430,5 +435,5 @@ class script:
                 last_time = self.GlobalTime
 
             if self.GameObject.Visual is not None:
-                self.GameObject.Visual._pul_visual_changed()
+                self.GameObject.Visual._pull_visual_changed()
             time.sleep(1/120)

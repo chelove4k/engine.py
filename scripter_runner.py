@@ -51,7 +51,7 @@ class scripter_runner:
         
             self.print(f"Остановлен {data['path']}")
 
-    def __init__(self, Time, id, render_in_stream, render_out_stream, main_in_stream, main_out_stream, objects_cache, procces_in_stream, managers_stream, lock, keyboard_input, proccess_status_info, camera_queue):
+    def __init__(self, Time, id, render_in_stream, change_in_stream, main_in_stream, main_out_stream, objects_cache, procces_in_stream, managers_stream, lock, keyboard_input, proccess_status_info, camera_queue):
 
         self.core_time = Time
         self.id = id
@@ -59,9 +59,13 @@ class scripter_runner:
         self._script_complexity_cache = {}
 
         proccess_status_info[id] = 0
-
+        last_time = None
         while True:
-                time.sleep(1/10)
+                real_time = self.core_time.value
+                if last_time == real_time:
+                    continue
+                last_time = real_time
+
                 try:
                     data = procces_in_stream.get_nowait()
                 except Exception as e:
@@ -82,7 +86,7 @@ class scripter_runner:
 
                     thread = threading.Thread(target=self.wrapper, args=(
                         getattr(module_obj, name), 
-                        (render_in_stream, render_out_stream, main_in_stream, main_out_stream, obj_data, objects_cache, lock, keyboard_input, Time, camera_queue),
+                        (render_in_stream, change_in_stream, main_in_stream, main_out_stream, obj_data, objects_cache, lock, keyboard_input, Time, camera_queue),
                         proccess_status_info,
                         id, data, lock
                         ))
