@@ -166,7 +166,7 @@ class Stream:
 
     def __init_scene_objects(self, path: Path):
         self.print('Инициализация обьектов...')
-        for i in range(1):
+        for i in range(20):
             for data in json.load(path.open(encoding="utf-8")):
         
                 GameObject(data).register()
@@ -231,7 +231,7 @@ class Stream:
         self._script_complexity_cache = {}
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = 2
+        proccess_count = 999999999999999
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

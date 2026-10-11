@@ -17,5 +17,20 @@
     "scripts" : ["access\\scripts\\test.py"],
     "network": []
     }
+},
+{
+"visual": {
+    "sprite": "C:\\Users\\root\\Desktop\\arcade_test\\access\\resources\\img.png",
+    "position": [0, 0], 
+    "scale": 0.2, 
+    "rotation": 90.0,
+    "alpha" : 1
+    }
+},
+{
+"scripting": {
+    "scripts" : [],
+    "network": []
+    }
 }
 ]

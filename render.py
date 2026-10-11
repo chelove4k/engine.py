@@ -42,6 +42,8 @@ class Game(arcade.Window):
         self._waiting_updates = {}
         self._textures = {}
 
+        self._pending_change_ids = set()
+
         self.fps_text = arcade.Text(
             text='FPS: 0',
             x=10,
@@ -65,6 +67,7 @@ class Game(arcade.Window):
 
         self._camera_queue()
         self._render_queue()
+        self._change_queue()
 
     def on_key_press(self, key, modifiers):
         try:
@@ -119,18 +122,46 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        # print(self.change_in_stream)
-        for id in self.change_in_stream:
+    def _change_queue(self):
         
+        while True:  
+            try:
+                object_id = self.change_in_stream.get_nowait()
+            except queue.Empty:
+                break
+            except (EOFError, BrokenPipeError, OSError):
+                return
+
+            self._pending_change_ids.add(object_id)
+
+
+        for object_id in tuple(self._pending_change_ids):
+
             with self.lock:
-                object = self.object_cache.get(id)
-                print(object['_is_changed'])
-                sprite = self._sprites_by_render_id.get(object["_render_id"])
+                obj = self.object_cache.get(object_id)
+
+                if obj is None:
+                    self._pending_change_ids.discard(object_id)
+                    continue
+
+                sprite = self._sprites_by_render_id.get(
+                    obj["_render_id"]
+                )
 
                 if sprite is None:
                     continue
-                self._apply_update(sprite, object, id)
-        del self.change_in_stream[:]
+
+                update_data = obj.copy()
+                update_data["changes"] = list(
+                    obj.get("changes", [])
+                )
+
+                obj["_is_changed"] = False
+                obj["changes"] = []
+                self.object_cache[object_id] = obj
+
+            self._apply_update(sprite, update_data, object_id)
+            self._pending_change_ids.discard(object_id)
 
     def _camera_queue(self):
         while True:
@@ -225,8 +256,7 @@ class Game(arcade.Window):
         if 'alpha' in object['changes']:
             world_data['alpha'] = object['_visual']['alpha']
 
-        self.object_cache[id]['_is_changed'] = False
-        print(self.object_cache)
+        self._pending_change_ids.clear()
 
         self._apply_world_transform(sprite, world_data)
 
@@ -242,10 +272,11 @@ class Game(arcade.Window):
     def on_draw(self):
         self.clear()
 
-        self.fps_text.draw()
-
         self.camera.use()
         self.renders.draw()
+
+        self.gui_camera.use()
+        self.fps_text.draw()
 
 
 class ManagedQueue:
@@ -295,7 +326,7 @@ def main():
     manager = multiprocessing.Manager()
 
     render_in_stream = RenderInQueue(manager)
-    change_in_stream = manager.list()
+    change_in_stream = ChangeInQueue(manager)
 
     main_in_stream = MainInQueue(manager)
     main_out_stream = MainOutQueue(manager)

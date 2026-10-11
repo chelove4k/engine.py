@@ -171,7 +171,7 @@ class GameObject:
                        self._find_component_in_stack("MainOutQueue"),
                        self._find_component_in_stack('DictProxy'),
                        self._find_component_in_stack('AcquirerProxy'),
-                       self._find_component_in_stack("ListProxy")]
+                       self._find_component_in_stack("ChangeInQueue")]
 
             self._change_list = []
             self.__dict__["_initialized"] = True
@@ -188,31 +188,45 @@ class GameObject:
                     self._change_list.append(name)
 
         def _pull_visual_changed(self):
-            objects_cache =     self.__dict__.get("_")[3]
-            lock =              self.__dict__.get("_")[4]
-            id =        self.__dict__.get("id")
+            if not self._change_list:
+                return
 
-            if objects_cache is None or lock is None or id is None:
+            objects_cache = self.__dict__.get("_")[3]
+            lock = self.__dict__.get("_")[4]
+            change_queue = self.__dict__.get("_")[5]
+            object_id = self.id
+
+            if (objects_cache is None or lock is None or change_queue is None or object_id is None):
                 return
 
             with lock:
-                entry = objects_cache.get(id)
-
-                if self.id not in self._[5]:
-                    self._[5].append(self.id)
-                print(self._[5])
+                entry = objects_cache.get(object_id)
 
                 if entry is None:
                     return
-                
+
+                visual = entry.get("_visual")
+
+                if visual is None:
+                    return
+
+                changes = entry.setdefault("changes", [])
+
                 for name in self._change_list:
-                    value = self.__dict__[name]
+                    value = copy.deepcopy(self.__dict__[name])
+
                     entry[name] = value
+                    visual[name] = copy.deepcopy(value)
 
-                    if entry.get("_visual") is not None:
-                        entry["_visual"][name] = copy.deepcopy(value)
+                    if name not in changes:
+                        changes.append(name)
 
-                objects_cache[id] = entry
+                entry["_is_changed"] = True
+                objects_cache[object_id] = entry
+
+                self._change_list.clear()
+
+            change_queue.put(object_id)
 
 
     class __Identity(ClassTools):
@@ -282,7 +296,7 @@ class GameObject:
         self.__dict__["_change_in_stream"] = self.__find_component_in_stack("ListProxy")
         self.__dict__["_main_in_stream"] = self.__find_component_in_stack("MainInQueue")
         self.__dict__["_main_out_stream"] = self.__find_component_in_stack("MainOutQueue")
-        self.__dict__["_objects_cache"] = self.__find_component_in_stack('DictProxy')
+        self.__dict__["_objects_cache"] = self.__find_component_in_stack("ChangeInQueue")
         self.__dict__["_lock"] = self.__find_component_in_stack('AcquirerProxy')
 
         self.dict_data = copy.deepcopy(source)
