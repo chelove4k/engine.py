@@ -7,12 +7,20 @@ import pyengine
 from radon.visitors import ComplexityVisitor
 import queue
 import time
+from memory_lib import ObjectCache, ValueCache
+
+
+class VisualCache(ObjectCache):
+    pass
+
+class IdCache(ObjectCache):
+    pass
 
 
 class scripter_runner:
     
     def print(self, *args, **kwargs):
-        prefix = f"[CORE {self.id:02d} : {self.core_time.value:.4f}]"
+        prefix = f"[CORE {self.id:02d} : {self.core_time.get():.4f}]"
 
         print(prefix, *args, **kwargs)
 
@@ -43,7 +51,8 @@ class scripter_runner:
             func(*arg)
 
         except Exception as e:
-            self.print(f"Ошибка внутри запущенного потока {data['path']}: {e}")
+            # self.print(f"Ошибка внутри запущенного потока {data['path']}: {e}")
+            traceback.print_exc()
 
         finally:
             with lock:
@@ -51,17 +60,40 @@ class scripter_runner:
         
             self.print(f"Остановлен {data['path']}")
 
-    def __init__(self, Time, id, render_in_stream, change_in_stream, main_in_stream, main_out_stream, objects_cache, procces_in_stream, managers_stream, lock, keyboard_input, proccess_status_info, camera_queue):
-
-        self.core_time = Time
+    def __init__(self, 
+                 time_key, id, 
+                 render_in_stream, 
+                 change_in_stream, 
+                 main_in_stream, 
+                 main_out_stream, 
+                 objects_cache, 
+                 procces_in_stream, 
+                 lock, 
+                 keyboard_input, 
+                 proccess_status_info, 
+                 camera_queue,
+                 visual_cache,
+                 id_cache,
+                 object_lock
+        ):
+        self.core_time = ValueCache(time_key)
         self.id = id
-
+        self.change_in_stream = change_in_stream
+        self.main_in_stream = main_in_stream
+        self.main_out_stream = main_out_stream
+        self.objects_cache = objects_cache
+        self.proccess_status_info = proccess_status_info
+        self.procces_in_stream = procces_in_stream
+        self.lock = lock
+        self.keyboard_input = keyboard_input
+        self.camera_queue = camera_queue 
+        self.object_lock = object_lock
         self._script_complexity_cache = {}
 
         proccess_status_info[id] = 0
         last_time = None
         while True:
-                real_time = self.core_time.value
+                real_time = self.core_time.get()
                 if last_time == real_time:
                     continue
                 last_time = real_time
@@ -80,13 +112,26 @@ class scripter_runner:
                         continue
                     module = data['path'].replace('.py', '').replace('\\', '.').replace('/', '.')
                     name = module.split('.')[-1]
-                    obj_data = objects_cache[list(objects_cache.keys())[int(data['obj_id'])]]['dict_data']
+                    obj_data = data['script_data']
 
                     module_obj = importlib.import_module(module)
 
                     thread = threading.Thread(target=self.wrapper, args=(
                         getattr(module_obj, name), 
-                        (render_in_stream, change_in_stream, main_in_stream, main_out_stream, obj_data, objects_cache, lock, keyboard_input, Time, camera_queue),
+                        (render_in_stream, 
+                         change_in_stream, 
+                         main_in_stream, 
+                         main_out_stream, 
+                         obj_data, 
+                         objects_cache, 
+                         lock, keyboard_input, 
+                         time_key, 
+                         camera_queue, 
+                         VisualCache(*visual_cache), 
+                         visual_cache,
+                         IdCache(*id_cache), 
+                         id_cache,
+                         self.object_lock),
                         proccess_status_info,
                         id, data, lock
                         ))

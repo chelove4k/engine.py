@@ -1,15 +1,14 @@
 import time
 import math
 from pyengine import *
+import random
 
 class test(script):
 
     
     def start(self):
         self.GameObject.render()
-        pass
-        self.start_pos = (self.GameObject.Visual.position.x, self.GameObject.Visual.position.y-100)
-
+        self.GameObject.Visual.position.y = random.randint(0, 400)
         self.k = 1
 
     def fixed_update(self):

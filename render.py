@@ -10,11 +10,12 @@ import pyglet
 
 import console
 import stream
+from memory_lib import ObjectCache, ValueCache
 
 
 class Game(arcade.Window):
     def print(self, *args):
-        print(f"[RENDER  : {self.Time.value:.4f}]", *args, flush=True)
+        print(f"[RENDER  : {self.Time.get():.4f}]", *args, flush=True)
 
     def __init__(self, data, Time, width=1280, height=720, title='Arcade Window'):
         super().__init__(
@@ -33,6 +34,7 @@ class Game(arcade.Window):
         self.main_in_stream = data[1]
         self.object_cache = data[2]
         self.camera_in_stream = data[3]
+        self.visual_cache = ObjectCache(*data[4])
 
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
@@ -62,7 +64,10 @@ class Game(arcade.Window):
         self.fps_text.y = self.height - 25
 
         self._camera_queue()
+ 
         self._render_queue()
+
+
 
     def on_key_press(self, key, modifiers):
         try:
@@ -117,15 +122,16 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        for _, object in self.object_cache.items():
+        for i in self._sprites_by_render_id:
+            changes = self.visual_cache.get_changes(i)
 
-            if object["_is_changed"]:
+            if len(changes) == 0:
+                continue
+            entry = {}
+            for j in changes:
+                entry.update({j : self.visual_cache.get(i, j)})
 
-                sprite = self._sprites_by_render_id.get(object["_render_id"])
-
-                if sprite is None:
-                    continue
-                self._apply_update(sprite, object)
+            self._apply_update(i, self._sprites_by_render_id[i], entry)
 
     def _camera_queue(self):
         while True:
@@ -189,16 +195,12 @@ class Game(arcade.Window):
         self._world_data_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
 
-    def _apply_update(self, sprite, object):
-
-        render_id = object["_render_id"]
-        world_data = self._world_data_by_render_id.get(render_id)
-
+    def _apply_update(self, id, sprite, object_data):
+        world_data = self._world_data_by_render_id.get(id)
         if world_data is None:
             return
-
-        if 'sprite' in object['changes']:
-            path = object['_visual']['sprite']
+        if 'sprite' in object_data:
+            path = object_data['sprite'] 
             texture = self._textures.get(path)
 
             if texture is None:
@@ -207,19 +209,24 @@ class Game(arcade.Window):
 
             sprite.texture = texture
 
-        if 'position' in object['changes']:
-            position = object['_visual']['position']
-            world_data['position'] = position.x, position.y
+        current_x, current_y = world_data['position']
+        
+        if 'x' in object_data:
+            current_x = object_data['x']
 
-        if 'scale' in object['changes']:
-            world_data['scale'] = object['_visual']['scale']
+        if 'y' in object_data:
+            current_y = object_data['y']
+            
+        world_data['position'] = (current_x, current_y)
 
-        if 'rotation' in object['changes']:
-            world_data['rotation'] = object['_visual']['rotation']
+        if 'scale' in object_data:
+            world_data['scale'] = object_data['scale']
 
-        if 'alpha' in object['changes']:
-            world_data['alpha'] = object['_visual']['alpha']
-        object['_is_changed'] = False
+        if 'rotation' in object_data:
+            world_data['rotation'] = object_data['rotation']
+
+        if 'alpha' in object_data:
+            world_data['alpha'] = object_data['alpha']
 
         self._apply_world_transform(sprite, world_data)
 
@@ -277,37 +284,68 @@ class ProccesInQueue(ManagedQueue):
 class CameraQueue(ManagedQueue):
     pass
 
+class VisualCache(ObjectCache):
+    pass
+
+class IdCache(ObjectCache):
+    pass
 
 def tact_counter(start, tact_time, Time):
 
     while True:
         time.sleep(tact_time)
-        Time.value = time.time() - start
+        Time.set(round(time.time() - start, 5))
 
 def main():
 
-    manager = multiprocessing.Manager()
+    render_manager = multiprocessing.Manager()
+    main_manager = multiprocessing.Manager()
+    objects_manager = multiprocessing.Manager()
+    universal_manager = multiprocessing.Manager()
 
-    render_in_stream = RenderInQueue(manager)
-    render_out_stream = RenderOutQueue(manager)
 
-    main_in_stream = MainInQueue(manager)
-    main_out_stream = MainOutQueue(manager)
+    render_in_stream = RenderInQueue(render_manager)
+    render_out_stream = RenderOutQueue(render_manager)
+    camera_queue = CameraQueue(render_manager)
 
-    procces_in_stream = ProccesInQueue(manager)
-    camera_queue = CameraQueue(manager)
+    main_in_stream = MainInQueue(main_manager)
+    main_out_stream = MainOutQueue(main_manager) 
 
-    keyboard_input = manager.list()
-    objects_cache = manager.dict()
-    managers_stream = manager.dict()
-    proccess_status_info = manager.list()
-    Time = manager.Value('d', 0.0)
-    lock = manager.Lock()
+    procces_in_stream = ProccesInQueue(objects_manager)
+
+    objects_cache = objects_manager.dict()
+    object_lock = objects_manager.Lock()
+    visual_struct =  {
+        'x' : float,
+        'y' : float,
+        'rotation' : float,
+        'scale' : float,
+        'alpha' : float,
+        'sprite' : str
+    }
+    raw_visual_cache = VisualCache(1024*256, visual_struct)
+    visual_cache = [raw_visual_cache.key, visual_struct]
+
+    id_struct =  {
+        'name' : str,
+        'layer' : str,
+        'type' : str,
+        'class' : str,
+        'id' : str,
+    }
+    raw_id_cache = IdCache(1024*256, id_struct)
+    id_cache = [raw_id_cache.key, id_struct]
+
+    proccess_status_info = universal_manager.list()
+    keyboard_input = universal_manager.list()
+    raw_time = ValueCache(0.0)
+    time_key = raw_time.name
+    lock = universal_manager.Lock()
 
     logic_process = multiprocessing.Process(
         target=stream.Stream,
         args=(
-            Time,
+            time_key,
             render_in_stream,
             render_out_stream,
             main_in_stream,
@@ -315,10 +353,12 @@ def main():
             objects_cache,
             proccess_status_info,
             procces_in_stream,
-            managers_stream,
             lock,
             keyboard_input,
             camera_queue,
+            visual_cache,
+            id_cache,
+            object_lock
         ),
         daemon=False,
     )
@@ -329,7 +369,9 @@ def main():
         args=(
             render_in_stream,
             objects_cache,
-            proccess_status_info
+            proccess_status_info,
+            visual_cache,
+            id_cache
         ),
         daemon=True,
     ).start()
@@ -340,13 +382,13 @@ def main():
         args=(
             time.time(),
             tact_time,
-            Time
+            raw_time
         ),
         daemon=True,
     ).start()
 
     try:
-        Game([render_in_stream, main_in_stream, objects_cache, camera_queue], Time, width=400, height=400)
+        Game([render_in_stream, main_in_stream, objects_cache, camera_queue, visual_cache], time_key, width=400, height=400)
         arcade.run()
 
     finally:
@@ -354,7 +396,14 @@ def main():
             logic_process.terminate()
 
         logic_process.join(timeout=2)
-        manager.shutdown()
+
+        objects_manager.shutdown()
+        render_manager.shutdown()
+        main_manager.shutdown()
+        universal_manager.shutdown()
+        raw_visual_cache.close()
+        raw_id_cache.close()
+        raw_time.close()
 
 
 if __name__ == '__main__':

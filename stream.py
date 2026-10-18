@@ -11,13 +11,14 @@ import traceback
 
 from pyengine import GameObject
 import scripter_runner
+from memory_lib import ObjectCache, ValueCache
 
 from radon.visitors import ComplexityVisitor
 
 
 class Stream:
     def print(self, *args):
-        print(f"[STREAM  : {self.stream_time.value:.4f}]", *args, flush=True)
+        print(f"[STREAM  : {self.stream_time.get():.4f}]", *args, flush=True)
 
     def __check_queue(self):
         while True:
@@ -78,6 +79,25 @@ class Stream:
                 "render_id": render_id,
             })
             object["dict_data"]["_id"] = id
+            identity = object["dict_data"].pop("id", None)
+            visual = object["dict_data"].pop("visual", None)
+
+            if identity is not None:
+                for field_name in ("name", "layer", "type", "class"):
+                    value = identity.get(field_name)
+                    if value is not None:
+                        self.id_cache.set(render_id, field_name, value)
+                self.id_cache.set(render_id, "id", id)
+
+            if visual is not None:
+                position = visual.get("position", [0, 0])
+                self.visual_cache.set(render_id, "x", float(position[0]))
+                self.visual_cache.set(render_id, "y", float(position[1]))
+                self.visual_cache.set(render_id, "rotation", float(visual.get("rotation", 0)))
+                self.visual_cache.set(render_id, "scale", float(visual.get("scale", 1)))
+                self.visual_cache.set(render_id, "alpha", float(visual.get("alpha", 1)))
+                self.visual_cache.set(render_id, "sprite", str(visual.get("sprite", "")))
+
             self.objects_cache[id] = object
 
         self.main_out_stream.put({id: (object_id, render_id)})
@@ -99,6 +119,7 @@ class Stream:
             "path": data["path"],
             "id": data["id"],
             "obj_id" : data["obj_id"],
+            "script_data": data["script_data"],
         })
 
     def __render(self, data):
@@ -111,17 +132,22 @@ class Stream:
             
             object["_is_render"] = True
             self.objects_cache[id] = object
-            visual = dict(object["_visual"])
             render_id = object["_render_id"]
+
+        visual = {
+            field_name: self.visual_cache.get(render_id, field_name)
+            for field_name in ("x", "y", "rotation", "scale", "alpha", "sprite")
+        }
 
         self.render_in_stream.put({
             "command": "add",
             "render_id": render_id,
             "path": visual["sprite"],
-            "x": visual["position"].x,
-            "y": visual["position"].y,
+            "x": visual["x"],
+            "y": visual["y"],
             "scale": visual["scale"],
             "rotation": visual["rotation"],
+            "alpha": visual["alpha"],
         })
 
     def __remove(self, data):
@@ -144,7 +170,7 @@ class Stream:
             worker = multiprocessing.Process(
                 target=scripter_runner.scripter_runner,
                 args=(
-                    self.stream_time,
+                    self.time_key,
                     worker_id,
                     self.render_in_stream,
                     self.change_in_stream,
@@ -152,11 +178,13 @@ class Stream:
                     self.main_out_stream,
                     self.objects_cache,
                     self.procces_in_stream,
-                    self.managers_stream,
                     self.lock,
                     self.keyboard_input,
                     self.proccess_status_info,
                     self.camera_queue,
+                    self.visual_cache_data,
+                    self.id_cache_data,
+                    self.object_lock
                 ),
                 daemon=True,
             )
@@ -166,7 +194,7 @@ class Stream:
 
     def __init_scene_objects(self, path: Path):
         self.print('Инициализация обьектов...')
-        for i in range(20):
+        for i in range(1):
             for data in json.load(path.open(encoding="utf-8")):
         
                 GameObject(data).register()
@@ -194,7 +222,7 @@ class Stream:
     
     def __init__(
         self,
-        Time,
+        time_key,
         render_in_stream,
         change_in_stream,
         main_in_stream,
@@ -202,10 +230,12 @@ class Stream:
         objects_cache,
         proccess_status_info,
         procces_in_stream,
-        managers_stream,
         lock,
         keyboard_input,
         camera_queue,
+        visual_cache,
+        id_cache,
+        object_lock
     ):
         self.render_in_stream = render_in_stream
         self.change_in_stream = change_in_stream
@@ -214,14 +244,17 @@ class Stream:
         self.objects_cache = objects_cache
         self.proccess_status_info = proccess_status_info
         self.procces_in_stream = procces_in_stream
-        self.managers_stream = managers_stream
         self.lock = lock
         self.keyboard_input = keyboard_input
-        self.stream_time = Time
-
+        self.time_key = time_key
+        self.stream_time = ValueCache(time_key)
         self.camera_queue = camera_queue 
-        self.camera_x = 0.0
-        self.camera_y = 0.0
+        self.visual_cache_data = visual_cache
+        self.id_cache_data = id_cache
+        self.visual_cache = ObjectCache(*visual_cache)
+        self.id_cache = ObjectCache(*id_cache)
+        self.object_lock = object_lock
+
         self.camera_rotation = 0.0
         self.camera_scale = 1.0
 
@@ -231,7 +264,7 @@ class Stream:
         self._script_complexity_cache = {}
 
         cpu_count = os.cpu_count() or 1
-        proccess_count = 5
+        proccess_count = 1
         worker_count = max(1, min(proccess_count, cpu_count - 1))
         self.__start_scripter_runners(worker_count)
 

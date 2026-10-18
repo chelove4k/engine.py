@@ -5,7 +5,13 @@ import time
 from typing import Any
 import inspect
 from typing import Callable
+from memory_lib import ObjectCache, ValueCache
 
+class VisualCache(ObjectCache):
+    pass
+
+class IdCache(ObjectCache):
+    pass
 
 class Vector2:
     def __init__(self, x: float = 0.0, y: float = 0.0):
@@ -170,7 +176,8 @@ class GameObject:
                        self._find_component_in_stack("MainInQueue"),
                        self._find_component_in_stack("MainOutQueue"),
                        self._find_component_in_stack('DictProxy'),
-                       self._find_component_in_stack('AcquirerProxy')]
+                       self._find_component_in_stack('AcquirerProxy'),
+                       self._find_component_in_stack('VisualCache')]
 
             self.__dict__["_initialized"] = True
 
@@ -185,31 +192,36 @@ class GameObject:
                 self.__visual_changed(name)
 
         def __visual_changed(self, name):
-            objects_cache =     self.__dict__.get("_")[3]
-            lock =              self.__dict__.get("_")[4]
-            id =        self.__dict__.get("id")
+            id = self.__dict__.get("id")
+            value = self.__dict__[name]
 
-            if objects_cache is None or lock is None or id is None:
+            if self._[5] is None:
+                print('VisualCache не найден')
                 return
 
-            with lock:
-                entry = objects_cache.get(id)
-                if entry is None:
-                    return
+            visual_cache = self._[5]
 
-                value = self.__dict__[name]
-                entry[name] = value
-
-                if entry.get("_visual") is not None:
-                    entry["_visual"][name] = copy.deepcopy(value)
-                    entry["_is_changed"] = True
-                    if name not in entry["changes"]:
-                        entry["changes"].append(name)
-                objects_cache[id] = entry
+            if name == 'position':
+                visual_cache.set(id, 'x', float(value.x))
+                visual_cache.set(id, 'y', float(value.y))
+                return
+            if name == 'rotation':
+                visual_cache.set(id, 'rotation', float(value))
+                return
+            if name == 'scale':
+                visual_cache.set(id, 'scale', float(value))
+                return
+            if name == 'alpha':
+                visual_cache.set(id, 'alpha', float(value))
+                return
+            if name == 'path':
+                visual_cache.set(id, 'path', str(value))
+                return
 
 
     class __Identity(ClassTools):
         def __init__(self, 
+                     render_id,
                      id, 
                      class_, 
                      name, 
@@ -218,6 +230,7 @@ class GameObject:
                     ):
             self.__dict__["_initialized"] = False
 
+            self.render_id = render_id
             self.id = id
             self.class_ = class_
             self.name = name
@@ -228,9 +241,26 @@ class GameObject:
                         self._find_component_in_stack("MainInQueue"),
                         self._find_component_in_stack("MainOutQueue"),
                         self._find_component_in_stack('DictProxy'),
-                        self._find_component_in_stack('AcquirerProxy')]
+                        self._find_component_in_stack('AcquirerProxy'),
+                        self._find_component_in_stack('IdCache')]
+            {
+                'name' : str,
+                'layer' : str,
+                'type' : str,
+                'class' : str,
+                'id' : float,
+            }
+
+            if self._[5] is not None and self.render_id is not None:
+                self._[5].set(self.render_id, 'layer', self.layer)
+                self._[5].set(self.render_id, 'name', self.name)
+                self._[5].set(self.render_id, 'type', self.type)
+                self._[5].set(self.render_id, 'class', self.class_)
+                self._[5].set(self.render_id, 'id', self.id)
 
             self.__dict__["_initialized"] = True
+
+
 
 
     class __Scripting(ClassTools):
@@ -294,7 +324,7 @@ class GameObject:
         visual = source.get("visual")
         if visual is not None:
             self.Visual = self.__Visual(
-                id = self._id,
+                id = self._render_id,
                 sprite_path = visual["sprite"],
                 scale = visual["scale"],
                 position=Vector2(visual["position"][0], visual["position"][1]),
@@ -307,6 +337,7 @@ class GameObject:
         if identity is not None:
             # print(identity)
             self.Identity = self.__Identity(
+                render_id= self._render_id,
                 id = self._id,
                 name = identity["name"],
                 class_ = identity["class"],
@@ -327,10 +358,8 @@ class GameObject:
         self.__dict__["_initialized"] = True
 
     def __cache_record(self):
-        _visual = None
-        if self.Visual is not None:
-            _visual = self.Visual.__dict__.copy()
-            _visual.pop('_')
+        # Component state lives in its dedicated cache; objects_cache keeps
+        # only the source data needed to construct a script-side GameObject.
         return {
             "dict_data": copy.deepcopy(self.dict_data),
             "_id": self._id,
@@ -338,7 +367,6 @@ class GameObject:
             "_render_id": self._render_id,
             "_is_render": self._is_render,
             "_is_changed": False,
-            "_visual": copy.deepcopy(_visual),
         }
 
     def register(self):
@@ -348,6 +376,7 @@ class GameObject:
         self._main_in_stream.put({
             "command": "register",
             "obj": self.__cache_record(),
+            "script_data": copy.deepcopy(self.dict_data),
             "id": self._id,
         })
         object_id, render_id = self._main_out_stream.get()[self._id]
@@ -355,19 +384,19 @@ class GameObject:
         self.__dict__["_object_id"] = object_id
         self.__dict__["_render_id"] = render_id
 
-        self.dict_data.setdefault("id", {}).update({
-            "object_id": object_id,
-            "render_id": render_id,
-        })
-        self.dict_data["_id"] = self._id
-
         if self.Scripting is not None:
+            script_data = copy.deepcopy(self.dict_data)
+            script_data["_id"] = self._id
+            script_data["object_id"] = object_id
+            script_data["render_id"] = render_id
+
             for path in self.Scripting.scripts:
                 self._main_in_stream.put({
                     "command": "add_script",
                     "path": path,
                     "obj_id": object_id,
                     "id": self._id,
+                    "script_data": script_data,
                 })
         else:
             if self.Visual is not None:
@@ -396,6 +425,23 @@ class script:
     def is_pressed(self, button: str) -> bool:
         return button.upper() in self.__keyboard_input
 
+    def find_object(self, by, data):
+        '''
+        "c" - find by class
+        "n" - find by name
+        "l" - find by layer
+        "t" - find by type
+        '''
+        find = None
+        if by == 'c':
+            pass
+        if by == 'n':
+            pass
+        if by == 'l':
+            pass
+        if by == 't':
+            pass
+
     def __init__(
         self,
         render_in_stream,
@@ -406,20 +452,29 @@ class script:
         objects_cache,
         lock,
         keyboard_input,
-        Time,
-        camera_queue
+        time_key,
+        camera_queue,
+        raw_visual_cache,
+        visual_cache,
+        raw_id_cache,
+        id_cache,
+        object_lock
     ):
         self.__keyboard_input = keyboard_input
-        self.__rawTime = Time
-        self.GlobalTime = Time.value
+        self.__rawTime = ValueCache(time_key)
+        self.GlobalTime = self.__rawTime.get()
         self.GameObject = GameObject(game_object)
+
+        # self.id_cache = IdCache(*id_cache)
+        # self.visual_cache = VisualCache(*visual_cache)
+
         self.Camera = _Camera()
 
         self.start()
 
-        last_time = self.__rawTime.value
+        last_time = self.__rawTime.get()
         while True:
-            self.GlobalTime = self.__rawTime.value
+            self.GlobalTime = self.__rawTime.get()
 
             self.update()
             if last_time != self.GlobalTime:
