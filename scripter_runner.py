@@ -10,6 +10,32 @@ import time
 from memory_lib import ObjectCache, ValueCache
 
 
+class KeyboardSnapshot:
+    """Keep a local key snapshot so scripts don't poll a Manager proxy."""
+
+    def __init__(self, keyboard_input, poll_rate=1 / 120):
+        self._keyboard_input = keyboard_input
+        self._pressed = frozenset(keyboard_input[:])
+        self._poll_rate = poll_rate
+        self._thread = threading.Thread(
+            target=self._poll,
+            name="keyboard-snapshot",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _poll(self):
+        while True:
+            try:
+                self._pressed = frozenset(self._keyboard_input[:])
+            except (EOFError, BrokenPipeError, OSError, AttributeError):
+                return
+            time.sleep(self._poll_rate)
+
+    def snapshot(self):
+        return self._pressed
+
+
 class VisualCache(ObjectCache):
     pass
 
@@ -86,6 +112,7 @@ class scripter_runner:
         self.procces_in_stream = procces_in_stream
         self.lock = lock
         self.keyboard_input = keyboard_input
+        self.keyboard_snapshot = KeyboardSnapshot(keyboard_input)
         self.object_lock = object_lock
         self.camera_state = camera_state
         self._script_complexity_cache = {}
@@ -118,7 +145,7 @@ class scripter_runner:
                          main_out_stream, 
                          obj_data, 
                          objects_cache, 
-                         lock, keyboard_input, 
+                         lock, self.keyboard_snapshot,
                          time_key, 
                          VisualCache(*visual_cache), 
                          visual_cache,

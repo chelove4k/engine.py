@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import arcade
 import pyglet
@@ -17,6 +18,8 @@ from memory_lib import ObjectCache, ValueCache
 class Game(arcade.Window):
     POSITION_INTERPOLATION_DELAY = 0.02
     POSITION_HISTORY_SIZE = 8
+    SIMULATION_TICK = 1 / 100
+    PROJECT_DIR = Path(__file__).resolve().parent
 
     def print(self, *args):
         print(f"[RENDER  : {self.Time.get():.4f}]", *args, flush=True)
@@ -60,6 +63,7 @@ class Game(arcade.Window):
         self._waiting_updates = {}
         self._textures = {}
         self._camera_target_id = -1
+        self._fps_elapsed = 0.0
 
         self.fps_text = arcade.Text(
             text='FPS: 0',
@@ -74,17 +78,19 @@ class Game(arcade.Window):
         self.gui_camera = arcade.Camera2D()
 
     def on_update(self, delta_time):
-
-        if delta_time > 0:
+        self._fps_elapsed += delta_time
+        if self._fps_elapsed >= 0.25 and delta_time > 0:
             self.fps_text.text = (
                 f'FPS: {round(1 / delta_time)}'
             )
+            self._fps_elapsed %= 0.25
 
-        self.fps_text.y = self.height - 25
+        fps_y = self.height - 25
+        if self.fps_text.y != fps_y:
+            self.fps_text.y = fps_y
 
         self._render_queue()
         self._read_camera_state()
-        self._record_visible_positions()
 
 
 
@@ -141,14 +147,11 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        for i in self._sprites_by_render_id:
-            changes = self.visual_cache.get_changes(i)
-
-            if len(changes) == 0:
-                continue
-            entry = self.visual_cache.get_many(i, changes)
-
-            self._apply_update(i, self._sprites_by_render_id[i], entry)
+        # Check active sprites only; scanning the full cache capacity each frame is costly.
+        for render_id, sprite in self._sprites_by_render_id.items():
+            entry = self.visual_cache.get_changed_values(render_id)
+            if entry and sprite is not None:
+                self._apply_update(render_id, sprite, entry)
 
     def _read_camera_state(self):
         self._camera_target_id = self.camera_target_cache.get()
@@ -172,34 +175,23 @@ class Game(arcade.Window):
             if timestamp == last_time:
                 history[-1] = (timestamp, x, y)
                 return
+            if timestamp - last_time > self.SIMULATION_TICK * 1.5:
+                held_state_time = timestamp - self.SIMULATION_TICK
+                if held_state_time > last_time:
+                    history.append((held_state_time, last_x, last_y))
         history.append((timestamp, x, y))
-
-    def _record_visible_positions(self):
-        render_ids = set(self._sprites_by_render_id)
-        if self._camera_target_id >= 0:
-            render_ids.add(self._camera_target_id)
-
-        for render_id in render_ids:
-            position = self.visual_cache.get_many(
-                render_id,
-                ('x', 'y', 'sim_time'),
-            )
-            self._record_position(
-                render_id,
-                (position['x'], position['y']),
-                position['sim_time'],
-            )
 
     def _interpolated_position(self, render_id, render_time):
         history = self._position_history_by_render_id.get(render_id)
         if not history:
             return None
 
-        previous = history[0]
+        samples = iter(history)
+        previous = next(samples)
         if render_time <= previous[0]:
             return previous[1], previous[2]
 
-        for current in list(history)[1:]:
+        for current in samples:
             if render_time <= current[0]:
                 interval = current[0] - previous[0]
                 if interval <= 0:
@@ -224,6 +216,12 @@ class Game(arcade.Window):
             if position is not None:
                 self.camera.position = position
 
+    def _resolve_asset_path(self, path):
+        asset_path = Path(path).expanduser()
+        if not asset_path.is_absolute():
+            asset_path = self.PROJECT_DIR / asset_path
+        return str(asset_path.resolve())
+
     def _clear(self, data):
         self.renders.clear()
 
@@ -244,8 +242,13 @@ class Game(arcade.Window):
             'alpha':    data.get('alpha', 1.0),
         }
 
+        image_path = self._resolve_asset_path(data['path'])
+        texture = self._textures.get(image_path)
+        if texture is None:
+            texture = arcade.load_texture(image_path)
+            self._textures[image_path] = texture
         sprite = arcade.Sprite(
-            path_or_texture=data['path'],
+            path_or_texture=texture,
             scale=world_data['scale'],
             angle=world_data['rotation'],
         )
@@ -279,7 +282,7 @@ class Game(arcade.Window):
         if world_data is None:
             return
         if 'sprite' in object_data:
-            path = object_data['sprite'] 
+            path = self._resolve_asset_path(object_data['sprite'])
             texture = self._textures.get(path)
 
             if texture is None:
@@ -314,7 +317,12 @@ class Game(arcade.Window):
                 object_data.get('sim_time', self.Time.get()),
             )
 
-        self._apply_world_transform(sprite, world_data)
+        if 'scale' in object_data:
+            sprite.scale = world_data['scale']
+        if 'rotation' in object_data:
+            sprite.angle = world_data['rotation']
+        if 'alpha' in object_data:
+            sprite.alpha = int(world_data['alpha'] * 255)
 
     def _apply_world_transform(self, sprite, world_data):
         world_x, world_y = world_data['position']
@@ -413,7 +421,7 @@ def main():
         'sprite' : str
     }
     visual_locks = [multiprocessing.Lock() for _ in range(64)]
-    raw_visual_cache = VisualCache(1024*256, visual_struct, visual_locks)
+    raw_visual_cache = VisualCache(1024 * 256, visual_struct, visual_locks)
     visual_cache = [raw_visual_cache.key, visual_struct, visual_locks]
 
     id_struct =  {

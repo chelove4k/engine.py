@@ -131,8 +131,7 @@ class ObjectCache:
             self.__memory = shared_memory.SharedMemory(create=True, size=id_or_name)
             self.key = self.__memory.name
             
-            for i in range(self.__memory.size):
-                self.__memory.buf[i] = 0
+            self.__memory.buf[:] = bytes(self.__memory.size)
         
 
         self.segments_count = self.__memory.size // self.segment_len
@@ -190,6 +189,8 @@ class ObjectCache:
         mask_end = mask_start + 4
 
         with self._lock_for(segment_id):
+            if bytes(self.__memory.buf[frame[0]:frame[1]]) == packed_data:
+                return
             self.__memory.buf[frame[0]:frame[1]] = packed_data
 
             current_mask = struct.unpack('i', self.__memory.buf[mask_start:mask_end])[0]
@@ -222,7 +223,6 @@ class ObjectCache:
             return
 
         prepared = []
-        changed_mask = 0
         for object_name, data in values.items():
             if object_name not in self.field_bit_mapping:
                 raise TypeError(f"unknown cache field: {object_name}")
@@ -232,16 +232,54 @@ class ObjectCache:
                 if len(data) > 64:
                     raise ValueError("string value exceeds 64 bytes")
             packed_data = struct.pack(fmt_type, data)
-            prepared.append((self.get_frame(segment_id, object_name), packed_data))
-            changed_mask |= self.field_bit_mapping[object_name]
+            prepared.append((
+                self.get_frame(segment_id, object_name),
+                packed_data,
+                self.field_bit_mapping[object_name],
+            ))
 
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
         with self._lock_for(segment_id):
-            for frame, packed_data in prepared:
+            changed_mask = 0
+            for frame, packed_data, bit_value in prepared:
+                if bytes(self.__memory.buf[frame[0]:frame[1]]) == packed_data:
+                    continue
                 self.__memory.buf[frame[0]:frame[1]] = packed_data
+                changed_mask |= bit_value
+            if changed_mask == 0:
+                return
             current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
             self.__memory.buf[mask_start:mask_end] = struct.pack("i", current_mask | changed_mask)
+
+    def get_changed_values(self, segment_id: int):
+        """Return and clear the changed fields while holding one segment lock."""
+        if segment_id < 0 or segment_id >= self.segments_count:
+            raise IndexError("segment index out of range")
+
+        mask_start = segment_id * self.segment_len
+        mask_end = mask_start + 4
+        with self._lock_for(segment_id):
+            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
+            if current_mask == 0:
+                return {}
+
+            values = {}
+            for field_name, bit_value in self.field_bit_mapping.items():
+                if not current_mask & bit_value:
+                    continue
+                frame = self.get_frame(segment_id, field_name)
+                fmt_type = self.__dict__[field_name][1]
+                raw_val = struct.unpack(
+                    fmt_type,
+                    bytes(self.__memory.buf[frame[0]:frame[1]]),
+                )[0]
+                if isinstance(raw_val, bytes):
+                    raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
+                values[field_name] = raw_val
+
+            self.__memory.buf[mask_start:mask_end] = struct.pack("i", 0)
+            return values
 
     def get_changes(self, segment_id: int) -> list:
         if segment_id < 0 or segment_id >= self.segments_count:

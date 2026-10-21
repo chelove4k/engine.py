@@ -16,7 +16,6 @@ from memory_lib import ObjectCache, ValueCache
 from radon.visitors import ComplexityVisitor
 
 
-# Component names in scene JSON map directly to these rule keys.
 OBJECT_TYPE_RULES = {
     "static_object": {
         "allowed": frozenset({"id", "visual"}),

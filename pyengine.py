@@ -527,8 +527,14 @@ class script:
         object_lock,
         camera_state
     ):
-        self.__keyboard_input = keyboard_input
-        self.__pressed_keys = set(keyboard_input[:])
+        self.__keyboard_snapshot = getattr(keyboard_input, "snapshot", None)
+        self.__keyboard_input = (
+            None if self.__keyboard_snapshot is not None else keyboard_input
+        )
+        if self.__keyboard_snapshot is None:
+            self.__pressed_keys = frozenset(keyboard_input[:])
+        else:
+            self.__pressed_keys = self.__keyboard_snapshot()
         self.__objects_cache = objects_cache
         self.__visual_cache = raw_visual_cache
         self.__id_cache = raw_id_cache
@@ -553,7 +559,10 @@ class script:
 
         last_time = self.__rawTime.get()
         while True:
-            self.__pressed_keys = set(self.__keyboard_input[:])
+            if self.__keyboard_snapshot is None:
+                self.__pressed_keys = frozenset(self.__keyboard_input[:])
+            else:
+                self.__pressed_keys = self.__keyboard_snapshot()
             self.GlobalTime = self.__rawTime.get()
 
             self.update()
