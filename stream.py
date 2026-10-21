@@ -16,7 +16,137 @@ from memory_lib import ObjectCache, ValueCache
 from radon.visitors import ComplexityVisitor
 
 
+# Component names in scene JSON map directly to these rule keys.
+OBJECT_TYPE_RULES = {
+    "static_object": {
+        "allowed": frozenset({"id", "visual"}),
+        "required": frozenset({"id"}),
+    },
+    "dynamic_object": {
+        "allowed": frozenset({"id", "visual", "scripting"}),
+        "required": frozenset(),
+    },
+    "background_object": {
+        "allowed": frozenset({"visual"}),
+        "required": frozenset({"visual"}),
+    },
+    "camera": {
+        "allowed": frozenset({"id", "visual"}),
+        "required": frozenset({"id", "visual"}),
+    },
+    "manager": {
+        "allowed": frozenset({"id", "scripting"}),
+        "required": frozenset({"id", "scripting"}),
+    },
+}
+
+
+def validate_object_data(data: dict) -> None:
+    if not isinstance(data, dict):
+        raise TypeError("Описание объекта должно быть JSON-объектом")
+
+    identity = data.get("id")
+    object_type = data.get("object_type")
+    if not isinstance(object_type, str):
+        raise ValueError("У объекта должно быть текстовое поле 'object_type'")
+    if identity is not None and not isinstance(identity, dict):
+        raise ValueError("Компонент 'id' должен быть объектом")
+    if identity is not None and identity.get("type", object_type) != object_type:
+        raise ValueError("Поле 'id.type' должно совпадать с 'object_type'")
+    rules = OBJECT_TYPE_RULES.get(object_type)
+    if rules is None:
+        raise ValueError(
+            f"Неизвестный тип объекта {object_type!r}. "
+            f"Допустимые типы: {', '.join(OBJECT_TYPE_RULES)}"
+        )
+
+    components = set(data) & {"id", "visual", "scripting"}
+    unknown = set(data) - {"object_type", "id", "visual", "scripting", "_id", "object_id", "render_id"}
+    if unknown:
+        raise ValueError(f"Неизвестные компоненты объекта: {', '.join(sorted(unknown))}")
+
+    forbidden = components - rules["allowed"]
+    missing = rules["required"] - components
+    if forbidden or missing:
+        details = []
+        if forbidden:
+            details.append(f"запрещены компоненты: {', '.join(sorted(forbidden))}")
+        if missing:
+            details.append(f"обязательны компоненты: {', '.join(sorted(missing))}")
+        raise ValueError(f"Тип {object_type!r}: {'; '.join(details)}")
+
+    if identity is not None:
+        required_identity = {"name", "class", "layer"}
+        missing_identity = required_identity - set(identity)
+        if missing_identity:
+            raise ValueError(
+                f"В компоненте 'id' отсутствуют поля: {', '.join(sorted(missing_identity))}"
+            )
+        if any(not isinstance(identity[field], str) for field in required_identity):
+            raise ValueError("Поля id.name, id.class и id.layer должны быть строками")
+
+    if "visual" in data:
+        visual = data["visual"]
+        if not isinstance(visual, dict):
+            raise ValueError("Компонент 'visual' должен быть объектом")
+        required = {"sprite", "position", "scale", "rotation", "alpha"}
+        missing_visual = required - set(visual)
+        if missing_visual:
+            raise ValueError(
+                f"В компоненте 'visual' отсутствуют поля: {', '.join(sorted(missing_visual))}"
+            )
+        if not isinstance(visual["sprite"], str):
+            raise ValueError("Поле 'visual.sprite' должно быть строкой")
+        position = visual["position"]
+        if not isinstance(position, (list, tuple)) or len(position) != 2:
+            raise ValueError("Поле 'visual.position' должно содержать два числа")
+        try:
+            float(position[0])
+            float(position[1])
+            float(visual["scale"])
+            float(visual["rotation"])
+            float(visual["alpha"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("Поля visual.position/scale/rotation/alpha должны быть числами") from error
+
+    if "scripting" in data:
+        scripting = data["scripting"]
+        if (not isinstance(scripting, dict)
+                or not isinstance(scripting.get("scripts", []), list)
+                or any(not isinstance(path, str) for path in scripting.get("scripts", []))):
+            raise ValueError("Компонент 'scripting.scripts' должен быть списком путей")
+
+
 class Stream:
+    INDEX_PREFIX = "__engine_index__"
+
+    def __add_identity_indexes(self, object_id, identity, object_type):
+        if identity is None:
+            return
+        indexed_values = dict(identity)
+        indexed_values.setdefault("type", object_type)
+        for field_name in ("name", "class", "layer", "type"):
+            value = indexed_values.get(field_name)
+            if value is None:
+                continue
+            key = (self.INDEX_PREFIX, field_name, value)
+            object_ids = list(self.objects_cache.get(key, ()))
+            object_ids.append(object_id)
+            self.objects_cache[key] = object_ids
+
+    def __remove_identity_indexes(self, object_id, render_id):
+        for field_name in ("name", "class", "layer", "type"):
+            value = self.id_cache.get(render_id, field_name)
+            key = (self.INDEX_PREFIX, field_name, value)
+            object_ids = list(self.objects_cache.get(key, ()))
+            if object_id not in object_ids:
+                continue
+            object_ids.remove(object_id)
+            if object_ids:
+                self.objects_cache[key] = object_ids
+            else:
+                self.objects_cache.pop(key, None)
+
     def print(self, *args):
         print(f"[STREAM  : {self.stream_time.get():.4f}]", *args, flush=True)
 
@@ -62,6 +192,13 @@ class Stream:
     def __register(self, data):
         id = data["id"]
         object = data["obj"]
+        script_data = data.get("script_data", object.get("dict_data", {}))
+        try:
+            validate_object_data(script_data)
+        except (TypeError, ValueError) as error:
+            self.main_out_stream.put({id: {"error": str(error)}})
+            raise
+
         with self.lock:
             object_id = self._next_object_id
             render_id = self._next_render_id
@@ -79,24 +216,33 @@ class Stream:
                 "render_id": render_id,
             })
             object["dict_data"]["_id"] = id
+            object["dict_data"]["_components"] = [
+                component for component in ("id", "visual", "scripting")
+                if component in object["dict_data"]
+            ]
+            object_type = object["dict_data"].get("object_type")
             identity = object["dict_data"].pop("id", None)
             visual = object["dict_data"].pop("visual", None)
 
             if identity is not None:
                 for field_name in ("name", "layer", "type", "class"):
-                    value = identity.get(field_name)
+                    value = identity.get(field_name, object_type if field_name == "type" else None)
                     if value is not None:
                         self.id_cache.set(render_id, field_name, value)
                 self.id_cache.set(render_id, "id", id)
+                self.__add_identity_indexes(id, identity, object_type)
 
             if visual is not None:
                 position = visual.get("position", [0, 0])
-                self.visual_cache.set(render_id, "x", float(position[0]))
-                self.visual_cache.set(render_id, "y", float(position[1]))
-                self.visual_cache.set(render_id, "rotation", float(visual.get("rotation", 0)))
-                self.visual_cache.set(render_id, "scale", float(visual.get("scale", 1)))
-                self.visual_cache.set(render_id, "alpha", float(visual.get("alpha", 1)))
-                self.visual_cache.set(render_id, "sprite", str(visual.get("sprite", "")))
+                self.visual_cache.set_many(render_id, {
+                    "x": float(position[0]),
+                    "y": float(position[1]),
+                    "sim_time": self.stream_time.get(),
+                    "rotation": float(visual.get("rotation", 0)),
+                    "scale": float(visual.get("scale", 1)),
+                    "alpha": float(visual.get("alpha", 1)),
+                    "sprite": str(visual.get("sprite", "")),
+                })
 
             self.objects_cache[id] = object
 
@@ -134,10 +280,10 @@ class Stream:
             self.objects_cache[id] = object
             render_id = object["_render_id"]
 
-        visual = {
-            field_name: self.visual_cache.get(render_id, field_name)
-            for field_name in ("x", "y", "rotation", "scale", "alpha", "sprite")
-        }
+        visual = self.visual_cache.get_many(
+            render_id,
+            ("x", "y", "sim_time", "rotation", "scale", "alpha", "sprite"),
+        )
 
         self.render_in_stream.put({
             "command": "add",
@@ -145,6 +291,7 @@ class Stream:
             "path": visual["sprite"],
             "x": visual["x"],
             "y": visual["y"],
+            "sim_time": visual["sim_time"],
             "scale": visual["scale"],
             "rotation": visual["rotation"],
             "alpha": visual["alpha"],
@@ -155,6 +302,8 @@ class Stream:
 
         with self.lock:
             object = self.objects_cache.pop(id, None)
+            if object is not None:
+                self.__remove_identity_indexes(id, object["_render_id"])
 
         if object is not None:
             self.render_in_stream.put({
@@ -181,10 +330,10 @@ class Stream:
                     self.lock,
                     self.keyboard_input,
                     self.proccess_status_info,
-                    self.camera_queue,
                     self.visual_cache_data,
                     self.id_cache_data,
-                    self.object_lock
+                    self.object_lock,
+                    self.camera_state
                 ),
                 daemon=True,
             )
@@ -196,7 +345,7 @@ class Stream:
         self.print('Инициализация обьектов...')
         for i in range(1):
             for data in json.load(path.open(encoding="utf-8")):
-        
+                validate_object_data(data)
                 GameObject(data).register()
         self.print('Все обьекты инициализированы')
 
@@ -232,10 +381,10 @@ class Stream:
         procces_in_stream,
         lock,
         keyboard_input,
-        camera_queue,
         visual_cache,
         id_cache,
-        object_lock
+        object_lock,
+        camera_state
     ):
         self.render_in_stream = render_in_stream
         self.change_in_stream = change_in_stream
@@ -248,12 +397,12 @@ class Stream:
         self.keyboard_input = keyboard_input
         self.time_key = time_key
         self.stream_time = ValueCache(time_key)
-        self.camera_queue = camera_queue 
         self.visual_cache_data = visual_cache
         self.id_cache_data = id_cache
         self.visual_cache = ObjectCache(*visual_cache)
         self.id_cache = ObjectCache(*id_cache)
         self.object_lock = object_lock
+        self.camera_state = camera_state
 
         self.camera_rotation = 0.0
         self.camera_scale = 1.0
@@ -270,17 +419,22 @@ class Stream:
 
         threading.Thread(target=self.__check_queue, daemon=True).start()
 
-        GameObject(
-            {
-            "scripting": {
-                "scripts" : ["access\\scripts\\camera.py"],
-                "network": []
-                }
-            }
-        ).register()
-
         scene_path = Path(__file__).parent / "access" / "scenes" / "scene1.json"
         self.__init_scene_objects(scene_path)
+
+        GameObject({
+            "object_type": "manager",
+            "id": {
+                "name": "camera_manager",
+                "class": "CameraManager",
+                "layer": "system",
+                "type": "manager",
+            },
+            "scripting": {
+                "scripts": ["access\\scripts\\camera.py"],
+                "network": [],
+            },
+        }).register()
 
         while True:
             # self.print(Time)

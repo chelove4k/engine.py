@@ -85,7 +85,16 @@ class ValueCache:
 
         with self.lock:
             self.__memory.buf[1:self.get_size()+1] = packed_data
-
+    def close(self):
+            memory = self.__memory
+            if memory is None:
+                return
+            self.__memory = None
+            memory.close()
+            try:
+                memory.unlink()
+            except FileNotFoundError:
+                pass
 
 class ObjectCache:
     MEMORY_TYPES_SIZE = {
@@ -94,7 +103,7 @@ class ObjectCache:
         str: 64
     }
     
-    def __init__(self, id_or_name, data):
+    def __init__(self, id_or_name, data, locks=None):
         self.__memory = None
         self._fields = {} 
 
@@ -127,7 +136,16 @@ class ObjectCache:
         
 
         self.segments_count = self.__memory.size // self.segment_len
-        self.locks = [multiprocessing.Lock() for _ in range(self.segments_count)]
+        if locks is None:
+            lock_count = min(64, max(1, self.segments_count))
+            self.locks = [multiprocessing.Lock() for _ in range(lock_count)]
+        elif isinstance(locks, (list, tuple)):
+            self.locks = locks
+        else:
+            self.locks = [locks]
+
+    def _lock_for(self, segment_id):
+        return self.locks[segment_id % len(self.locks)]
 
     def get_frame(self, segment_id, object_name):
         start = segment_id * self.segment_len
@@ -144,7 +162,7 @@ class ObjectCache:
         frame = self.get_frame(segment_id, object_name)
         fmt_type = self.__dict__[object_name][1]
 
-        with self.locks[segment_id]:
+        with self._lock_for(segment_id):
             memory_segment = bytes(self.__memory.buf[frame[0]:frame[1]])
             raw_val = struct.unpack(fmt_type, memory_segment)[0]
             
@@ -171,12 +189,59 @@ class ObjectCache:
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
 
-        with self.locks[segment_id]:
+        with self._lock_for(segment_id):
             self.__memory.buf[frame[0]:frame[1]] = packed_data
 
             current_mask = struct.unpack('i', self.__memory.buf[mask_start:mask_end])[0]
             new_mask = current_mask | self.field_bit_mapping[object_name]
             self.__memory.buf[mask_start:mask_end] = struct.pack('i', new_mask)
+
+    def get_many(self, segment_id: int, object_names):
+        if segment_id < 0 or segment_id >= self.segments_count:
+            raise IndexError("segment index out of range")
+        object_names = tuple(object_names)
+        for object_name in object_names:
+            if object_name not in self.field_bit_mapping:
+                raise TypeError(f"unknown cache field: {object_name}")
+
+        with self._lock_for(segment_id):
+            values = {}
+            for object_name in object_names:
+                frame = self.get_frame(segment_id, object_name)
+                fmt_type = self.__dict__[object_name][1]
+                raw_val = struct.unpack(fmt_type, bytes(self.__memory.buf[frame[0]:frame[1]]))[0]
+                if isinstance(raw_val, bytes):
+                    raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
+                values[object_name] = raw_val
+            return values
+
+    def set_many(self, segment_id: int, values):
+        if segment_id < 0 or segment_id >= self.segments_count:
+            raise IndexError("segment index out of range")
+        if not values:
+            return
+
+        prepared = []
+        changed_mask = 0
+        for object_name, data in values.items():
+            if object_name not in self.field_bit_mapping:
+                raise TypeError(f"unknown cache field: {object_name}")
+            fmt_type = self.__dict__[object_name][1]
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+                if len(data) > 64:
+                    raise ValueError("string value exceeds 64 bytes")
+            packed_data = struct.pack(fmt_type, data)
+            prepared.append((self.get_frame(segment_id, object_name), packed_data))
+            changed_mask |= self.field_bit_mapping[object_name]
+
+        mask_start = segment_id * self.segment_len
+        mask_end = mask_start + 4
+        with self._lock_for(segment_id):
+            for frame, packed_data in prepared:
+                self.__memory.buf[frame[0]:frame[1]] = packed_data
+            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
+            self.__memory.buf[mask_start:mask_end] = struct.pack("i", current_mask | changed_mask)
 
     def get_changes(self, segment_id: int) -> list:
         if segment_id < 0 or segment_id >= self.segments_count:
@@ -186,7 +251,7 @@ class ObjectCache:
         mask_end = mask_start + 4
         changed_fields = []
 
-        with self.locks[segment_id]:
+        with self._lock_for(segment_id):
             current_mask = struct.unpack('i', self.__memory.buf[mask_start:mask_end])[0]
             if current_mask == 0:
                 return changed_fields
@@ -211,7 +276,6 @@ class ObjectCache:
             pass
 
     def detach(self):
-        """Close this process's handle without unlinking the shared segment."""
         memory = self.__memory
         if memory is None:
             return

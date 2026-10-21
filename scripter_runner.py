@@ -71,10 +71,10 @@ class scripter_runner:
                  lock, 
                  keyboard_input, 
                  proccess_status_info, 
-                 camera_queue,
                  visual_cache,
                  id_cache,
-                 object_lock
+                 object_lock,
+                 camera_state
         ):
         self.core_time = ValueCache(time_key)
         self.id = id
@@ -86,25 +86,19 @@ class scripter_runner:
         self.procces_in_stream = procces_in_stream
         self.lock = lock
         self.keyboard_input = keyboard_input
-        self.camera_queue = camera_queue 
         self.object_lock = object_lock
+        self.camera_state = camera_state
         self._script_complexity_cache = {}
 
         proccess_status_info[id] = 0
-        last_time = None
         while True:
-                real_time = self.core_time.get()
-                if last_time == real_time:
-                    continue
-                last_time = real_time
-
                 try:
-                    data = procces_in_stream.get_nowait()
-                except Exception as e:
-                    continue
+                    data = procces_in_stream.get()
+                except (EOFError, BrokenPipeError, OSError):
+                    return
                 if data['proc_id'] != id:
                     procces_in_stream.put(data)
-                    time.sleep(1/10)
+                    time.sleep(1/100)
                     continue
 
                 try:
@@ -126,12 +120,12 @@ class scripter_runner:
                          objects_cache, 
                          lock, keyboard_input, 
                          time_key, 
-                         camera_queue, 
                          VisualCache(*visual_cache), 
                          visual_cache,
                          IdCache(*id_cache), 
                          id_cache,
-                         self.object_lock),
+                         self.object_lock,
+                         self.camera_state),
                         proccess_status_info,
                         id, data, lock
                         ))
