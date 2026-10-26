@@ -12,6 +12,7 @@ import pyglet
 
 import console
 import stream
+from collision import transform_polygon, validate_convex_polygon
 from memory_lib import ObjectCache, ValueCache
 
 
@@ -32,6 +33,7 @@ class Game(arcade.Window):
         height=720,
         title='Arcade Window',
         clock_origin=None,
+        overlay_settings=None,
     ):
         super().__init__(
             width,
@@ -52,6 +54,7 @@ class Game(arcade.Window):
         self.render_in_stream = data[0]
         self.main_in_stream = data[1]
         self.object_cache = data[2]
+        self.overlay_settings = overlay_settings or console.OverlaySettings()
         self.visual_cache = ObjectCache(*data[3])
         self.camera_target_cache = data[4]
         self.camera_scale_cache = data[5]
@@ -62,6 +65,7 @@ class Game(arcade.Window):
         self._position_history_by_render_id = {}
         self._waiting_updates = {}
         self._textures = {}
+        self._colliders_by_render_id = {}
         self._camera_target_id = -1
         self._fps_elapsed = 0.0
 
@@ -216,6 +220,36 @@ class Game(arcade.Window):
             if position is not None:
                 self.camera.position = position
 
+    def _get_collider_polygon(self, render_id):
+        record = self.object_cache.get((stream.Stream.INDEX_PREFIX, "render_id", render_id))
+        if record is not None:
+            record = self.object_cache.get(record)
+        if record is None:
+            return None
+        transform = record.get("dict_data", {}).get("transform")
+        if transform is None:
+            return None
+        return validate_convex_polygon(transform["polygon"])
+
+    def _draw_collision_overlay(self, render_time):
+        settings = self.overlay_settings.get("collision")
+        if settings is None or not settings["enabled"]:
+            return
+        for render_id, polygon in self._colliders_by_render_id.items():
+            world_data = self._world_data_by_render_id.get(render_id)
+            if world_data is None:
+                continue
+            position = self._interpolated_position(render_id, render_time)
+            if position is None:
+                position = world_data["position"]
+            world_polygon = transform_polygon(
+                polygon, position, world_data["rotation"], world_data["scale"]
+            )
+            if world_polygon:
+                arcade.draw_polygon_outline(
+                    world_polygon, settings["color"], line_width=settings["width"]
+                )
+
     def _resolve_asset_path(self, path):
         asset_path = Path(path).expanduser()
         if not asset_path.is_absolute():
@@ -229,6 +263,7 @@ class Game(arcade.Window):
         self._world_data_by_render_id.clear()
         self._position_history_by_render_id.clear()
         self._waiting_updates.clear()
+        self._colliders_by_render_id.clear()
 
     def _add_sprite(self, data):
 
@@ -257,6 +292,9 @@ class Game(arcade.Window):
 
         self._sprites_by_render_id[render_id] = sprite
         self._world_data_by_render_id[render_id] = world_data
+        collider_polygon = self._get_collider_polygon(render_id)
+        if collider_polygon is not None:
+            self._colliders_by_render_id[render_id] = collider_polygon
         self._record_position(
             render_id,
             world_data['position'],
@@ -276,6 +314,7 @@ class Game(arcade.Window):
         self._world_data_by_render_id.pop(render_id, None)
         self._position_history_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
+        self._colliders_by_render_id.pop(render_id, None)
 
     def _apply_update(self, id, sprite, object_data):
         world_data = self._world_data_by_render_id.get(id)
@@ -346,6 +385,7 @@ class Game(arcade.Window):
 
         self.camera.use()
         self.renders.draw()
+        self._draw_collision_overlay(render_time)
 
         self.gui_camera.use()
         self.fps_text.draw()
@@ -442,6 +482,7 @@ def main():
     camera_target_cache = ValueCache(-1)
     camera_scale_cache = ValueCache(1.0)
     camera_state = [camera_target_cache.name, camera_scale_cache.name]
+    overlay_settings = console.OverlaySettings()
     lock = universal_manager.Lock()
 
     logic_process = multiprocessing.Process(
@@ -473,7 +514,8 @@ def main():
             objects_cache,
             proccess_status_info,
             visual_cache,
-            id_cache
+            id_cache,
+            overlay_settings,
         ),
         daemon=True,
     ).start()
@@ -501,7 +543,8 @@ def main():
             visual_cache,
             camera_target_cache,
             camera_scale_cache,
-        ], time_key, width=400, height=400, clock_origin=game_clock_origin)
+        ], time_key, width=400, height=400, clock_origin=game_clock_origin,
+            overlay_settings=overlay_settings)
         arcade.run()
 
     finally:

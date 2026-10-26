@@ -46,9 +46,31 @@
       "rotation": 0,
       "alpha": 1
     },
+    "transform": {
+      "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
+    },
     "scripting": {
       "scripts": ["access\\scripts\\test.py"],
       "network": []
+    }
+  },
+  {
+    "object_type": "static_object",
+    "id": {
+      "name": "tilt_trigger",
+      "class": "TiltTrigger",
+      "layer": "world",
+      "type": "static_object"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "position": [180, 0],
+      "scale": 0.2,
+      "rotation": 0,
+      "alpha": 1
+    },
+    "transform": {
+      "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
     }
   }
 ]

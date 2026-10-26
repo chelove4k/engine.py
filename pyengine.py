@@ -5,6 +5,7 @@ import time
 from typing import Any
 import inspect
 from typing import Callable
+from collision import convex_polygons_overlap, transform_polygon, validate_convex_polygon
 from memory_lib import ObjectCache, ValueCache
 
 class VisualCache(ObjectCache):
@@ -162,11 +163,23 @@ class GameObject:
             return stream
 
         
-    class __Transform: # Временно Visual выполняет функции transform
-        def __init__(self, 
+    class __Transform:
+        def __init__(self, render_id, polygon, visual_cache=None):
+            self.render_id = render_id
+            self.polygon = validate_convex_polygon(polygon)
+            self._visual_cache = visual_cache
 
-                    ):
-            pass
+        def _world_polygon(self):
+            if self._visual_cache is None or self.render_id is None:
+                raise RuntimeError("Transform collider is not connected to the shared transform cache")
+            pose = self._visual_cache.get_many(self.render_id, ("x", "y", "rotation", "scale"))
+            return transform_polygon(self.polygon, (pose["x"], pose["y"]), pose["rotation"], pose["scale"])
+
+        def overlaps(self, other):
+            other_transform = getattr(other, "Transform", other)
+            if not isinstance(other_transform, self.__class__):
+                raise TypeError("Transform.overlaps expects a GameObject with a Transform collider")
+            return convex_polygons_overlap(self._world_polygon(), other_transform._world_polygon())
 
 
     class __Visual(ClassTools):
@@ -369,6 +382,15 @@ class GameObject:
             )
             self.components.append('visual')
 
+        transform = source.get("transform")
+        if transform is not None:
+            self.Transform = self.__Transform(
+                self._render_id,
+                transform["polygon"],
+                self.Visual._[5] if self.Visual is not None else None,
+            )
+            self.components.append("transform")
+
         identity = source.get("id")
         if identity is not None:
             self.Identity = self.__Identity(
@@ -486,6 +508,8 @@ class script:
             }
             components = record.get("dict_data", {})
             component_names = components.get("_components", ())
+            if "transform" in component_names:
+                source["transform"] = components["transform"]
             if "scripting" in component_names:
                 source["scripting"] = components["scripting"]
             if "visual" in component_names:

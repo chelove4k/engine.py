@@ -10,27 +10,31 @@ import time
 import traceback
 
 from pyengine import GameObject
+from collision import validate_convex_polygon
 import scripter_runner
 from memory_lib import ObjectCache, ValueCache
 
 from radon.visitors import ComplexityVisitor
 
 
+# Choose the scene loaded when the engine starts.
+SCENE_FILE = "camera_stability.json"
+
 OBJECT_TYPE_RULES = {
     "static_object": {
-        "allowed": frozenset({"id", "visual"}),
+        "allowed": frozenset({"id", "visual", "transform"}),
         "required": frozenset({"id"}),
     },
     "dynamic_object": {
-        "allowed": frozenset({"id", "visual", "scripting"}),
+        "allowed": frozenset({"id", "visual", "scripting", "transform"}),
         "required": frozenset(),
     },
     "background_object": {
-        "allowed": frozenset({"visual"}),
+        "allowed": frozenset({"visual", "transform"}),
         "required": frozenset({"visual"}),
     },
     "camera": {
-        "allowed": frozenset({"id", "visual"}),
+        "allowed": frozenset({"id", "visual", "transform"}),
         "required": frozenset({"id", "visual"}),
     },
     "manager": {
@@ -59,8 +63,8 @@ def validate_object_data(data: dict) -> None:
             f"Допустимые типы: {', '.join(OBJECT_TYPE_RULES)}"
         )
 
-    components = set(data) & {"id", "visual", "scripting"}
-    unknown = set(data) - {"object_type", "id", "visual", "scripting", "_id", "object_id", "render_id"}
+    components = set(data) & {"id", "visual", "scripting", "transform"}
+    unknown = set(data) - {"object_type", "id", "visual", "scripting", "transform", "_id", "object_id", "render_id"}
     if unknown:
         raise ValueError(f"Неизвестные компоненты объекта: {', '.join(sorted(unknown))}")
 
@@ -108,6 +112,14 @@ def validate_object_data(data: dict) -> None:
         except (TypeError, ValueError) as error:
             raise ValueError("Поля visual.position/scale/rotation/alpha должны быть числами") from error
 
+    if "transform" in data:
+        transform = data["transform"]
+        if not isinstance(transform, dict) or set(transform) != {"polygon"}:
+            raise ValueError("transform must contain only a polygon field")
+        if "visual" not in data:
+            raise ValueError("transform collider requires visual for position, rotation, and scale")
+        validate_convex_polygon(transform["polygon"])
+
     if "scripting" in data:
         scripting = data["scripting"]
         if (not isinstance(scripting, dict)
@@ -133,7 +145,13 @@ class Stream:
             object_ids.append(object_id)
             self.objects_cache[key] = object_ids
 
+    def __add_render_index(self, object_id, render_id):
+        self.objects_cache[(self.INDEX_PREFIX, "render_id", render_id)] = object_id
+
     def __remove_identity_indexes(self, object_id, render_id):
+        render_key = (self.INDEX_PREFIX, "render_id", render_id)
+        if self.objects_cache.get(render_key) == object_id:
+            self.objects_cache.pop(render_key, None)
         for field_name in ("name", "class", "layer", "type"):
             value = self.id_cache.get(render_id, field_name)
             key = (self.INDEX_PREFIX, field_name, value)
@@ -216,9 +234,10 @@ class Stream:
             })
             object["dict_data"]["_id"] = id
             object["dict_data"]["_components"] = [
-                component for component in ("id", "visual", "scripting")
+                component for component in ("id", "visual", "scripting", "transform")
                 if component in object["dict_data"]
             ]
+            object["dict_data"]["render_id"] = render_id
             object_type = object["dict_data"].get("object_type")
             identity = object["dict_data"].pop("id", None)
             visual = object["dict_data"].pop("visual", None)
@@ -244,6 +263,7 @@ class Stream:
                 })
 
             self.objects_cache[id] = object
+            self.__add_render_index(id, render_id)
 
         self.main_out_stream.put({id: (object_id, render_id)})
 
@@ -418,7 +438,7 @@ class Stream:
 
         threading.Thread(target=self.__check_queue, daemon=True).start()
 
-        scene_path = Path(__file__).parent / "access" / "scenes" / "scene1.json"
+        scene_path = Path(__file__).parent / "access" / "scenes" / SCENE_FILE
         self.__init_scene_objects(scene_path)
 
         GameObject({

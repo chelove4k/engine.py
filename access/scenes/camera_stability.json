@@ -1,0 +1,38 @@
+[
+  {
+    "object_type": "camera",
+    "id": {
+      "name": "alpha",
+      "class": "CameraTarget",
+      "layer": "world",
+      "type": "camera"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "position": [0, 0],
+      "scale": 0.2,
+      "rotation": 0,
+      "alpha": 0
+    }
+  },
+  {
+    "object_type": "dynamic_object",
+    "id": {
+      "name": "stability_runner",
+      "class": "CameraStabilityRunner",
+      "layer": "world",
+      "type": "dynamic_object"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "position": [100, 0],
+      "scale": 0.2,
+      "rotation": 0,
+      "alpha": 1
+    },
+    "scripting": {
+      "scripts": ["access\\scripts\\camera_stability.py"],
+      "network": []
+    }
+  }
+]
