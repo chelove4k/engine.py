@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import multiprocessing
 import queue
@@ -66,6 +66,7 @@ class Game(arcade.Window):
         self._waiting_updates = {}
         self._textures = {}
         self._colliders_by_render_id = {}
+        self._info_text_by_render_id = {}
         self._camera_target_id = -1
         self._fps_elapsed = 0.0
 
@@ -250,6 +251,74 @@ class Game(arcade.Window):
                     world_polygon, settings["color"], line_width=settings["width"]
                 )
 
+    def _draw_info_categories(self, render_time):
+        categories = ("id", "name", "coords", "scripts", "transform")
+        enabled = {
+            category: self.overlay_settings.get(f"info_{category}")["enabled"]
+            for category in categories
+        }
+        if self.overlay_settings.get("info")["enabled"]:
+            enabled = {category: True for category in categories}
+        if not any(enabled.values()):
+            return
+
+        for render_id, sprite in self._sprites_by_render_id.items():
+            if sprite.alpha <= 0:
+                continue
+            record_id = self.object_cache.get(
+                (stream.Stream.INDEX_PREFIX, "render_id", render_id)
+            )
+            record = self.object_cache.get(record_id) if record_id is not None else None
+            if record is None:
+                continue
+            data = record.get("dict_data", {})
+            identity = data.get("_identity", {})
+            world = self._world_data_by_render_id.get(render_id, {})
+            position = self._interpolated_position(render_id, render_time)
+            if position is None:
+                position = world.get("position", (0, 0))
+
+            lines = []
+            if enabled["id"]:
+                lines.append(f"ID: {record.get('_id', '?')} / render {render_id}")
+            if enabled["name"]:
+                lines.append(
+                    f"{identity.get('name', '-')} | {identity.get('class', '-')} | "
+                    f"{identity.get('type', data.get('object_type', '-'))} | "
+                    f"layer: {identity.get('layer', '-')}"
+                )
+            if enabled["coords"]:
+                lines.append(f"x={position[0]:.0f}, y={position[1]:.0f}")
+            if enabled["scripts"]:
+                paths = data.get("scripting", {}).get("scripts", [])
+                lines.append(f"scripts: {', '.join(Path(path).name for path in paths) or '-'}")
+            if enabled["transform"]:
+                lines.append(
+                    f"angle={world.get('rotation', 0):.1f}, "
+                    f"scale={world.get('scale', 1):.2f}"
+                )
+            if not lines:
+                continue
+
+            screen_position = self.camera.project(position)
+            sprite_top = screen_position.y + sprite.height * self.camera.zoom / 2
+            label_y = sprite_top + 5
+            label_content = "\n".join(lines)
+            label = self._info_text_by_render_id.get(render_id)
+            if label is None:
+                label = arcade.Text(
+                    label_content, screen_position.x, label_y,
+                    color=(255, 255, 255, 255), font_size=10,
+                    width=max(100, self.width - 12), align="center",
+                    multiline=True, anchor_x="center", anchor_y="bottom",
+                )
+                self._info_text_by_render_id[render_id] = label
+            elif label.text != label_content:
+                label.text = label_content
+            label.x = screen_position.x
+            label.y = label_y
+            label.draw()
+
     def _resolve_asset_path(self, path):
         asset_path = Path(path).expanduser()
         if not asset_path.is_absolute():
@@ -264,6 +333,7 @@ class Game(arcade.Window):
         self._position_history_by_render_id.clear()
         self._waiting_updates.clear()
         self._colliders_by_render_id.clear()
+        self._info_text_by_render_id.clear()
 
     def _add_sprite(self, data):
 
@@ -315,6 +385,7 @@ class Game(arcade.Window):
         self._position_history_by_render_id.pop(render_id, None)
         self._waiting_updates.pop(render_id, None)
         self._colliders_by_render_id.pop(render_id, None)
+        self._info_text_by_render_id.pop(render_id, None)
 
     def _apply_update(self, id, sprite, object_data):
         world_data = self._world_data_by_render_id.get(id)
@@ -388,6 +459,7 @@ class Game(arcade.Window):
         self._draw_collision_overlay(render_time)
 
         self.gui_camera.use()
+        self._draw_info_categories(render_time)
         self.fps_text.draw()
 
 

@@ -18,7 +18,7 @@ from radon.visitors import ComplexityVisitor
 
 
 # Choose the scene loaded when the engine starts.
-SCENE_FILE = "camera_stability.json"
+SCENE_FILE = "scene1.json"
 
 OBJECT_TYPE_RULES = {
     "static_object": {
@@ -240,6 +240,7 @@ class Stream:
             object["dict_data"]["render_id"] = render_id
             object_type = object["dict_data"].get("object_type")
             identity = object["dict_data"].pop("id", None)
+            object["dict_data"]["_identity"] = identity or {}
             visual = object["dict_data"].pop("visual", None)
 
             if identity is not None:
@@ -440,20 +441,6 @@ class Stream:
 
         scene_path = Path(__file__).parent / "access" / "scenes" / SCENE_FILE
         self.__init_scene_objects(scene_path)
-
-        GameObject({
-            "object_type": "manager",
-            "id": {
-                "name": "camera_manager",
-                "class": "CameraManager",
-                "layer": "system",
-                "type": "manager",
-            },
-            "scripting": {
-                "scripts": ["access\\scripts\\camera.py"],
-                "network": [],
-            },
-        }).register()
 
         while True:
             # self.print(Time)

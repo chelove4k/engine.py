@@ -72,5 +72,18 @@
     "transform": {
       "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
     }
+  },
+  {
+    "object_type": "manager",
+    "id": {
+      "name": "camera_manager",
+      "class": "CameraManager",
+      "layer": "system",
+      "type": "manager"
+    },
+    "scripting": {
+      "scripts": ["access\\scripts\\camera.py"],
+      "network": []
+    }
   }
 ]

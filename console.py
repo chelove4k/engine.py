@@ -8,6 +8,12 @@ class OverlaySettings:
         self._lock = threading.Lock()
         self._features = {
             "collision": {"enabled": False, "color": (0, 255, 255, 255), "width": 2.0},
+            "info": {"enabled": False, "color": (255, 255, 255, 255)},
+            "info_id": {"enabled": False},
+            "info_name": {"enabled": False},
+            "info_coords": {"enabled": False},
+            "info_scripts": {"enabled": False},
+            "info_transform": {"enabled": False},
         }
 
     def get(self, feature):
@@ -54,12 +60,41 @@ def _overlay_command(args, overlay_settings):
         print("overlay [collision] [on|off|toggle|status]")
         print("overlay collision color <name|#RRGGBB>")
         print("overlay collision width <1..8>")
+        print("overlay info [on|off|toggle|status]")
+        print("overlay info <id|name|coords|scripts|transform> [on|off|toggle]")
         return
+    if args[0] == "info" and len(args) > 1 and args[1] in {"on", "off", "toggle"}:
+        current = overlay_settings.get("info")["enabled"]
+        enabled = not current if args[1] == "toggle" else args[1] == "on"
+        overlay_settings.update("info", enabled=enabled)
+        for category in ("info_id", "info_name", "info_coords", "info_scripts", "info_transform"):
+            overlay_settings.update(category, enabled=enabled)
+        print(f"overlay info: {'on' if enabled else 'off'}")
+        return
+    if args[0] == "info" and len(args) > 1:
+        category = {"id": "info_id", "name": "info_name", "coords": "info_coords",
+                    "scripts": "info_scripts", "transform": "info_transform"}.get(args[1])
+        if category is not None:
+            args = [category, *args[2:]]
+    if args[0] == "info" and len(args) == 1:
+        enabled = not overlay_settings.get("info")["enabled"]
+        overlay_settings.update("info", enabled=enabled)
+        for category in ("info_id", "info_name", "info_coords", "info_scripts", "info_transform"):
+            overlay_settings.update(category, enabled=enabled)
+        print(f"overlay info: {'on' if enabled else 'off'}")
+        return
+    if args[0] in {"id", "name", "coords", "scripts", "transform"}:
+        args[0] = f"info_{args[0]}"
     if args[0] in {"on", "off", "toggle", "color", "width"}:
         args.insert(0, "collision")
     if args[0] == "status":
+        if len(args) == 1:
+            for name in overlay_settings.snapshot():
+                state = overlay_settings.get(name)
+                print(f"{name}: {'on' if state['enabled'] else 'off'}")
+            return
         args = ["collision", "status"]
-    feature = {"colliders": "collision", "collisions": "collision"}.get(args[0], args[0])
+    feature = {"colliders": "collision", "collisions": "collision", "objects": "info"}.get(args[0], args[0])
     if feature not in overlay_settings.snapshot():
         print(f"Неизвестный overlay: {args[0]}")
         return
@@ -70,7 +105,8 @@ def _overlay_command(args, overlay_settings):
         overlay_settings.update(feature, enabled=enabled)
         print(f"overlay {feature}: {'on' if enabled else 'off'}")
     elif option == "status":
-        print(f"{feature}: {'on' if settings['enabled'] else 'off'}, color={settings['color']}, width={settings['width']}")
+        extra = f", color={settings['color']}, width={settings['width']}" if feature == "collision" else ""
+        print(f"{feature}: {'on' if settings['enabled'] else 'off'}{extra}")
     elif option == "color" and len(args) == 3:
         try:
             color = _parse_overlay_color(args[2])
