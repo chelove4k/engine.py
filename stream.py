@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -22,23 +23,23 @@ SCENE_FILE = "scene1.json"
 
 OBJECT_TYPE_RULES = {
     "static_object": {
-        "allowed": frozenset({"id", "visual", "transform"}),
+        "allowed": frozenset({"id", "visual", "transform", "components"}),
         "required": frozenset({"id"}),
     },
     "dynamic_object": {
-        "allowed": frozenset({"id", "visual", "scripting", "transform"}),
+        "allowed": frozenset({"id", "visual", "scripting", "transform", "components"}),
         "required": frozenset(),
     },
     "background_object": {
-        "allowed": frozenset({"visual", "transform"}),
+        "allowed": frozenset({"visual", "transform", "components"}),
         "required": frozenset({"visual"}),
     },
     "camera": {
-        "allowed": frozenset({"id", "visual", "transform"}),
+        "allowed": frozenset({"id", "visual", "transform", "components"}),
         "required": frozenset({"id", "visual"}),
     },
     "manager": {
-        "allowed": frozenset({"id", "scripting"}),
+        "allowed": frozenset({"id", "scripting", "components"}),
         "required": frozenset({"id", "scripting"}),
     },
 }
@@ -63,8 +64,8 @@ def validate_object_data(data: dict) -> None:
             f"Допустимые типы: {', '.join(OBJECT_TYPE_RULES)}"
         )
 
-    components = set(data) & {"id", "visual", "scripting", "transform"}
-    unknown = set(data) - {"object_type", "id", "visual", "scripting", "transform", "_id", "object_id", "render_id"}
+    components = set(data) & {"id", "visual", "scripting", "transform", "components"}
+    unknown = set(data) - {"object_type", "id", "visual", "scripting", "transform", "components", "_id", "object_id", "render_id"}
     if unknown:
         raise ValueError(f"Неизвестные компоненты объекта: {', '.join(sorted(unknown))}")
 
@@ -79,14 +80,16 @@ def validate_object_data(data: dict) -> None:
         raise ValueError(f"Тип {object_type!r}: {'; '.join(details)}")
 
     if identity is not None:
-        required_identity = {"name", "class", "layer"}
+        required_identity = {"name", "class"}
         missing_identity = required_identity - set(identity)
         if missing_identity:
             raise ValueError(
                 f"В компоненте 'id' отсутствуют поля: {', '.join(sorted(missing_identity))}"
             )
+        if "layer" in identity:
+            raise ValueError("id.layer was moved to visual.layer")
         if any(not isinstance(identity[field], str) for field in required_identity):
-            raise ValueError("Поля id.name, id.class и id.layer должны быть строками")
+            raise ValueError("Поля id.name и id.class должны быть строками")
 
     if "visual" in data:
         visual = data["visual"]
@@ -109,8 +112,11 @@ def validate_object_data(data: dict) -> None:
             float(visual["scale"])
             float(visual["rotation"])
             float(visual["alpha"])
+            layer = float(visual.get("layer", 0))
         except (TypeError, ValueError) as error:
-            raise ValueError("Поля visual.position/scale/rotation/alpha должны быть числами") from error
+            raise ValueError("Поля visual.position/scale/rotation/alpha/layer должны быть числами") from error
+        if not math.isfinite(layer):
+            raise ValueError("visual.layer must be a finite number")
 
     if "transform" in data:
         transform = data["transform"]
@@ -119,6 +125,18 @@ def validate_object_data(data: dict) -> None:
         if "visual" not in data:
             raise ValueError("transform collider requires visual for position, rotation, and scale")
         validate_convex_polygon(transform["polygon"])
+
+    if "components" in data:
+        specs = data["components"]
+        if not isinstance(specs, list):
+            raise ValueError("components must be a list of component definitions")
+        for index, spec in enumerate(specs):
+            if not isinstance(spec, dict):
+                raise ValueError(f"components[{index}] must be an object")
+            if not isinstance(spec.get("path"), str) or not spec["path"].endswith(".py"):
+                raise ValueError(f"components[{index}].path must be a Python file path")
+            if not isinstance(spec.get("properties", {}), dict):
+                raise ValueError(f"components[{index}].properties must be an object")
 
     if "scripting" in data:
         scripting = data["scripting"]
@@ -136,7 +154,7 @@ class Stream:
             return
         indexed_values = dict(identity)
         indexed_values.setdefault("type", object_type)
-        for field_name in ("name", "class", "layer", "type"):
+        for field_name in ("name", "class", "type"):
             value = indexed_values.get(field_name)
             if value is None:
                 continue
@@ -152,7 +170,7 @@ class Stream:
         render_key = (self.INDEX_PREFIX, "render_id", render_id)
         if self.objects_cache.get(render_key) == object_id:
             self.objects_cache.pop(render_key, None)
-        for field_name in ("name", "class", "layer", "type"):
+        for field_name in ("name", "class", "type"):
             value = self.id_cache.get(render_id, field_name)
             key = (self.INDEX_PREFIX, field_name, value)
             object_ids = list(self.objects_cache.get(key, ()))
@@ -200,11 +218,61 @@ class Stream:
                 self.print('Ошибка очереди')
 
     def __register_input_button(self, data):
+        event_type = data.get("type", "")
+        if event_type.startswith("mouse_"):
+            events_key = ("__engine_mouse__", "events")
+            state_key = ("__engine_mouse__", "state")
+            events = list(self.objects_cache.get(events_key, ()))
+            sequence = events[-1]["sequence"] + 1 if events else 1
+            event = {
+                "sequence": sequence,
+                "type": event_type,
+                "render_id": data.get("render_id"),
+                "x": float(data.get("x", 0)),
+                "y": float(data.get("y", 0)),
+                "screen_x": float(data.get("screen_x", 0)),
+                "screen_y": float(data.get("screen_y", 0)),
+                "button": data.get("button"),
+                "delta_x": float(data.get("delta_x", 0)),
+                "delta_y": float(data.get("delta_y", 0)),
+                "scroll_x": float(data.get("scroll_x", 0)),
+                "scroll_y": float(data.get("scroll_y", 0)),
+            }
+            events.append(event)
+            self.objects_cache[events_key] = events[-128:]
+
+            state = dict(self.objects_cache.get(state_key, {}))
+            buttons = set(state.get("buttons", ()))
+            if event_type == "mouse_down" and event["button"]:
+                buttons.add(event["button"])
+            elif event_type == "mouse_up" and event["button"]:
+                buttons.discard(event["button"])
+            state.update({
+                "position": (event["x"], event["y"]),
+                "screen_position": (event["screen_x"], event["screen_y"]),
+                "hovered_render_id": event["render_id"],
+                "buttons": tuple(buttons),
+            })
+            self.objects_cache[state_key] = state
+            return
+
         key = data["key"]
         if data["type"] == "key_down" and key not in self.keyboard_input:
             self.keyboard_input.append(key)
         elif data["type"] == "key_up" and key in self.keyboard_input:
             self.keyboard_input.remove(key)
+
+        if data["type"] in {"key_down", "key_up"}:
+            events_key = ("__engine_keyboard__", "events")
+            events = list(self.objects_cache.get(events_key, ()))
+            sequence = events[-1]["sequence"] + 1 if events else 1
+            events.append({
+                "sequence": sequence,
+                "type": data["type"],
+                "key": key,
+                "modifiers": data.get("modifiers", 0),
+            })
+            self.objects_cache[events_key] = events[-128:]
 
     def __register(self, data):
         id = data["id"]
@@ -234,7 +302,7 @@ class Stream:
             })
             object["dict_data"]["_id"] = id
             object["dict_data"]["_components"] = [
-                component for component in ("id", "visual", "scripting", "transform")
+                component for component in ("id", "visual", "scripting", "transform", "components")
                 if component in object["dict_data"]
             ]
             object["dict_data"]["render_id"] = render_id
@@ -244,7 +312,7 @@ class Stream:
             visual = object["dict_data"].pop("visual", None)
 
             if identity is not None:
-                for field_name in ("name", "layer", "type", "class"):
+                for field_name in ("name", "type", "class"):
                     value = identity.get(field_name, object_type if field_name == "type" else None)
                     if value is not None:
                         self.id_cache.set(render_id, field_name, value)
@@ -253,6 +321,7 @@ class Stream:
 
             if visual is not None:
                 position = visual.get("position", [0, 0])
+                layer = float(visual.get("layer", 0))
                 self.visual_cache.set_many(render_id, {
                     "x": float(position[0]),
                     "y": float(position[1]),
@@ -261,6 +330,7 @@ class Stream:
                     "scale": float(visual.get("scale", 1)),
                     "alpha": float(visual.get("alpha", 1)),
                     "sprite": str(visual.get("sprite", "")),
+                    "layer": layer,
                 })
 
             self.objects_cache[id] = object
@@ -302,7 +372,7 @@ class Stream:
 
         visual = self.visual_cache.get_many(
             render_id,
-            ("x", "y", "sim_time", "rotation", "scale", "alpha", "sprite"),
+            ("x", "y", "sim_time", "rotation", "scale", "alpha", "sprite", "layer"),
         )
 
         self.render_in_stream.put({
@@ -315,6 +385,7 @@ class Stream:
             "scale": visual["scale"],
             "rotation": visual["rotation"],
             "alpha": visual["alpha"],
+            "layer": visual["layer"],
         })
 
     def __remove(self, data):

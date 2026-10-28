@@ -4,11 +4,11 @@
     "id": {
       "name": "alpha",
       "class": "CameraTarget",
-      "layer": "world",
       "type": "camera"
     },
     "visual": {
       "sprite": "access/resources/img.png",
+      "layer": 1,
       "position": [-120, 0],
       "scale": 0.2,
       "rotation": 0,
@@ -20,11 +20,11 @@
     "id": {
       "name": "beta",
       "class": "CameraTarget",
-      "layer": "world",
       "type": "camera"
     },
     "visual": {
       "sprite": "access/resources/img.png",
+      "layer": 1,
       "position": [120, 0],
       "scale": 0.2,
       "rotation": 0,
@@ -36,11 +36,11 @@
     "id": {
       "name": "runner",
       "class": "test",
-      "layer": "world",
       "type": "dynamic_object"
     },
     "visual": {
       "sprite": "access/resources/img.png",
+      "layer": 1,
       "position": [0, 0],
       "scale": 0.2,
       "rotation": 0,
@@ -59,11 +59,11 @@
     "id": {
       "name": "tilt_trigger",
       "class": "TiltTrigger",
-      "layer": "world",
       "type": "static_object"
     },
     "visual": {
       "sprite": "access/resources/img.png",
+      "layer": 3,
       "position": [180, 0],
       "scale": 0.2,
       "rotation": 0,
@@ -71,14 +71,21 @@
     },
     "transform": {
       "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
-    }
+    },
+    "components": [
+      {
+        "path": "access\\components\\rotate_on_click.py",
+        "properties": {
+          "degrees": 90
+        }
+      }
+    ]
   },
   {
     "object_type": "manager",
     "id": {
       "name": "camera_manager",
       "class": "CameraManager",
-      "layer": "system",
       "type": "manager"
     },
     "scripting": {

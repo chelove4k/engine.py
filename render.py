@@ -61,6 +61,8 @@ class Game(arcade.Window):
 
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
+        self._render_order = []
+        self._render_order_dirty = False
         self._world_data_by_render_id = {}
         self._position_history_by_render_id = {}
         self._waiting_updates = {}
@@ -108,7 +110,8 @@ class Game(arcade.Window):
         self.main_in_stream.put({
             'command': 'input',
             'type': 'key_down',
-            'key': key_name
+            'key': key_name,
+            'modifiers': modifiers,
         })
 
     def on_key_release(self, key, modifiers):
@@ -121,8 +124,65 @@ class Game(arcade.Window):
         self.main_in_stream.put({
             'command': 'input',
             'type': 'key_up',
-            'key': key_name
+            'key': key_name,
+            'modifiers': modifiers,
         })
+
+    @staticmethod
+    def _mouse_button_name(button):
+        return {1: "left", 2: "middle", 4: "right"}.get(button, str(button))
+
+    def _sort_render_layers(self):
+        if not self._render_order_dirty:
+            return
+        self.renders.sort(
+            key=lambda sprite: (
+                self._world_data_by_render_id[sprite._engine_render_id]["layer"],
+                -sprite._engine_render_id,
+            )
+        )
+        self._render_order = [sprite._engine_render_id for sprite in self.renders]
+        self._render_order_dirty = False
+
+    def _send_mouse_event(self, event_type, x, y, button=None, dx=0, dy=0, scroll_x=0, scroll_y=0):
+        world_position = self.camera.unproject((x, y))
+        point = (world_position.x, world_position.y)
+        target_render_id = None
+        self._sort_render_layers()
+        for render_id in reversed(self._render_order):
+            sprite = self._sprites_by_render_id[render_id]
+            if sprite.alpha > 0 and sprite.collides_with_point(point):
+                target_render_id = render_id
+                break
+        self.main_in_stream.put({
+            "command": "input",
+            "type": event_type,
+            "render_id": target_render_id,
+            "x": point[0],
+            "y": point[1],
+            "screen_x": x,
+            "screen_y": y,
+            "button": self._mouse_button_name(button) if button is not None else None,
+            "delta_x": dx,
+            "delta_y": dy,
+            "scroll_x": scroll_x,
+            "scroll_y": scroll_y,
+        })
+
+    def on_mouse_press(self, x, y, button, modifiers):
+        self._send_mouse_event("mouse_down", x, y, button)
+
+    def on_mouse_release(self, x, y, button, modifiers):
+        self._send_mouse_event("mouse_up", x, y, button)
+
+    def on_mouse_motion(self, x, y, dx, dy):
+        self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
+
+    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+        self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
+
+    def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+        self._send_mouse_event("mouse_scroll", x, y, scroll_x=scroll_x, scroll_y=scroll_y)
 
     def _render_queue(self):
         while True:
@@ -157,6 +217,7 @@ class Game(arcade.Window):
             entry = self.visual_cache.get_changed_values(render_id)
             if entry and sprite is not None:
                 self._apply_update(render_id, sprite, entry)
+        self._sort_render_layers()
 
     def _read_camera_state(self):
         self._camera_target_id = self.camera_target_cache.get()
@@ -285,7 +346,7 @@ class Game(arcade.Window):
                 lines.append(
                     f"{identity.get('name', '-')} | {identity.get('class', '-')} | "
                     f"{identity.get('type', data.get('object_type', '-'))} | "
-                    f"layer: {identity.get('layer', '-')}"
+                    f"layer: {world.get('layer', 0):g}"
                 )
             if enabled["coords"]:
                 lines.append(f"x={position[0]:.0f}, y={position[1]:.0f}")
@@ -329,6 +390,8 @@ class Game(arcade.Window):
         self.renders.clear()
 
         self._sprites_by_render_id.clear()
+        self._render_order.clear()
+        self._render_order_dirty = False
         self._world_data_by_render_id.clear()
         self._position_history_by_render_id.clear()
         self._waiting_updates.clear()
@@ -345,6 +408,7 @@ class Game(arcade.Window):
             'scale':    data.get('scale',1.0),
             'rotation': data.get('rotation', 0.0),
             'alpha':    data.get('alpha', 1.0),
+            'layer':    float(data.get('layer', 0.0)),
         }
 
         image_path = self._resolve_asset_path(data['path'])
@@ -357,11 +421,13 @@ class Game(arcade.Window):
             scale=world_data['scale'],
             angle=world_data['rotation'],
         )
+        sprite._engine_render_id = render_id
 
         self.renders.append(sprite)
 
         self._sprites_by_render_id[render_id] = sprite
         self._world_data_by_render_id[render_id] = world_data
+        self._render_order_dirty = True
         collider_polygon = self._get_collider_polygon(render_id)
         if collider_polygon is not None:
             self._colliders_by_render_id[render_id] = collider_polygon
@@ -380,6 +446,7 @@ class Game(arcade.Window):
 
         if sprite is not None:
             self.renders.remove(sprite)
+            self._render_order_dirty = True
 
         self._world_data_by_render_id.pop(render_id, None)
         self._position_history_by_render_id.pop(render_id, None)
@@ -419,6 +486,10 @@ class Game(arcade.Window):
 
         if 'alpha' in object_data:
             world_data['alpha'] = object_data['alpha']
+
+        if 'layer' in object_data:
+            world_data['layer'] = float(object_data['layer'])
+            self._render_order_dirty = True
 
         if 'x' in object_data or 'y' in object_data:
             self._record_position(
@@ -530,7 +601,8 @@ def main():
         'rotation' : float,
         'scale' : float,
         'alpha' : float,
-        'sprite' : str
+        'sprite' : str,
+        'layer' : float,
     }
     visual_locks = [multiprocessing.Lock() for _ in range(64)]
     raw_visual_cache = VisualCache(1024 * 256, visual_struct, visual_locks)
@@ -538,7 +610,6 @@ def main():
 
     id_struct =  {
         'name' : str,
-        'layer' : str,
         'type' : str,
         'class' : str,
         'id' : str,
