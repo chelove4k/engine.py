@@ -7,7 +7,7 @@
       "type": "camera"
     },
     "visual": {
-      "sprite": "access/resources/img.png",
+      "sprite": "None",
       "layer": 1,
       "position": [-120, 0],
       "scale": 0.2,
@@ -23,7 +23,7 @@
       "type": "camera"
     },
     "visual": {
-      "sprite": "access/resources/img.png",
+      "sprite": "None",
       "layer": 1,
       "position": [120, 0],
       "scale": 0.2,
@@ -72,14 +72,9 @@
     "transform": {
       "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
     },
-    "components": [
-      {
-        "path": "access\\components\\rotate_on_click.py",
-        "properties": {
-          "degrees": 90
-        }
-      }
-    ]
+    "rotate_on_click": {
+      "degrees": 90
+    }
   },
   {
     "object_type": "manager",

@@ -21,7 +21,12 @@ from config import (
     SCRIPT_UPDATE_PERIOD,
 )
 from memory_lib import ObjectCache, ValueCache
-from scene import validate_object_data
+from scene import (
+    RESERVED_COMPONENT_PROPERTIES,
+    component_specs_from_data,
+    custom_component_names,
+    validate_object_data,
+)
 
 _DEPENDENCIES = contextvars.ContextVar("pyengine_dependencies", default=None)
 _REGISTRATION_LOCK = threading.Lock()
@@ -582,7 +587,7 @@ class GameObject:
         self.__dict__["_tick_cache"] = deps.get("tick_cache")
 
         self.dict_data = copy.deepcopy(source)
-        self.component_specs = copy.deepcopy(source.get("components", []))
+        self.component_specs = copy.deepcopy(component_specs_from_data(source))
         self._id = source.get("_id") or uuid.uuid4().hex
         self._object_id = source.get("object_id")
         self._render_id = source.get("render_id")
@@ -1028,6 +1033,8 @@ class script:
                 source["components"] = components["components"]
             if "scripting" in component_names:
                 source["scripting"] = components["scripting"]
+            for custom_name in custom_component_names(components):
+                source[custom_name] = copy.deepcopy(components[custom_name])
             if "visual" in component_names:
                 visual = self.__visual_cache.get_many(
                     render_id,
@@ -1120,15 +1127,10 @@ class script:
             self.Keyboard = Keyboard(self, objects_cache)
             self.__mouse_is_over = self.Mouse.is_over()
             self.ComponentConfig = copy.deepcopy(game_object.get("_component_config", {}))
-            reserved_component_properties = {
-                "GameObject", "Camera", "Mouse", "Keyboard", "ComponentConfig", "GlobalTime",
-                "start", "update", "fixed_update", "stop", "is_pressed",
-                "get_mouse_clicks", "find_object", "create_object", "creat_object",
-            }
             for property_name, property_value in self.ComponentConfig.items():
                 if (not property_name.isidentifier()
                         or property_name.startswith("_")
-                        or property_name in reserved_component_properties
+                        or property_name in RESERVED_COMPONENT_PROPERTIES
                         or callable(getattr(self, property_name, None))):
                     raise ValueError(f"Invalid or reserved component property: {property_name!r}")
                 setattr(self, property_name, copy.deepcopy(property_value))
@@ -1224,5 +1226,5 @@ class script:
 
 
 class Component(script):
-    """Reusable object behavior configured through a scene component entry."""
+    """Reusable object behavior configured by a top-level scene component."""
     pass

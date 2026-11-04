@@ -163,6 +163,31 @@ class TextureFailureTests(unittest.TestCase):
         self.assertTrue(game.messages)
 
 
+class NoSpriteTests(unittest.TestCase):
+    class FakeGame:
+        _no_sprite_texture = object()
+
+        def _resolve_asset_path(self, path):
+            return "resolved:" + path
+
+        def _load_texture(self, path):
+            return ("loaded", path)
+
+        _texture_for_path = render.Game._texture_for_path
+
+    def test_none_sprite_uses_transparent_texture(self):
+        game = self.FakeGame()
+        self.assertIs(game._texture_for_path("None"), game._no_sprite_texture)
+        self.assertIs(game._texture_for_path("  none  "), game._no_sprite_texture)
+
+    def test_real_sprite_path_is_still_loaded(self):
+        game = self.FakeGame()
+        self.assertEqual(
+            game._texture_for_path("img.png"),
+            ("loaded", "resolved:img.png"),
+        )
+
+
 class KeyboardTests(unittest.TestCase):
     class Owner:
         def is_pressed(self, key):
@@ -186,6 +211,18 @@ class ValidationTests(unittest.TestCase):
         validate_object_data({
             "object_type": "static_object",
             "id": {"name": "wall", "class": "Wall"},
+        })
+
+    def test_no_sprite_marker_is_valid(self):
+        validate_object_data({
+            "object_type": "background_object",
+            "visual": {
+                "sprite": "None",
+                "position": [0, 0],
+                "scale": 1,
+                "rotation": 0,
+                "alpha": 1,
+            },
         })
 
     def test_type_mismatch_is_rejected(self):
@@ -225,6 +262,66 @@ class ValidationTests(unittest.TestCase):
                 "id": {"name": "manager", "class": "Manager"},
                 "scripting": {"scripts": [], "network": "tcp"},
             })
+
+    def test_top_level_component_is_valid(self):
+        validate_object_data({
+            "object_type": "static_object",
+            "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+            "rotate_on_click": {"degrees": 90},
+        })
+
+    def test_top_level_component_properties_must_be_object(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "static_object",
+                "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+                "rotate_on_click": [90],
+            })
+
+    def test_unknown_component_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "static_object",
+                "id": {"name": "wall", "class": "Wall"},
+                "definitely_missing_component": {},
+            })
+
+    def test_component_properties_wrapper_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "static_object",
+                "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+                "rotate_on_click": {"properties": {"degrees": 90}},
+            })
+
+    def test_component_path_wrapper_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "static_object",
+                "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+                "rotate_on_click": {
+                    "path": "access/components/rotate_on_click.py",
+                    "degrees": 90,
+                },
+            })
+
+    def test_reserved_component_property_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "static_object",
+                "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+                "rotate_on_click": {"update": 90},
+            })
+
+    def test_legacy_components_list_is_still_valid(self):
+        validate_object_data({
+            "object_type": "static_object",
+            "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+            "components": [{
+                "path": "access/components/rotate_on_click.py",
+                "properties": {"degrees": 90},
+            }],
+        })
 
 
 class MemoryCacheTests(unittest.TestCase):
@@ -452,6 +549,58 @@ class CreateObjectTests(CacheTestCase):
         self.assertEqual(identity.get(0, "name"), "wall")
         self.assertEqual([m["command"] for m in requests.messages], ["register"])
 
+    def test_top_level_component_is_registered_with_direct_properties(self):
+        visual, identity = self.make_caches()
+        deps, requests, _ = self.make_deps(visual, identity)
+
+        game_object = create_object({
+            "object_type": "static_object",
+            "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+            "rotate_on_click": {"degrees": 90},
+        }, deps=deps)
+
+        self.assertEqual(game_object.component_specs, [{
+            "name": "rotate_on_click",
+            "path": "access/components/rotate_on_click.py",
+            "properties": {"degrees": 90},
+        }])
+        add_script = [
+            message for message in requests.messages
+            if message["command"] == "add_script"
+        ]
+        self.assertEqual(len(add_script), 1)
+        self.assertEqual(
+            add_script[0]["path"],
+            "access/components/rotate_on_click.py",
+        )
+        self.assertEqual(
+            add_script[0]["script_data"]["_component_config"],
+            {"degrees": 90},
+        )
+
+    def test_legacy_components_are_still_registered(self):
+        visual, identity = self.make_caches()
+        deps, requests, _ = self.make_deps(visual, identity)
+
+        create_object({
+            "object_type": "static_object",
+            "id": {"name": "tilt_trigger", "class": "TiltTrigger"},
+            "components": [{
+                "path": "access/components/rotate_on_click.py",
+                "properties": {"degrees": 45},
+            }],
+        }, deps=deps)
+
+        add_script = [
+            message for message in requests.messages
+            if message["command"] == "add_script"
+        ]
+        self.assertEqual(len(add_script), 1)
+        self.assertEqual(
+            add_script[0]["script_data"]["_component_config"],
+            {"degrees": 45},
+        )
+
     def test_create_list(self):
         visual, identity = self.make_caches()
         deps, requests, responses = self.make_deps(visual, identity)
@@ -546,6 +695,59 @@ class CreateObjectTests(CacheTestCase):
             "script_data": {"object_type": "unknown"},
         })
         self.assertIn("error", responses.items[-1]["two"])
+
+
+class FindObjectComponentTests(CacheTestCase):
+    def test_find_object_preserves_top_level_component(self):
+        visual, identity = self.make_caches()
+        identity.set_many(0, {
+            "name": "tilt_trigger",
+            "class": "TiltTrigger",
+            "type": "static_object",
+            "id": "object-id",
+        })
+        visual.set_many(0, {
+            "sprite": "None",
+            "x": 10.0,
+            "y": 20.0,
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+            "layer": 0.0,
+        })
+        objects_cache = {
+            ("__engine_index__", "name", "tilt_trigger"): ["object-id"],
+            "object-id": {
+                "_object_id": 7,
+                "_render_id": 0,
+                "dict_data": {
+                    "object_type": "static_object",
+                    "_components": ["id", "visual", "rotate_on_click"],
+                    "rotate_on_click": {"degrees": 90},
+                },
+            },
+        }
+        deps = {
+            "objects_cache": objects_cache,
+            "lock": threading.Lock(),
+            "visual_cache": visual,
+            "id_cache": identity,
+        }
+
+        probe = script.__new__(script)
+        probe.__dict__["_script__objects_cache"] = objects_cache
+        probe.__dict__["_script__id_cache"] = identity
+        probe.__dict__["_script__visual_cache"] = visual
+        probe.__dict__["_script__dependencies"] = deps
+
+        found = script.find_object(probe, "name", "tilt_trigger")
+        self.assertIsNotNone(found)
+        self.assertEqual(found._object_id, 7)
+        self.assertEqual(found.component_specs, [{
+            "name": "rotate_on_click",
+            "path": "access/components/rotate_on_click.py",
+            "properties": {"degrees": 90},
+        }])
 
 
 class StopLifecycleTests(unittest.TestCase):

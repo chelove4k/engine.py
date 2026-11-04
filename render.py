@@ -25,6 +25,17 @@ from config import (
 from memory_lib import ObjectCache, ValueCache
 
 
+NO_SPRITE = "None"
+
+
+def _is_no_sprite(path):
+    """Return True when the scene uses the textual no-sprite marker."""
+
+    return path is None or (
+        isinstance(path, str) and path.strip().casefold() == NO_SPRITE.casefold()
+    )
+
+
 class Game(arcade.Window):
     POSITION_INTERPOLATION_DELAY = CONFIG_POSITION_INTERPOLATION_DELAY
     POSITION_HISTORY_SIZE = CONFIG_POSITION_HISTORY_SIZE
@@ -89,6 +100,9 @@ class Game(arcade.Window):
         self._failed_textures = set()
         self._fallback_texture = arcade.make_soft_square_texture(
             64, (255, 0, 255, 255), center_alpha=255, outer_alpha=255
+        )
+        self._no_sprite_texture = arcade.Texture.create_empty(
+            "__engine_no_sprite__", (1, 1)
         )
         self._colliders_by_render_id = {}
         self._info_text_by_render_id = {}
@@ -474,6 +488,13 @@ class Game(arcade.Window):
             asset_path = self.PROJECT_DIR / asset_path
         return str(asset_path.resolve())
 
+    def _texture_for_path(self, path):
+        """Resolve a sprite path, or return a transparent texture for "None"."""
+
+        if _is_no_sprite(path):
+            return self._no_sprite_texture
+        return self._load_texture(self._resolve_asset_path(path))
+
     def _load_texture(self, path):
         """Load a texture, returning a visible placeholder on failure."""
 
@@ -524,8 +545,8 @@ class Game(arcade.Window):
             'layer':    float(data.get('layer', 0.0)),
         }
 
-        image_path = self._resolve_asset_path(data['path'])
-        texture = self._load_texture(image_path)
+        image_path = data.get('path')
+        texture = self._texture_for_path(image_path)
         sprite = arcade.Sprite(
             path_or_texture=texture,
             scale=world_data['scale'],
@@ -579,9 +600,7 @@ class Game(arcade.Window):
         if world_data is None:
             return
         if 'sprite' in object_data:
-            path = self._resolve_asset_path(object_data['sprite'])
-            texture = self._load_texture(path)
-            sprite.texture = texture
+            sprite.texture = self._texture_for_path(object_data['sprite'])
 
         tick = object_data.get('tick')
         if tick is not None:

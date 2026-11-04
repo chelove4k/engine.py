@@ -7,6 +7,7 @@ script loop from drifting apart.
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
+COMPONENTS_DIR = PROJECT_DIR / "access" / "components"
 
 
 def resolve_project_path(path):

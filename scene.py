@@ -6,10 +6,11 @@ them without importing the rendering stack or creating circular imports.
 
 from __future__ import annotations
 
+import copy
 import math
 
 from collision import validate_convex_polygon
-from config import MAX_CACHE_STRING_BYTES
+from config import COMPONENTS_DIR, MAX_CACHE_STRING_BYTES, PROJECT_DIR
 
 
 OBJECT_TYPE_RULES = {
@@ -35,11 +36,121 @@ OBJECT_TYPE_RULES = {
     },
 }
 
-_ENGINE_FIELDS = frozenset(
-    {"object_type", "id", "visual", "scripting", "transform", "components",
-     "_id", "object_id", "render_id"}
+ENGINE_COMPONENT_NAMES = frozenset(
+    {"id", "visual", "scripting", "transform", "components"}
 )
-_COMPONENT_FIELDS = frozenset({"id", "visual", "scripting", "transform", "components"})
+ENGINE_FIELDS = frozenset(
+    {"object_type", *ENGINE_COMPONENT_NAMES, "_id", "object_id", "render_id"}
+)
+
+# These names belong to the engine or to the script lifecycle and cannot be
+# overwritten by custom component properties.
+RESERVED_COMPONENT_PROPERTIES = frozenset({
+    "GameObject", "Camera", "Mouse", "Keyboard", "ComponentConfig", "GlobalTime",
+    "start", "update", "fixed_update", "stop", "is_pressed",
+    "get_mouse_clicks", "find_object", "create_object", "creat_object",
+})
+
+
+def custom_component_names(data: dict) -> list[str]:
+    """Return top-level keys that describe custom components."""
+
+    if not isinstance(data, dict):
+        return []
+    return [
+        name
+        for name in data
+        if isinstance(name, str)
+        and not name.startswith("_")
+        and name not in ENGINE_FIELDS
+    ]
+
+
+def resolve_component_path(name: str):
+    """Resolve a component name to access/components/<name>.py."""
+
+    if not isinstance(name, str) or not name.isidentifier():
+        return None
+    if not COMPONENTS_DIR.is_dir():
+        return None
+
+    exact = COMPONENTS_DIR / f"{name}.py"
+    if exact.is_file():
+        return exact.resolve()
+
+    # Be forgiving about filename case on case-sensitive filesystems while
+    # still passing the real file name to the script loader (the class name
+    # must match the file stem).
+    matches = sorted(
+        path
+        for path in COMPONENTS_DIR.glob("*.py")
+        if path.stem.casefold() == name.casefold()
+    )
+    if len(matches) == 1:
+        return matches[0].resolve()
+    return None
+
+
+def _component_path_for_spec(path) -> str:
+    try:
+        return path.relative_to(PROJECT_DIR).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def validate_component_properties(component_name: str, properties) -> None:
+    """Validate properties written directly inside a component entry."""
+
+    if not isinstance(properties, dict):
+        raise ValueError(
+            f"Компонент {component_name!r} должен быть объектом со свойствами"
+        )
+    for property_name in properties:
+        if property_name in {"path", "properties"}:
+            raise ValueError(
+                f"Свойства компонента {component_name!r} задаются напрямую, "
+                f"без поля {property_name!r}"
+            )
+        if (not isinstance(property_name, str)
+                or not property_name.isidentifier()
+                or property_name.startswith("_")
+                or property_name in RESERVED_COMPONENT_PROPERTIES):
+            raise ValueError(
+                f"Недопустимое свойство {property_name!r} "
+                f"у компонента {component_name!r}"
+            )
+
+
+def component_specs_from_data(data: dict) -> list[dict]:
+    """Collect legacy ``components`` entries and top-level components."""
+
+    specs = []
+    legacy_specs = data.get("components", []) or []
+    if not isinstance(legacy_specs, list):
+        raise ValueError("components must be a list of component definitions")
+    for index, spec in enumerate(legacy_specs):
+        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
+            raise ValueError(f"components[{index}] must contain a path")
+        specs.append({
+            "path": spec["path"],
+            "properties": copy.deepcopy(spec.get("properties", {})),
+        })
+
+    for name in custom_component_names(data):
+        resolved = resolve_component_path(name)
+        if resolved is None:
+            raise ValueError(
+                f"Неизвестный компонент {name!r}: "
+                f"нет файла access/components/{name}.py"
+            )
+        properties = data[name]
+        validate_component_properties(name, properties)
+        specs.append({
+            "name": name,
+            "path": _component_path_for_spec(resolved),
+            "properties": copy.deepcopy(properties),
+        })
+    return specs
 
 
 def validate_cache_string(value: str, field_name: str, *, allow_empty: bool = False) -> None:
@@ -86,10 +197,7 @@ def validate_object_data(data: dict) -> None:
             f"Допустимые типы: {', '.join(OBJECT_TYPE_RULES)}"
         )
 
-    components = set(data) & _COMPONENT_FIELDS
-    unknown = set(data) - _ENGINE_FIELDS
-    if unknown:
-        raise ValueError(f"Неизвестные компоненты объекта: {', '.join(sorted(unknown))}")
+    components = set(data) & ENGINE_COMPONENT_NAMES
 
     forbidden = components - rules["allowed"]
     missing = rules["required"] - components
@@ -100,6 +208,26 @@ def validate_object_data(data: dict) -> None:
         if missing:
             details.append(f"обязательны компоненты: {', '.join(sorted(missing))}")
         raise ValueError(f"Тип {object_type!r}: {'; '.join(details)}")
+
+    # Any other top-level key is a custom component.  Its name must match a
+    # Python file in access/components, and its value holds the properties
+    # directly (no "path"/"properties" wrapper).
+    for name in data:
+        if name in ENGINE_FIELDS:
+            continue
+        if (not isinstance(name, str)
+                or not name.isidentifier()
+                or name.startswith("_")):
+            raise ValueError(
+                f"Недопустимое имя компонента {name!r}: используйте имя "
+                f"класса и файла из access/components"
+            )
+        if resolve_component_path(name) is None:
+            raise ValueError(
+                f"Неизвестный компонент {name!r}: "
+                f"нет файла access/components/{name}.py"
+            )
+        validate_component_properties(name, data[name])
 
     if identity is not None:
         required_identity = {"name", "class"}

@@ -10,7 +10,12 @@ import traceback
 
 from config import WORKER_READY_TIMEOUT, resolve_project_path
 from pyengine import GameObject
-from scene import OBJECT_TYPE_RULES, validate_cache_string, validate_object_data
+from scene import (
+    OBJECT_TYPE_RULES,
+    custom_component_names,
+    validate_cache_string,
+    validate_object_data,
+)
 import scripter_runner
 from memory_lib import ObjectCache, ValueCache
 
@@ -206,7 +211,7 @@ class Stream:
                     component
                     for component in ("id", "visual", "scripting", "transform", "components")
                     if component in object["dict_data"]
-                ]
+                ] + custom_component_names(object["dict_data"])
                 object_type = object["dict_data"].get("object_type")
                 identity = object["dict_data"].pop("id", None)
                 object["dict_data"]["_identity"] = identity or {}
@@ -321,8 +326,10 @@ class Stream:
             # (for example an idle camera target) must not hold back the
             # shared render tick.
             scripting = dict_data.get("scripting") or {}
-            scripted = bool(scripting.get("scripts")) or bool(
-                dict_data.get("components")
+            scripted = (
+                bool(scripting.get("scripts"))
+                or bool(dict_data.get("components"))
+                or bool(custom_component_names(dict_data))
             )
 
         visual = self.visual_cache.get_many(
