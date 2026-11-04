@@ -5,7 +5,6 @@ class camera_stability(script):
     SPEED = 2.0
 
     def start(self):
-        self.GameObject.render()
         self.position = self.GameObject.Visual.position
 
     def fixed_update(self):

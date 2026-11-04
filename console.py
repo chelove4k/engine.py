@@ -132,29 +132,45 @@ def _overlay_command(args, overlay_settings):
 def console(shared_queue, cache, proccess_status_info, vcache_data, icache_data, overlay_settings=None):
     vcache = ObjectCache(*vcache_data)
     icache = ObjectCache(*icache_data)
-    while True:
-        try:
-            parts = input('').strip().lower().split()
+    try:
+        while True:
+            try:
+                parts = input('').strip().lower().split()
+            except EOFError:
+                return
+            except KeyboardInterrupt:
+                return
+
             if not parts:
                 continue
+
             command, arg = parts[0], parts[1:]
-            
-            if not command:
-                continue
-            elif command == 'show':
-                print('-' * 10)
-                for i in cache:
-                    print(i, cache[i]) if cache[i] is not None else print(i, None)
-                print('-' * 10)
-            elif command == 'pshow':
-                print(proccess_status_info)
-            elif command == 'vshow':
-                print(vcache.get(int(arg[0]), arg[1]))
-            elif command == 'ishow':
-                print(icache.get(int(arg[0]), arg[1]))
-            elif command == 'overlay':
-                _overlay_command(arg, overlay_settings)
-            else:
-                shared_queue.put(command)
-        except Exception as e:
-            print(e)
+            try:
+                if command == 'show':
+                    print('-' * 10)
+                    for key, value in list(cache.items()):
+                        print(key, value)
+                    print('-' * 10)
+                elif command == 'pshow':
+                    print(proccess_status_info)
+                elif command == 'vshow':
+                    if len(arg) < 2:
+                        print("Использование: vshow <segment_id> <field>")
+                        continue
+                    print(vcache.get(int(arg[0]), arg[1]))
+                elif command == 'ishow':
+                    if len(arg) < 2:
+                        print("Использование: ishow <segment_id> <field>")
+                        continue
+                    print(icache.get(int(arg[0]), arg[1]))
+                elif command == 'overlay':
+                    _overlay_command(arg, overlay_settings)
+                else:
+                    shared_queue.put(command)
+            except Exception as error:
+                print(error)
+    finally:
+        # These are read-only attachments to shared memory owned by the
+        # renderer/main process, so they must be detached, not unlinked.
+        vcache.detach()
+        icache.detach()

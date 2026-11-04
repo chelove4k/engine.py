@@ -2,43 +2,54 @@ import multiprocessing
 from multiprocessing import shared_memory
 import struct
 
+from config import MAX_CACHE_STRING_BYTES
+
 
 class ValueCache:
     MEMORY_TYPES_SIZE = {
-            float: 4,
-            int: 4,
-            str: 64
-        }
+        float: 4,
+        int: 4,
+        str: MAX_CACHE_STRING_BYTES,
+    }
 
-    def __init__(self, data = None, name=None, lock=None):
+    def __init__(self, data=None, name=None, lock=None):
         self.__memory = None
+        self._owner = False
+
         if isinstance(data, list):
             name = data[1]
             lock = data[2]
             data = data[0]
 
         if data is not None:
-            self.size = self.MEMORY_TYPES_SIZE[type(data)] + 1
+            try:
+                self.size = self.MEMORY_TYPES_SIZE[type(data)] + 1
+            except KeyError as error:
+                raise TypeError(f"Unsupported ValueCache type: {type(data)!r}") from error
             if type(data) is str:
                 self.fmt_char = "s"
             elif type(data) is float:
-                self.fmt_char = 'f'
+                self.fmt_char = "f"
             else:
-                self.fmt_char = 'i'
+                self.fmt_char = "i"
 
         if name is not None:
+            if lock is None:
+                raise ValueError("A shared lock is required when attaching a ValueCache")
             self.__memory = shared_memory.SharedMemory(name=name)
             self.lock = lock
             self.name = name
-
+            self._owner = False
         elif name is None:
+            if data is None:
+                raise ValueError("ValueCache requires an initial value or a shared memory name")
             self.__memory = shared_memory.SharedMemory(create=True, size=self.size)
             self.lock = multiprocessing.Lock()
             self.name = [None, self.__memory.name, self.lock]
+            self._owner = True
 
-            
-            for i in range(self.size):
-                self.__memory.buf[i] = 0
+            for index in range(self.size):
+                self.__memory.buf[index] = 0
 
             if type(data) is str:
                 self.__memory.buf[0] = 2
@@ -48,91 +59,113 @@ class ValueCache:
                 self.__memory.buf[0] = 1
 
             self.set(data)
-        
 
     def get_fml(self):
-        fmt = None
         raw_fml = self.__memory.buf[0]
         if raw_fml == 0:
-            fmt = 'f'
+            return "f"
         if raw_fml == 1:
-            fmt = 'i'
+            return "i"
         if raw_fml == 2:
-            fmt = '64s'
-        return fmt
-    
+            return f"{MAX_CACHE_STRING_BYTES}s"
+        raise ValueError(f"Unknown ValueCache payload type: {raw_fml}")
+
     def get_size(self):
-        fml = self.get_fml()
-        size = 4
-        if fml == '64s':
-            size = 64
-        return size
-    
+        return MAX_CACHE_STRING_BYTES if self.get_fml().endswith("s") else 4
+
     def get(self):
         with self.lock:
-            memory_segment = bytes(self.__memory.buf[1:self.get_size()+1])
+            memory_segment = bytes(self.__memory.buf[1:self.get_size() + 1])
             raw_val = struct.unpack(self.get_fml(), memory_segment)[0]
-            
+
             if isinstance(raw_val, bytes):
-                return raw_val.rstrip(b'\x00').decode('utf-8', errors='ignore')
+                return raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
             return raw_val
 
     def set(self, data):
         if isinstance(data, str):
-            data = data.encode('utf-8')[:64].ljust(64, b'\x00')
+            encoded = data.encode("utf-8")
+            if len(encoded) > MAX_CACHE_STRING_BYTES:
+                raise ValueError(
+                    f"String value is too long: {len(encoded)} bytes "
+                    f"(maximum {MAX_CACHE_STRING_BYTES})"
+                )
+            data = encoded.ljust(MAX_CACHE_STRING_BYTES, b"\x00")
 
-        packed_data = struct.pack(self.get_fml(), data) 
+        packed_data = struct.pack(self.get_fml(), data)
 
         with self.lock:
-            self.__memory.buf[1:self.get_size()+1] = packed_data
+            self.__memory.buf[1:self.get_size() + 1] = packed_data
+
     def close(self):
-            memory = self.__memory
-            if memory is None:
-                return
-            self.__memory = None
-            memory.close()
+        memory = self.__memory
+        if memory is None:
+            return
+        self.__memory = None
+        memory.close()
+        if self._owner:
             try:
                 memory.unlink()
             except FileNotFoundError:
                 pass
 
+    def detach(self):
+        """Close this attachment without removing shared memory for other users."""
+        memory = self.__memory
+        if memory is None:
+            return
+        self.__memory = None
+        memory.close()
+
+
 class ObjectCache:
     MEMORY_TYPES_SIZE = {
         float: 4,
         int: 4,
-        str: 64
+        str: MAX_CACHE_STRING_BYTES,
     }
-    
+
     def __init__(self, id_or_name, data, locks=None):
         self.__memory = None
-        self._fields = {} 
+        self._fields = {}
+        self.segment_len = 4
+        self.field_bit_mapping = {}
+        self._owner = False
 
-        self.segment_len = 4 
-        self.field_bit_mapping = {} 
-        
+        if len(data) > 31:
+            raise ValueError("ObjectCache supports at most 31 fields (32-bit dirty mask)")
+
         for bit_index, field_name in enumerate(data):
+            if field_name in self._fields:
+                raise ValueError(f"Duplicate ObjectCache field: {field_name!r}")
             size = self.MEMORY_TYPES_SIZE[data[field_name]]
             if data[field_name] is str:
                 fmt_char = f"{size}s"
             elif data[field_name] is float:
-                fmt_char = 'f'
+                fmt_char = "f"
             else:
-                fmt_char = 'i'
+                fmt_char = "i"
 
-            self.__dict__[field_name] = [[self.segment_len, self.segment_len + size], fmt_char]
+            self._fields[field_name] = (
+                [self.segment_len, self.segment_len + size],
+                fmt_char,
+            )
             self.field_bit_mapping[field_name] = 1 << bit_index
             self.segment_len += size
 
         if isinstance(id_or_name, str):
+            if locks is None:
+                raise ValueError("A shared lock list is required when attaching an ObjectCache")
             self.__memory = shared_memory.SharedMemory(name=id_or_name)
             self.key = id_or_name
-
+            self._owner = False
         elif isinstance(id_or_name, int):
             self.__memory = shared_memory.SharedMemory(create=True, size=id_or_name)
             self.key = self.__memory.name
-            
+            self._owner = True
             self.__memory.buf[:] = bytes(self.__memory.size)
-        
+        else:
+            raise TypeError("ObjectCache expects a shared memory name or a size in bytes")
 
         self.segments_count = self.__memory.size // self.segment_len
         if locks is None:
@@ -143,48 +176,58 @@ class ObjectCache:
         else:
             self.locks = [locks]
 
+    @property
+    def capacity(self):
+        return self.segments_count
+
     def _lock_for(self, segment_id):
         return self.locks[segment_id % len(self.locks)]
 
+    def _field(self, object_name):
+        try:
+            return self._fields[object_name]
+        except KeyError as error:
+            raise TypeError(f"Запрошен незаданый обьект: {object_name!r}") from error
+
     def get_frame(self, segment_id, object_name):
         start = segment_id * self.segment_len
-        bounds = self.__dict__[object_name][0]
-        
+        bounds = self._field(object_name)[0]
         return [bounds[0] + start, bounds[1] + start]
 
     def get(self, segment_id: int, object_name: str):
-        if object_name not in self.__dict__:
-            raise TypeError('Запрошен незаданый обьект')
+        self._field(object_name)
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError('Индекс сегмента выходит за границы')
-        
+            raise IndexError("Индекс сегмента выходит за границы")
+
         frame = self.get_frame(segment_id, object_name)
-        fmt_type = self.__dict__[object_name][1]
+        fmt_type = self._field(object_name)[1]
 
         with self._lock_for(segment_id):
             memory_segment = bytes(self.__memory.buf[frame[0]:frame[1]])
             raw_val = struct.unpack(fmt_type, memory_segment)[0]
-            
+
             if isinstance(raw_val, bytes):
-                return raw_val.rstrip(b'\x00').decode('utf-8', errors='ignore')
+                return raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
             return raw_val
 
     def set(self, segment_id: int, object_name: str, data):
-        if object_name not in self.__dict__:
-            raise TypeError('Запрошен незаданый обьект')
+        self._field(object_name)
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError('Индекс сегмента выходит за границы')
+            raise IndexError("Индекс сегмента выходит за границы")
 
         frame = self.get_frame(segment_id, object_name)
-        fmt_type = self.__dict__[object_name][1]
+        fmt_type = self._field(object_name)[1]
 
         if isinstance(data, str):
-            data = data.encode('utf-8')
-            if len(data) > 64:
-                raise ValueError(f"Строка слишком длинная! Максимум 64 байта, получено {len(data)}")
+            data = data.encode("utf-8")
+            if len(data) > MAX_CACHE_STRING_BYTES:
+                raise ValueError(
+                    f"Строка слишком длинная! Максимум {MAX_CACHE_STRING_BYTES} байт, "
+                    f"получено {len(data)}"
+                )
 
-        packed_data = struct.pack(fmt_type, data) 
-        
+        packed_data = struct.pack(fmt_type, data)
+
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
 
@@ -193,23 +236,22 @@ class ObjectCache:
                 return
             self.__memory.buf[frame[0]:frame[1]] = packed_data
 
-            current_mask = struct.unpack('i', self.__memory.buf[mask_start:mask_end])[0]
+            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
             new_mask = current_mask | self.field_bit_mapping[object_name]
-            self.__memory.buf[mask_start:mask_end] = struct.pack('i', new_mask)
+            self.__memory.buf[mask_start:mask_end] = struct.pack("i", new_mask)
 
     def get_many(self, segment_id: int, object_names):
         if segment_id < 0 or segment_id >= self.segments_count:
             raise IndexError("segment index out of range")
         object_names = tuple(object_names)
         for object_name in object_names:
-            if object_name not in self.field_bit_mapping:
-                raise TypeError(f"unknown cache field: {object_name}")
+            self._field(object_name)
 
         with self._lock_for(segment_id):
             values = {}
             for object_name in object_names:
                 frame = self.get_frame(segment_id, object_name)
-                fmt_type = self.__dict__[object_name][1]
+                fmt_type = self._field(object_name)[1]
                 raw_val = struct.unpack(fmt_type, bytes(self.__memory.buf[frame[0]:frame[1]]))[0]
                 if isinstance(raw_val, bytes):
                     raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
@@ -224,13 +266,14 @@ class ObjectCache:
 
         prepared = []
         for object_name, data in values.items():
-            if object_name not in self.field_bit_mapping:
-                raise TypeError(f"unknown cache field: {object_name}")
-            fmt_type = self.__dict__[object_name][1]
+            self._field(object_name)
+            fmt_type = self._field(object_name)[1]
             if isinstance(data, str):
                 data = data.encode("utf-8")
-                if len(data) > 64:
-                    raise ValueError("string value exceeds 64 bytes")
+                if len(data) > MAX_CACHE_STRING_BYTES:
+                    raise ValueError(
+                        f"String value exceeds {MAX_CACHE_STRING_BYTES} bytes"
+                    )
             packed_data = struct.pack(fmt_type, data)
             prepared.append((
                 self.get_frame(segment_id, object_name),
@@ -269,7 +312,7 @@ class ObjectCache:
                 if not current_mask & bit_value:
                     continue
                 frame = self.get_frame(segment_id, field_name)
-                fmt_type = self.__dict__[field_name][1]
+                fmt_type = self._field(field_name)[1]
                 raw_val = struct.unpack(
                     fmt_type,
                     bytes(self.__memory.buf[frame[0]:frame[1]]),
@@ -283,23 +326,23 @@ class ObjectCache:
 
     def get_changes(self, segment_id: int) -> list:
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError('Индекс сегмента выходит за границы')
+            raise IndexError("Индекс сегмента выходит за границы")
 
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
         changed_fields = []
 
         with self._lock_for(segment_id):
-            current_mask = struct.unpack('i', self.__memory.buf[mask_start:mask_end])[0]
+            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
             if current_mask == 0:
                 return changed_fields
-                
+
             for field_name, bit_value in self.field_bit_mapping.items():
                 if current_mask & bit_value:
                     changed_fields.append(field_name)
 
-            self.__memory.buf[mask_start:mask_end] = struct.pack('i', 0)
-            
+            self.__memory.buf[mask_start:mask_end] = struct.pack("i", 0)
+
         return changed_fields
 
     def close(self):
@@ -308,12 +351,14 @@ class ObjectCache:
             return
         self.__memory = None
         memory.close()
-        try:
-            memory.unlink()
-        except FileNotFoundError:
-            pass
+        if self._owner:
+            try:
+                memory.unlink()
+            except FileNotFoundError:
+                pass
 
     def detach(self):
+        """Close this attachment without removing shared memory for other users."""
         memory = self.__memory
         if memory is None:
             return

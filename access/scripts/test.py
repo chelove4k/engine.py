@@ -7,8 +7,9 @@ class test(script):
 
 
     def start(self):
-        self.GameObject.render()
-        self.GameObject.Visual.position.y = random.randint(0, 400)
+        position = self.GameObject.Visual.position
+        position.y = random.randint(0, 400)
+        self.GameObject.Visual.position = position
         self.k = 1
         self.tilt_trigger = self.find_object("n", "tilt_trigger")
         self.is_touching_trigger = False
