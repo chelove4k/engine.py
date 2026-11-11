@@ -28,11 +28,3 @@ class test(script):
             + Vector2(2, 0) * self.k
         )
 
-        if self.tilt_trigger is None or self.GameObject.Transform is None:
-            return
-
-        is_touching = self.GameObject.Transform.overlaps(self.tilt_trigger)
-        if is_touching and not self.is_touching_trigger:
-            self.GameObject.Visual.rotation += 30
-        self.is_touching_trigger = is_touching
-

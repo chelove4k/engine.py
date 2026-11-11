@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import traceback
+from bisect import bisect_left
 from collections import deque
 from pathlib import Path
 
@@ -16,16 +17,34 @@ import console
 import stream
 from collision import transform_polygon, validate_convex_polygon
 from config import (
+    ENGINE_STATE_SEGMENT_BYTES,
+    ENGINE_STATE_STRUCT,
     FIXED_DT,
+    KEYBOARD_EVENT_BYTES,
+    KEYBOARD_EVENT_STRUCT,
+    MOUSE_MOTION_BYTES,
+    MOUSE_MOTION_STRUCT,
     POSITION_HISTORY_SIZE as CONFIG_POSITION_HISTORY_SIZE,
     POSITION_INTERPOLATION_DELAY as CONFIG_POSITION_INTERPOLATION_DELAY,
     SCRIPT_UPDATE_PERIOD,
     SNAPSHOT_ACTIVE_WINDOW,
 )
-from memory_lib import ObjectCache, ValueCache
+from memory_lib import FieldView, ObjectCache, ValueCache
 
 
 NO_SPRITE = "None"
+
+# Mouse hit-testing used to walk every render id on every motion event.  A
+# uniform grid keeps that cost proportional to the sprites near the pointer.
+HIT_TEST_CELL_SIZE = 128.0
+# Huge sprites (backgrounds) would touch thousands of cells.  Keep them in a
+# separate short list that is checked on every query instead.
+HIT_TEST_MAX_CELLS = 32
+# The info overlay reads identity/script data from the Manager once per second
+# instead of once per sprite per frame.  Overlay data is debug output; one
+# second of staleness is harmless, while thousands of Manager reads per frame
+# were enough to sink the frame rate.
+INFO_OVERLAY_CACHE_TTL = 1.0
 
 
 def _is_no_sprite(path):
@@ -41,6 +60,10 @@ class Game(arcade.Window):
     POSITION_HISTORY_SIZE = CONFIG_POSITION_HISTORY_SIZE
     SIMULATION_TICK = FIXED_DT
     ACTIVE_SNAPSHOT_WINDOW = SNAPSHOT_ACTIVE_WINDOW
+    # An object that has not published a position for this long is static.
+    INTERPOLATION_IDLE_TICKS = max(
+        1, int(round(ACTIVE_SNAPSHOT_WINDOW / SIMULATION_TICK))
+    )
     PROJECT_DIR = Path(__file__).resolve().parent
 
     def print(self, *args):
@@ -66,11 +89,11 @@ class Game(arcade.Window):
             draw_rate=SCRIPT_UPDATE_PERIOD,
         )
 
-        self.Time = Time if isinstance(Time, ValueCache) else ValueCache(Time)
+        self.Time = Time if hasattr(Time, "get") else ValueCache(Time)
         self.tick_cache = (
             tick_cache
-            if isinstance(tick_cache, ValueCache)
-            else (ValueCache(tick_cache) if tick_cache is not None else None)
+            if tick_cache is None or hasattr(tick_cache, "get")
+            else ValueCache(tick_cache)
         )
         self.clock_origin = (
             clock_origin
@@ -85,13 +108,25 @@ class Game(arcade.Window):
         self.visual_cache = ObjectCache(*data[3])
         self.camera_target_cache = data[4]
         self.camera_scale_cache = data[5]
+        # When present, pointer snapshots are published straight to shared
+        # memory.  Sending every coalesced motion event through the Manager
+        # queue added a full IPC round-trip per rendered frame.
+        self.motion_cache = data[6] if len(data) > 6 else None
+        self._motion_sequence = (
+            int(self.motion_cache.get(0, "seq"))
+            if self.motion_cache is not None else 0
+        )
 
         self.renders = arcade.SpriteList()
         self._sprites_by_render_id = {}
-        self._render_order = []
         self._render_order_dirty = False
+        self._hit_cells = {}
+        self._hit_cell_bounds = {}
+        self._hit_large_ids = set()
+        self._hit_dirty_ids = set()
         self._world_data_by_render_id = {}
         self._position_history_by_render_id = {}
+        self._moving_render_ids = set()
         self._latest_tick_by_render_id = {}
         self._last_tick_update_by_render_id = {}
         self._scripted_render_ids = set()
@@ -106,8 +141,10 @@ class Game(arcade.Window):
         )
         self._colliders_by_render_id = {}
         self._info_text_by_render_id = {}
+        self._info_static_cache = {}
         self._camera_target_id = -1
         self._fps_elapsed = 0.0
+        self._pending_mouse_motion = None
 
         self.fps_text = arcade.Text(
             text='FPS: 0',
@@ -135,6 +172,7 @@ class Game(arcade.Window):
 
         self._render_queue()
         self._read_camera_state()
+        self._flush_mouse_motion()
 
 
 
@@ -170,6 +208,9 @@ class Game(arcade.Window):
         return {1: "left", 2: "middle", 4: "right"}.get(button, str(button))
 
     def _sort_render_layers(self):
+        # Rebuilds only happen on add/remove/layer changes.  A bucket sort
+        # would still have to rebuild arcade's GPU index buffer, so the small
+        # Python-side win is not worth touching SpriteList internals.
         if not self._render_order_dirty:
             return
         self.renders.sort(
@@ -178,19 +219,140 @@ class Game(arcade.Window):
                 -sprite._engine_render_id,
             )
         )
-        self._render_order = [sprite._engine_render_id for sprite in self.renders]
         self._render_order_dirty = False
+
+    def _hit_drop_cells(self, render_id):
+        """Remove one sprite from the spatial hit-test grid."""
+
+        bounds = self._hit_cell_bounds.pop(render_id, None)
+        if bounds is None:
+            self._hit_large_ids.discard(render_id)
+            return
+        cells = self._hit_cells
+        for cell_x in range(bounds[0], bounds[2] + 1):
+            for cell_y in range(bounds[1], bounds[3] + 1):
+                cell = (cell_x, cell_y)
+                ids = cells.get(cell)
+                if ids is None:
+                    continue
+                ids.discard(render_id)
+                if not ids:
+                    cells.pop(cell, None)
+
+    def _hit_remove(self, render_id):
+        self._hit_drop_cells(render_id)
+        self._hit_dirty_ids.discard(render_id)
+
+    def _hit_mark_dirty(self, render_id):
+        """Queue a sprite for re-indexing on the next hit-test query.
+
+        Positions change every frame for moving sprites, so indexing eagerly
+        would add work even when the pointer never moves.  The dirty set is
+        only flushed when somebody actually asks what is under the cursor.
+        """
+
+        if render_id in self._sprites_by_render_id:
+            self._hit_dirty_ids.add(render_id)
+
+    def _hit_index_dirty(self):
+        if not self._hit_dirty_ids:
+            return
+        dirty = self._hit_dirty_ids
+        self._hit_dirty_ids = set()
+        cell_size = HIT_TEST_CELL_SIZE
+        for render_id in dirty:
+            self._hit_drop_cells(render_id)
+            sprite = self._sprites_by_render_id.get(render_id)
+            if sprite is None:
+                continue
+
+            points = sprite.hit_box.get_adjusted_points()
+            if not points:
+                continue
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            min_cell_x = int(min(xs) // cell_size)
+            max_cell_x = int(max(xs) // cell_size)
+            min_cell_y = int(min(ys) // cell_size)
+            max_cell_y = int(max(ys) // cell_size)
+            if ((max_cell_x - min_cell_x + 1)
+                    * (max_cell_y - min_cell_y + 1) > HIT_TEST_MAX_CELLS):
+                self._hit_large_ids.add(render_id)
+                continue
+
+            for cell_x in range(min_cell_x, max_cell_x + 1):
+                for cell_y in range(min_cell_y, max_cell_y + 1):
+                    self._hit_cells.setdefault(
+                        (cell_x, cell_y), set()
+                    ).add(render_id)
+            self._hit_cell_bounds[render_id] = (
+                min_cell_x, min_cell_y, max_cell_x, max_cell_y,
+            )
+
+    def _hit_test(self, point):
+        """Return the topmost visible render id under a world-space point."""
+
+        self._hit_index_dirty()
+        cell_size = HIT_TEST_CELL_SIZE
+        cell = (int(point[0] // cell_size), int(point[1] // cell_size))
+        candidates = self._hit_cells.get(cell, ())
+        best_id = None
+        best_key = None
+
+        def consider(render_id):
+            nonlocal best_id, best_key
+            sprite = self._sprites_by_render_id[render_id]
+            if sprite.alpha <= 0 or not sprite.collides_with_point(point):
+                return
+            # Same ordering as the sprite list: highest layer wins, and a
+            # lower render id wins a layer tie.
+            layer = self._world_data_by_render_id[render_id]["layer"]
+            key = (layer, -render_id)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_id = render_id
+
+        for render_id in candidates:
+            consider(render_id)
+        for render_id in self._hit_large_ids:
+            consider(render_id)
+        return best_id
+
+    def _publish_pointer_snapshot(self, event_type, render_id, point,
+                                  screen_x, screen_y, dx, dy):
+        """Write the latest pointer state to shared memory.
+
+        Returns ``True`` when the snapshot was published.  Motion events then
+        do not need the Manager queue at all; discrete events still go there
+        for the click/keyboard event lists.
+        """
+
+        motion_cache = getattr(self, "motion_cache", None)
+        if motion_cache is None:
+            return False
+        if event_type == "mouse_move":
+            self._motion_sequence += 1
+        motion_cache.set_many(0, {
+            "seq": self._motion_sequence,
+            "x": point[0],
+            "y": point[1],
+            "dx": dx,
+            "dy": dy,
+            "screen_x": screen_x,
+            "screen_y": screen_y,
+            "hovered": -1 if render_id is None else int(render_id),
+        })
+        return True
 
     def _send_mouse_event(self, event_type, x, y, button=None, dx=0, dy=0, scroll_x=0, scroll_y=0):
         world_position = self.camera.unproject((x, y))
         point = (world_position.x, world_position.y)
-        target_render_id = None
-        self._sort_render_layers()
-        for render_id in reversed(self._render_order):
-            sprite = self._sprites_by_render_id[render_id]
-            if sprite.alpha > 0 and sprite.collides_with_point(point):
-                target_render_id = render_id
-                break
+        target_render_id = self._hit_test(point)
+        published = self._publish_pointer_snapshot(
+            event_type, target_render_id, point, x, y, dx, dy
+        )
+        if event_type == "mouse_move" and published:
+            return
         self.main_in_stream.put({
             "command": "input",
             "type": event_type,
@@ -204,21 +366,52 @@ class Game(arcade.Window):
             "delta_y": dy,
             "scroll_x": scroll_x,
             "scroll_y": scroll_y,
+            "pointer_published": published,
         })
 
+    def _queue_mouse_motion(self, x, y, dx, dy):
+        """Coalesce motion events so hit-testing runs once per frame.
+
+        A high-polling-rate mouse can produce hundreds of motion events per
+        frame.  Testing every sprite for every event made the renderer spend
+        all its time inside ``on_mouse_motion`` and dropped FPS to zero on a
+        large scene.  Keeping only the newest position and the accumulated
+        delta preserves the frame-level meaning of the event.
+        """
+
+        pending = self._pending_mouse_motion
+        if pending is None:
+            self._pending_mouse_motion = [x, y, dx, dy]
+        else:
+            pending[0] = x
+            pending[1] = y
+            pending[2] += dx
+            pending[3] += dy
+
+    def _flush_mouse_motion(self):
+        if self._pending_mouse_motion is None:
+            return
+        x, y, dx, dy = self._pending_mouse_motion
+        self._pending_mouse_motion = None
+        self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
+
     def on_mouse_press(self, x, y, button, modifiers):
+        # Preserve enter/exit ordering before a click at the same position.
+        self._flush_mouse_motion()
         self._send_mouse_event("mouse_down", x, y, button)
 
     def on_mouse_release(self, x, y, button, modifiers):
+        self._flush_mouse_motion()
         self._send_mouse_event("mouse_up", x, y, button)
 
     def on_mouse_motion(self, x, y, dx, dy):
-        self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
+        self._queue_mouse_motion(x, y, dx, dy)
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
-        self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
+        self._queue_mouse_motion(x, y, dx, dy)
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+        self._flush_mouse_motion()
         self._send_mouse_event("mouse_scroll", x, y, scroll_x=scroll_x, scroll_y=scroll_y)
 
     def _render_queue(self):
@@ -255,10 +448,17 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        # Check active sprites only; scanning the full cache capacity each frame is costly.
-        for render_id, sprite in list(self._sprites_by_render_id.items()):
-            entry = self.visual_cache.get_changed_values(render_id)
-            if entry and sprite is not None:
+        # Check active sprites only; scanning the full cache capacity each
+        # frame is costly.  Batch the dirty-mask reads by lock stripe so a
+        # large scene does not acquire the same locks once per sprite.
+        if self._sprites_by_render_id:
+            updates = self.visual_cache.get_changed_values_many(
+                self._sprites_by_render_id
+            )
+            for render_id, entry in updates.items():
+                sprite = self._sprites_by_render_id.get(render_id)
+                if sprite is None:
+                    continue
                 try:
                     self._apply_update(render_id, sprite, entry)
                 except Exception:
@@ -303,43 +503,48 @@ class Game(arcade.Window):
                 return
         history.append((tick, x, y))
 
-    def _position_at_tick(self, render_id, query_tick):
-        """Return the position of an entity at one shared simulation tick."""
+    @staticmethod
+    def _position_from_history(history, query_tick):
+        """Interpolate one history without another dictionary lookup."""
 
-        history = self._position_history_by_render_id.get(render_id)
         if not history:
             return None
 
-        previous = history[0]
-        if query_tick <= previous[0]:
-            return previous[1], previous[2]
+        index = bisect_left(history, (query_tick,))
+        if index <= 0:
+            first = history[0]
+            return first[1], first[2]
+        if index >= len(history):
+            last = history[-1]
+            return last[1], last[2]
 
-        for current in history:
-            if query_tick <= current[0]:
-                interval = current[0] - previous[0]
-                if interval <= 0:
-                    return current[1], current[2]
-                fraction = (query_tick - previous[0]) / interval
-                return (
-                    previous[1] + (current[1] - previous[1]) * fraction,
-                    previous[2] + (current[2] - previous[2]) * fraction,
-                )
-            previous = current
-        return previous[1], previous[2]
+        current = history[index]
+        previous = history[index - 1]
+        interval = current[0] - previous[0]
+        if interval <= 0:
+            return current[1], current[2]
+        fraction = (query_tick - previous[0]) / interval
+        return (
+            previous[1] + (current[1] - previous[1]) * fraction,
+            previous[2] + (current[2] - previous[2]) * fraction,
+        )
+
+    def _position_at_tick(self, render_id, query_tick):
+        """Return the position of an entity at one shared simulation tick."""
+
+        return self._position_from_history(
+            self._position_history_by_render_id.get(render_id),
+            query_tick,
+        )
 
     def _resolve_render_tick(self):
-        """Choose the shared tick used by every entity in this frame.
+        """Return the shared interpolation tick for this frame.
 
-        The usual value is ``current - interpolation delay``.  If a live
-        script is late, the tick is clamped to the oldest published tick so
-        that no entity is sampled past its newest data.
-
-        Only objects with their own script loop are considered here.  They
-        publish a heartbeat every fixed step, so an idle scripted object
-        still advances its tick.  Sporadically updated visuals (such as a
-        camera target that stopped moving) must not hold back the clock;
-        otherwise the whole frame freezes until the activity window expires
-        and then jumps forward.
+        The render clock is a smooth wall-clock timeline.  Each sprite is
+        sampled at this tick; ``_position_at_tick`` holds the newest sample
+        for an object that has not published that far yet.  A script that
+        falls behind therefore holds only its own objects instead of
+        freezing the whole frame and jumping forward later.
         """
 
         now = time.monotonic()
@@ -347,28 +552,57 @@ class Game(arcade.Window):
             (now - self.clock_origin) / self.SIMULATION_TICK
             - self.POSITION_INTERPOLATION_DELAY / self.SIMULATION_TICK
         )
-
-        oldest_tick = None
-        for render_id in self._scripted_render_ids:
-            latest_tick = self._latest_tick_by_render_id.get(render_id)
-            if latest_tick is None:
-                continue
-            updated_at = self._last_tick_update_by_render_id.get(render_id)
-            if updated_at is None:
-                continue
-            if now - updated_at > self.ACTIVE_SNAPSHOT_WINDOW:
-                continue
-            if oldest_tick is None or latest_tick < oldest_tick:
-                oldest_tick = latest_tick
-        if oldest_tick is not None:
-            render_tick = min(render_tick, oldest_tick - 1)
         return max(0.0, render_tick)
 
     def _interpolate_sprite_positions(self, render_tick):
-        for render_id, sprite in self._sprites_by_render_id.items():
-            position = self._position_at_tick(render_id, render_tick)
-            if position is not None:
-                sprite.center_x, sprite.center_y = position
+        """Interpolate only sprites that published a position recently.
+
+        Static sprites already sit at their final position, so touching every
+        sprite each frame is wasted work: a scene with thousands of walls paid
+        the same per-frame cost as a scene where everything moves.
+        """
+
+        moving = self._moving_render_ids
+        if not moving:
+            return
+
+        sprites = self._sprites_by_render_id
+        histories = self._position_history_by_render_id
+        interpolate = self._position_from_history
+        idle_before = render_tick - self.INTERPOLATION_IDLE_TICKS
+        stale = None
+        for render_id in moving:
+            history = histories.get(render_id)
+            if not history:
+                if stale is None:
+                    stale = []
+                stale.append(render_id)
+                continue
+
+            sprite = sprites.get(render_id)
+            if sprite is not None:
+                position = interpolate(history, render_tick)
+                if (sprite.center_x != position[0]
+                        or sprite.center_y != position[1]):
+                    sprite.center_x, sprite.center_y = position
+                    self._hit_mark_dirty(render_id)
+
+            if history[-1][0] < idle_before:
+                if stale is None:
+                    stale = []
+                stale.append(render_id)
+
+        if not stale:
+            return
+
+        world_positions = self._world_data_by_render_id
+        for render_id in stale:
+            moving.discard(render_id)
+            sprite = sprites.get(render_id)
+            world_data = world_positions.get(render_id)
+            if sprite is not None and world_data is not None:
+                # Snap to the last received sample before going static.
+                sprite.center_x, sprite.center_y = world_data["position"]
 
     def _track_camera_target(self, render_tick):
         # The tracked object may have been removed without a renderer update
@@ -414,6 +648,34 @@ class Game(arcade.Window):
                     world_polygon, settings["color"], line_width=settings["width"]
                 )
 
+    def _info_static_for(self, render_id, now):
+        """Return cached identity/scripts for the info overlay."""
+
+        cached = self._info_static_cache.get(render_id)
+        if cached is not None and cached[0] >= now:
+            return cached[1]
+
+        index_key = (stream.Stream.INDEX_PREFIX, "render_id", render_id)
+        record_id = self.object_cache.get(index_key)
+        record = self.object_cache.get(record_id) if record_id is not None else None
+        if record is None:
+            return None
+
+        data = record.get("dict_data", {})
+        identity = data.get("_identity", {})
+        scripts = data.get("scripting", {}).get("scripts", [])
+        payload = {
+            "object_id": record.get("_id", "?"),
+            "name": identity.get("name", "-"),
+            "class": identity.get("class", "-"),
+            "type": identity.get("type", data.get("object_type", "-")),
+            "scripts": ", ".join(Path(path).name for path in scripts) or "-",
+        }
+        self._info_static_cache[render_id] = (
+            now + INFO_OVERLAY_CACHE_TTL, payload,
+        )
+        return payload
+
     def _draw_info_categories(self, render_tick):
         categories = ("id", "name", "coords", "scripts", "transform")
         enabled = {
@@ -425,17 +687,13 @@ class Game(arcade.Window):
         if not any(enabled.values()):
             return
 
+        now = time.monotonic()
         for render_id, sprite in self._sprites_by_render_id.items():
             if sprite.alpha <= 0:
                 continue
-            record_id = self.object_cache.get(
-                (stream.Stream.INDEX_PREFIX, "render_id", render_id)
-            )
-            record = self.object_cache.get(record_id) if record_id is not None else None
-            if record is None:
+            static = self._info_static_for(render_id, now)
+            if static is None:
                 continue
-            data = record.get("dict_data", {})
-            identity = data.get("_identity", {})
             world = self._world_data_by_render_id.get(render_id, {})
             position = self._position_at_tick(render_id, render_tick)
             if position is None:
@@ -443,18 +701,19 @@ class Game(arcade.Window):
 
             lines = []
             if enabled["id"]:
-                lines.append(f"ID: {record.get('_id', '?')} / render {render_id}")
+                lines.append(
+                    f"ID: {static['object_id']} / render {render_id}"
+                )
             if enabled["name"]:
                 lines.append(
-                    f"{identity.get('name', '-')} | {identity.get('class', '-')} | "
-                    f"{identity.get('type', data.get('object_type', '-'))} | "
+                    f"{static['name']} | {static['class']} | "
+                    f"{static['type']} | "
                     f"layer: {world.get('layer', 0):g}"
                 )
             if enabled["coords"]:
                 lines.append(f"x={position[0]:.0f}, y={position[1]:.0f}")
             if enabled["scripts"]:
-                paths = data.get("scripting", {}).get("scripts", [])
-                lines.append(f"scripts: {', '.join(Path(path).name for path in paths) or '-'}")
+                lines.append(f"scripts: {static['scripts']}")
             if enabled["transform"]:
                 lines.append(
                     f"angle={world.get('rotation', 0):.1f}, "
@@ -518,16 +777,21 @@ class Game(arcade.Window):
         self.renders.clear()
 
         self._sprites_by_render_id.clear()
-        self._render_order.clear()
         self._render_order_dirty = False
+        self._hit_cells.clear()
+        self._hit_cell_bounds.clear()
+        self._hit_large_ids.clear()
+        self._hit_dirty_ids.clear()
         self._world_data_by_render_id.clear()
         self._position_history_by_render_id.clear()
+        self._moving_render_ids.clear()
         self._latest_tick_by_render_id.clear()
         self._last_tick_update_by_render_id.clear()
         self._scripted_render_ids.clear()
         self._waiting_updates.clear()
         self._colliders_by_render_id.clear()
         self._info_text_by_render_id.clear()
+        self._info_static_cache.clear()
         self._failed_textures.clear()
         self._camera_target_id = -1
         self.camera_target_cache.set(-1)
@@ -572,6 +836,7 @@ class Game(arcade.Window):
         )
 
         self._apply_world_transform(sprite, world_data)
+        self._hit_mark_dirty(render_id)
 
     def _remove_sprite(self, data, reset_camera=True):
 
@@ -586,8 +851,11 @@ class Game(arcade.Window):
             self._camera_target_id = -1
             self.camera_target_cache.set(-1)
 
+        self._hit_remove(render_id)
+        self._info_static_cache.pop(render_id, None)
         self._world_data_by_render_id.pop(render_id, None)
         self._position_history_by_render_id.pop(render_id, None)
+        self._moving_render_ids.discard(render_id)
         self._latest_tick_by_render_id.pop(render_id, None)
         self._last_tick_update_by_render_id.pop(render_id, None)
         self._scripted_render_ids.discard(render_id)
@@ -611,13 +879,20 @@ class Game(arcade.Window):
             self._last_tick_update_by_render_id[id] = time.monotonic()
 
         current_x, current_y = world_data['position']
-        
+        position_changed = False
+
         if 'x' in object_data:
-            current_x = object_data['x']
+            new_x = object_data['x']
+            if new_x != current_x:
+                current_x = new_x
+                position_changed = True
 
         if 'y' in object_data:
-            current_y = object_data['y']
-            
+            new_y = object_data['y']
+            if new_y != current_y:
+                current_y = new_y
+                position_changed = True
+
         world_data['position'] = (current_x, current_y)
 
         if 'scale' in object_data:
@@ -633,16 +908,15 @@ class Game(arcade.Window):
             world_data['layer'] = float(object_data['layer'])
             self._render_order_dirty = True
 
-        record_tick = tick
-        if record_tick is None:
-            record_tick = self._latest_tick_by_render_id.get(id)
-
-        if 'x' in object_data or 'y' in object_data:
+        if position_changed:
+            # Repeated identical positions are heartbeat noise, not motion.
+            # Sending them to history would keep a static sprite in the
+            # interpolation set forever.
+            self._moving_render_ids.add(id)
+            record_tick = tick
+            if record_tick is None:
+                record_tick = self._latest_tick_by_render_id.get(id)
             self._record_position(id, world_data['position'], record_tick)
-        elif tick is not None:
-            # Tick heartbeats keep a snapshot for every fixed step even when
-            # the entity did not move during that step.
-            self._record_position(id, world_data['position'], tick)
 
         if 'scale' in object_data:
             sprite.scale = world_data['scale']
@@ -650,6 +924,9 @@ class Game(arcade.Window):
             sprite.angle = world_data['rotation']
         if 'alpha' in object_data:
             sprite.alpha = int(world_data['alpha'] * 255)
+        if 'sprite' in object_data or 'x' in object_data or 'y' in object_data \
+                or 'scale' in object_data or 'rotation' in object_data:
+            self._hit_mark_dirty(id)
 
     def _apply_world_transform(self, sprite, world_data):
         world_x, world_y = world_data['position']
@@ -714,12 +991,14 @@ class VisualCache(ObjectCache):
 class IdCache(ObjectCache):
     pass
 
-def tact_counter(start, tact_time, Time, Tick, stop_event):
+def tact_counter(start, tact_time, EngineState, stop_event):
 
     while not stop_event.wait(tact_time):
         elapsed = time.monotonic() - start
-        Time.set(round(elapsed, 5))
-        Tick.set(int(elapsed / tact_time))
+        EngineState.set_many(0, {
+            "time": round(elapsed, 5),
+            "tick": int(elapsed / tact_time),
+        })
 
 def main():
 
@@ -731,7 +1010,7 @@ def main():
     main_out_stream = MainOutQueue(manager)
 
     cpu_count = os.cpu_count() or 1
-    worker_count = max(1, min(4, cpu_count - 1))
+    worker_count = max(1, cpu_count - 3)
     worker_queues = [ProccesInQueue(manager) for _ in range(worker_count)]
     worker_ready = manager.list([False] * worker_count)
 
@@ -763,11 +1042,49 @@ def main():
     id_cache = [raw_id_cache.key, id_struct, id_locks]
 
     proccess_status_info = manager.list()
-    keyboard_input = manager.list()
-    raw_time = ValueCache(0.0)
-    time_key = raw_time.name
-    raw_tick = ValueCache(0)
-    tick_key = raw_tick.name
+    # All engine counters share one segment; scripts read them in one lock.
+    raw_engine_state = ObjectCache(
+        ENGINE_STATE_SEGMENT_BYTES,
+        ENGINE_STATE_STRUCT,
+        [multiprocessing.Lock() for _ in range(4)],
+    )
+    engine_state = [
+        raw_engine_state.key,
+        ENGINE_STATE_STRUCT,
+        raw_engine_state.locks,
+    ]
+    raw_motion_cache = ObjectCache(
+        MOUSE_MOTION_BYTES,
+        MOUSE_MOTION_STRUCT,
+        [multiprocessing.Lock() for _ in range(8)],
+    )
+    # Zeroed shared memory would report ``hovered=0`` before the first mouse
+    # event, which looks like a hover over render_id 0 to the scripts.
+    raw_motion_cache.set_many(0, {
+        "seq": 0,
+        "x": 0.0,
+        "y": 0.0,
+        "dx": 0.0,
+        "dy": 0.0,
+        "screen_x": 0.0,
+        "screen_y": 0.0,
+        "hovered": -1,
+    })
+    motion_cache_data = [
+        raw_motion_cache.key,
+        MOUSE_MOTION_STRUCT,
+        raw_motion_cache.locks,
+    ]
+    raw_keyboard_events = ObjectCache(
+        KEYBOARD_EVENT_BYTES,
+        KEYBOARD_EVENT_STRUCT,
+        [multiprocessing.Lock() for _ in range(16)],
+    )
+    keyboard_ring_data = [
+        raw_keyboard_events.key,
+        KEYBOARD_EVENT_STRUCT,
+        raw_keyboard_events.locks,
+    ]
     camera_target_cache = ValueCache(-1)
     camera_scale_cache = ValueCache(1.0)
     camera_state = [camera_target_cache.name, camera_scale_cache.name]
@@ -777,7 +1094,7 @@ def main():
     logic_process = multiprocessing.Process(
         target=stream.Stream,
         args=(
-            time_key,
+            engine_state,
             render_in_stream,
             render_out_stream,
             main_in_stream,
@@ -787,12 +1104,14 @@ def main():
             worker_queues,
             worker_ready,
             lock,
-            keyboard_input,
             visual_cache,
             id_cache,
             object_lock,
             camera_state,
-            tick_key
+            motion_cache_data,
+            keyboard_ring_data,
+            manager.address,
+            manager._authkey,
         ),
         daemon=False,
     )
@@ -807,6 +1126,7 @@ def main():
             visual_cache,
             id_cache,
             overlay_settings,
+            main_in_stream,
         ),
         daemon=True,
     ).start()
@@ -819,8 +1139,7 @@ def main():
         args=(
             game_clock_origin,
             tact_time,
-            raw_time,
-            raw_tick,
+            raw_engine_state,
             tact_stop_event,
         ),
         daemon=True,
@@ -835,8 +1154,11 @@ def main():
             visual_cache,
             camera_target_cache,
             camera_scale_cache,
-        ], time_key, width=400, height=400, clock_origin=game_clock_origin,
-            tick_cache=raw_tick, overlay_settings=overlay_settings)
+            raw_motion_cache,
+        ], FieldView(raw_engine_state, "time"),
+            width=400, height=400, clock_origin=game_clock_origin,
+            tick_cache=FieldView(raw_engine_state, "tick"),
+            overlay_settings=overlay_settings)
         arcade.run()
 
     finally:
@@ -851,8 +1173,9 @@ def main():
         manager.shutdown()
         raw_visual_cache.close()
         raw_id_cache.close()
-        raw_time.close()
-        raw_tick.close()
+        raw_engine_state.close()
+        raw_motion_cache.close()
+        raw_keyboard_events.close()
         camera_target_cache.close()
         camera_scale_cache.close()
 

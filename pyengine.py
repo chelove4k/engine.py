@@ -14,13 +14,19 @@ from typing import Any
 
 from collision import convex_polygons_overlap, transform_polygon, validate_convex_polygon
 from config import (
+    ENGINE_STATE_LOOP_FIELDS,
     FIXED_DT,
+    KEYBOARD_EVENT_DOWN,
+    KEYBOARD_EVENT_FIELDS,
     MAX_CATCH_UP_STEPS,
+    MOUSE_MOTION_FIELDS,
+    PRESSED_KEY_FIELDS,
     REGISTRATION_POLL_INTERVAL,
     REGISTRATION_TIMEOUT,
     SCRIPT_UPDATE_PERIOD,
+    unpack_pressed_keys,
 )
-from memory_lib import ObjectCache, ValueCache
+from memory_lib import FieldView, ObjectCache, ValueCache
 from scene import (
     RESERVED_COMPONENT_PROPERTIES,
     component_specs_from_data,
@@ -125,11 +131,18 @@ class KeyboardEvent:
 class Keyboard:
     EVENTS_KEY = ("__engine_keyboard__", "events")
 
-    def __init__(self, script_owner, objects_cache):
+    def __init__(
+        self, script_owner, objects_cache, event_ring=None, event_sequence=None
+    ):
         self._script_owner = script_owner
         self._objects_cache = objects_cache
-        events = objects_cache.get(self.EVENTS_KEY) or ()
-        self._event_sequence = events[-1]["sequence"] if events else 0
+        self._event_ring = event_ring
+        self._event_sequence_cache = event_sequence
+        if event_ring is not None and event_sequence is not None:
+            self._event_sequence = int(event_sequence.get())
+        else:
+            events = objects_cache.get(self.EVENTS_KEY) or ()
+            self._event_sequence = events[-1]["sequence"] if events else 0
         # Queries such as was_pressed() track their own per-key cursor.  They
         # must not use _event_sequence, because _poll_events() advances it
         # before callbacks and update() are executed.
@@ -146,16 +159,47 @@ class Keyboard:
     def get_pressed(self):
         return frozenset(self._script_owner.get_pressed_keys())
 
+    def _events_after(self, cursor):
+        """Return events newer than ``cursor`` from shared memory or Manager."""
+
+        if self._event_ring is None or self._event_sequence_cache is None:
+            events = self._objects_cache.get(self.EVENTS_KEY) or ()
+            return [event for event in events if event["sequence"] > cursor]
+
+        latest = int(self._event_sequence_cache.get())
+        if latest <= cursor:
+            return []
+
+        capacity = self._event_ring.capacity
+        start = max(cursor + 1, latest - capacity + 1)
+        pending = []
+        for sequence in range(start, latest + 1):
+            values = self._event_ring.get_many(
+                sequence % capacity, KEYBOARD_EVENT_FIELDS
+            )
+            if int(values["sequence"]) != sequence:
+                # The slot was already overwritten by a newer event.
+                continue
+            pending.append({
+                "sequence": sequence,
+                "type": (
+                    "key_down"
+                    if int(values["type"]) == KEYBOARD_EVENT_DOWN
+                    else "key_up"
+                ),
+                "key": values["key"],
+                "modifiers": int(values["modifiers"]),
+            })
+        return pending
+
     def _was_event(self, key, event_type):
         key = self._normalize_key(key)
         cursor_key = (event_type, key)
-        events = self._objects_cache.get(self.EVENTS_KEY) or ()
         cursor = self._query_sequences.get(cursor_key, self._initial_event_sequence)
         matching_sequences = [
             event["sequence"]
-            for event in events
-            if event["sequence"] > cursor
-            and event["type"] == event_type
+            for event in self._events_after(cursor)
+            if event["type"] == event_type
             and event["key"] == key
         ]
         if matching_sequences:
@@ -172,8 +216,7 @@ class Keyboard:
         return self._was_event(key, "key_up")
 
     def _poll_events(self):
-        events = self._objects_cache.get(self.EVENTS_KEY) or ()
-        pending = [event for event in events if event["sequence"] > self._event_sequence]
+        pending = self._events_after(self._event_sequence)
         if pending:
             self._event_sequence = pending[-1]["sequence"]
         return pending
@@ -183,12 +226,19 @@ class Mouse:
     STATE_KEY = ("__engine_mouse__", "state")
     EVENTS_KEY = ("__engine_mouse__", "events")
 
-    def __init__(self, game_object, objects_cache):
+    def __init__(self, game_object, objects_cache, motion_cache=None):
         self._game_object = game_object
         self._objects_cache = objects_cache
+        self._motion_cache = motion_cache
         events = objects_cache.get(self.EVENTS_KEY) or ()
         self._event_sequence = events[-1]["sequence"] if events else 0
         self._click_sequence = self._event_sequence
+        # Motion is published in shared memory.  Remember the last sequence
+        # seen by this script so the same snapshot isn't dispatched twice.
+        self._motion_sequence = (
+            int(motion_cache.get(0, "seq"))
+            if motion_cache is not None else 0
+        )
 
     @staticmethod
     def _normalize_button(button):
@@ -199,19 +249,32 @@ class Mouse:
     def _state(self):
         return self._objects_cache.get(self.STATE_KEY) or {}
 
+    def _pointer(self):
+        """Return pointer position/hover without a Manager round-trip."""
+
+        if self._motion_cache is None:
+            return self._state()
+        values = self._motion_cache.get_many(0, MOUSE_MOTION_FIELDS)
+        hovered = int(values["hovered"])
+        return {
+            "position": (values["x"], values["y"]),
+            "screen_position": (values["screen_x"], values["screen_y"]),
+            "hovered_render_id": None if hovered < 0 else hovered,
+        }
+
     @property
     def position(self):
-        position = self._state().get("position", (0.0, 0.0))
+        position = self._pointer().get("position", (0.0, 0.0))
         return Vector2(position[0], position[1])
 
     @property
     def screen_position(self):
-        position = self._state().get("screen_position", (0.0, 0.0))
+        position = self._pointer().get("screen_position", (0.0, 0.0))
         return Vector2(position[0], position[1])
 
     def is_over(self, game_object=None):
         target = game_object if game_object is not None else self._game_object
-        return self._state().get("hovered_render_id") == getattr(target, "_render_id", None)
+        return self._pointer().get("hovered_render_id") == getattr(target, "_render_id", None)
 
     def is_pressed(self, button="left"):
         pressed = self._state().get("buttons", ())
@@ -231,6 +294,32 @@ class Mouse:
             self._click_sequence = max(matching_sequences)
             return True
         return False
+
+    def _poll_motion(self):
+        """Return the newest motion snapshot when it changed since last poll."""
+
+        if self._motion_cache is None:
+            return None
+        values = self._motion_cache.get_many(0, MOUSE_MOTION_FIELDS)
+        sequence = int(values["seq"])
+        if sequence == self._motion_sequence:
+            return None
+        self._motion_sequence = sequence
+        hovered = int(values["hovered"])
+        return {
+            "sequence": sequence,
+            "type": "mouse_move",
+            "render_id": None if hovered < 0 else hovered,
+            "x": values["x"],
+            "y": values["y"],
+            "screen_x": values["screen_x"],
+            "screen_y": values["screen_y"],
+            "button": None,
+            "delta_x": values["dx"],
+            "delta_y": values["dy"],
+            "scroll_x": 0.0,
+            "scroll_y": 0.0,
+        }
 
     def _poll_events(self):
         events = self._objects_cache.get(self.EVENTS_KEY) or ()
@@ -270,6 +359,13 @@ class _Camera:
 
         self.targets = {}
         target_ids = self.objects_cache.get((self.INDEX_PREFIX, "type", "camera"), ())
+        if not isinstance(target_ids, list):
+            # manager.list supports slicing in one server-side call; iterating
+            # a proxy directly would turn one lookup into N remote calls.
+            try:
+                target_ids = target_ids[:]
+            except TypeError:
+                target_ids = list(target_ids)
         for object_id in target_ids:
             record = self.objects_cache.get(object_id)
             if record is None:
@@ -417,6 +513,9 @@ class GameObject:
                      time_owner=None,
                      time_cache=None,
                      tick_cache=None,
+                     object_id=None,
+                     objects_cache=None,
+                     object_lock=None,
                     ):
             self.__dict__["_initialized"] = False
 
@@ -434,6 +533,9 @@ class GameObject:
             self.__dict__["_simulation_time_owner"] = time_owner
             self.__dict__["_simulation_time_cache"] = time_cache
             self.__dict__["_tick_cache"] = tick_cache
+            self.__dict__["_layer_index_object_id"] = object_id
+            self.__dict__["_layer_index_objects_cache"] = objects_cache
+            self.__dict__["_layer_index_lock"] = object_lock
 
             self.__dict__["_initialized"] = True
 
@@ -461,6 +563,65 @@ class GameObject:
                         cache_field = "sprite" if name == "sprite" else name
                         return cache.get(render_id, cache_field)
             return object.__getattribute__(self, name)
+
+        @staticmethod
+        def _layer_index_add(objects_cache, key, object_id):
+            bucket = objects_cache.get(key)
+            if bucket is None:
+                objects_cache[key] = [object_id]
+            elif isinstance(bucket, list):
+                if object_id in bucket:
+                    return
+                bucket = list(bucket)
+                bucket.append(object_id)
+                objects_cache[key] = bucket
+            else:
+                # Promoted Manager list: append in place.
+                bucket.append(object_id)
+
+        @staticmethod
+        def _layer_index_remove(objects_cache, key, object_id):
+            bucket = objects_cache.get(key)
+            if bucket is None:
+                return
+            if isinstance(bucket, list):
+                if object_id not in bucket:
+                    return
+                bucket = list(bucket)
+                bucket.remove(object_id)
+                if bucket:
+                    objects_cache[key] = bucket
+                else:
+                    objects_cache.pop(key, None)
+                return
+            try:
+                bucket.remove(object_id)
+            except ValueError:
+                return
+            if not bucket:
+                objects_cache.pop(key, None)
+
+        def __update_layer_index(self, old_layer, new_layer):
+            if old_layer == new_layer:
+                return
+            objects_cache = self.__dict__.get("_layer_index_objects_cache")
+            object_id = self.__dict__.get("_layer_index_object_id")
+            if objects_cache is None or object_id is None:
+                return
+
+            lock = self.__dict__.get("_layer_index_lock")
+            with (lock if lock is not None else nullcontext()):
+                if old_layer is not None:
+                    self._layer_index_remove(
+                        objects_cache,
+                        ("__engine_index__", "layer", float(old_layer)),
+                        object_id,
+                    )
+                self._layer_index_add(
+                    objects_cache,
+                    ("__engine_index__", "layer", float(new_layer)),
+                    object_id,
+                )
 
         def __visual_changed(self, name):
             id = self.__dict__.get("id")
@@ -514,7 +675,10 @@ class GameObject:
                 visual_cache.set(id, 'alpha', float(value))
                 return
             if name == 'layer':
-                visual_cache.set(id, 'layer', float(value))
+                new_layer = float(value)
+                old_layer = visual_cache.get(id, 'layer')
+                visual_cache.set(id, 'layer', new_layer)
+                self.__update_layer_index(old_layer, new_layer)
                 return
             if name in {'path', 'sprite'}:
                 visual_cache.set(id, 'sprite', str(value))
@@ -614,6 +778,9 @@ class GameObject:
                 time_owner=deps.get("time_owner"),
                 time_cache=deps.get("time_cache"),
                 tick_cache=deps.get("tick_cache"),
+                object_id=self._id,
+                objects_cache=deps.get("objects_cache"),
+                object_lock=deps.get("lock"),
             )
             self.components.append('visual')
 
@@ -734,43 +901,32 @@ class GameObject:
                 return payload
             self._stash_registration_responses(response)
 
-    def register(self):
-        if self._main_in_stream is None or self._main_out_stream is None:
-            raise RuntimeError("Отсутствует подключение GameObject с Stream")
+    def _registration_record(self):
+        return {
+            "id": self._id,
+            "obj": self.__cache_record(),
+        }
 
-        with _REGISTRATION_LOCK:
-            if self._object_id is not None:
-                return self
-
-            request_id = uuid.uuid4().hex
-            self._main_in_stream.put({
-                "command": "register",
-                "request_id": request_id,
-                "obj": self.__cache_record(),
-                "script_data": copy.deepcopy(self.dict_data),
-                "id": self._id,
-            })
-            response = self._wait_registration_response(request_id)
-
+    @staticmethod
+    def _parse_registration_response(response, object_key):
         if isinstance(response, dict):
             if "error" in response:
                 raise ValueError(
-                    f"Stream отклонил объект {self._id!r}: {response['error']}"
+                    f"Stream отклонил объект {object_key!r}: {response['error']}"
                 )
             try:
-                object_id = response["object_id"]
-                render_id = response["render_id"]
+                return response["object_id"], response["render_id"]
             except KeyError as error:
                 raise RuntimeError(
                     f"Некорректный ответ Stream при регистрации: {response!r}"
                 ) from error
-        elif isinstance(response, (list, tuple)) and len(response) == 2:
-            object_id, render_id = response
-        else:
-            raise RuntimeError(
-                f"Некорректный ответ Stream при регистрации: {response!r}"
-            )
+        if isinstance(response, (list, tuple)) and len(response) == 2:
+            return response
+        raise RuntimeError(
+            f"Некорректный ответ Stream при регистрации: {response!r}"
+        )
 
+    def _apply_registration(self, object_id, render_id):
         self.__dict__["_object_id"] = object_id
         self.__dict__["_render_id"] = render_id
 
@@ -792,6 +948,9 @@ class GameObject:
         if self.Transform is not None:
             self.Transform.__dict__["render_id"] = render_id
 
+    def _publish_registration(self):
+        object_id = self._object_id
+        render_id = self._render_id
         script_data = copy.deepcopy(self.dict_data)
         script_data["_id"] = self._id
         script_data["object_id"] = object_id
@@ -829,7 +988,96 @@ class GameObject:
         # script to call render() manually.
         if self.Visual is not None:
             self.render()
+
+    def register(self):
+        if self._main_in_stream is None or self._main_out_stream is None:
+            raise RuntimeError("Отсутствует подключение GameObject с Stream")
+
+        with _REGISTRATION_LOCK:
+            if self._object_id is not None:
+                return self
+
+            request_id = uuid.uuid4().hex
+            self._main_in_stream.put({
+                "command": "register",
+                "request_id": request_id,
+                **self._registration_record(),
+            })
+            response = self._wait_registration_response(request_id)
+
+        object_id, render_id = self._parse_registration_response(response, self._id)
+        self._apply_registration(object_id, render_id)
+        self._publish_registration()
         return self
+
+    @staticmethod
+    def register_many(objects):
+        """Register many objects with a single Stream round trip.
+
+        ``create_object(list)`` and scene loading use this path.  Stream
+        validates the whole batch before mutating shared state, then returns
+        one result per object.  Scripts and visuals are still published per
+        object after the batch response.
+        """
+
+        objects = list(objects)
+        pending = [obj for obj in objects if obj._object_id is None]
+        if not pending:
+            return objects
+
+        first = pending[0]
+        if first._main_in_stream is None or first._main_out_stream is None:
+            raise RuntimeError("Отсутствует подключение GameObject с Stream")
+
+        with _REGISTRATION_LOCK:
+            # Another thread could have registered part of the batch while it
+            # was being collected.
+            pending = [obj for obj in pending if obj._object_id is None]
+            if not pending:
+                return objects
+
+            request_id = uuid.uuid4().hex
+            first._main_in_stream.put({
+                "command": "register_many",
+                "request_id": request_id,
+                "objects": [obj._registration_record() for obj in pending],
+            })
+            response = first._wait_registration_response(request_id)
+
+        if not isinstance(response, dict):
+            raise RuntimeError(
+                f"Некорректный ответ Stream при пакетной регистрации: {response!r}"
+            )
+        if "error" in response:
+            raise ValueError(
+                f"Stream отклонил пакет объектов: {response['error']}"
+            )
+        results = response.get("objects")
+        if not isinstance(results, list) or len(results) != len(pending):
+            raise RuntimeError(
+                f"Некорректный ответ Stream при пакетной регистрации: {response!r}"
+            )
+
+        failures = []
+        registered = []
+        for game_object, result in zip(pending, results):
+            if isinstance(result, dict) and "error" in result:
+                failures.append(f"{game_object._id}: {result['error']}")
+                continue
+            object_id, render_id = game_object._parse_registration_response(
+                result, game_object._id
+            )
+            game_object._apply_registration(object_id, render_id)
+            registered.append(game_object)
+
+        for game_object in registered:
+            game_object._publish_registration()
+
+        if failures:
+            raise ValueError(
+                "Stream отклонил часть объектов: " + "; ".join(failures)
+            )
+        return objects
 
     def remove(self):
         if self._main_in_stream is not None and self._id is not None:
@@ -868,7 +1116,9 @@ def create_object(json_text, deps: dict | None = None):
             item = copy.deepcopy(item)
             validate_object_data(item)
             prepared.append(item)
-        return [GameObject(item, deps=deps).register() for item in prepared]
+        objects = [GameObject(item, deps=deps) for item in prepared]
+        GameObject.register_many(objects)
+        return objects
 
     if not isinstance(data, dict):
         raise TypeError("Описание объекта должно быть JSON-объектом или списком объектов")
@@ -943,6 +1193,26 @@ class script:
             self.__last_mouse_event_sequence = events[-1]["sequence"]
         return new_events
 
+    def __handle_mouse_move(self, data):
+        own_render_id = self.GameObject._render_id
+        event = MouseEvent(data)
+        is_over = data.get("render_id") == own_render_id
+
+        if is_over and not self.__mouse_is_over:
+            self.on_mouse_enter(event)
+        elif self.__mouse_is_over and not is_over:
+            self.on_mouse_exit(event)
+        self.__mouse_is_over = is_over
+        if is_over:
+            self.on_mouse_move(event)
+
+    def __dispatch_mouse_motion(self):
+        """Deliver the shared-memory motion snapshot when it changed."""
+
+        data = self.Mouse._poll_motion()
+        if data is not None:
+            self.__handle_mouse_move(data)
+
     def __dispatch_mouse_events(self):
         own_render_id = self.GameObject._render_id
         for data in self.Mouse._poll_events():
@@ -951,13 +1221,9 @@ class script:
             is_over = data.get("render_id") == own_render_id
 
             if event_type == "mouse_move":
-                if is_over and not self.__mouse_is_over:
-                    self.on_mouse_enter(event)
-                elif self.__mouse_is_over and not is_over:
-                    self.on_mouse_exit(event)
-                self.__mouse_is_over = is_over
-                if is_over:
-                    self.on_mouse_move(event)
+                # Legacy path used when no shared motion cache is attached.
+                if self.__motion_cache is None:
+                    self.__handle_mouse_move(data)
                 continue
 
             if not is_over:
@@ -993,8 +1259,9 @@ class script:
         if field is None:
             raise ValueError("by must be c/class, n/name, l/layer, or t/type")
 
-        if field == "layer":
-            # Layer can change through Visual.layer, so look up its current value.
+        if field == "layer" and not self.__objects_cache.get(
+                ("__engine_index__", "layer", "__ready__")):
+            # Compatibility path for caches built without a live Stream.
             object_ids = [
                 object_id
                 for object_id, record in self.__objects_cache.items()
@@ -1005,6 +1272,13 @@ class script:
             ]
         else:
             object_ids = self.__objects_cache.get(("__engine_index__", field, data), ())
+            if not isinstance(object_ids, list):
+                # The index bucket may be a manager.list; take one snapshot
+                # instead of one Manager round trip per element.
+                try:
+                    object_ids = object_ids[:]
+                except TypeError:
+                    object_ids = list(object_ids)
         for object_id in object_ids:
             record = self.__objects_cache.get(object_id)
             if record is None:
@@ -1055,9 +1329,20 @@ class script:
         return None
 
     def __current_tick(self):
-        if self.__dict__.get("_script__rawTick") is not None:
-            return int(self.__dict__["_script__rawTick"].get())
-        return int(self.__rawTime.get() / FIXED_DT)
+        return int(self.__rawTick.get())
+
+    def __read_pressed_keys(self, count=None):
+        """Read the atomically published pressed-key snapshot."""
+
+        if count is None:
+            count = int(self.__engine_state.get(0, "key_count"))
+        count = max(0, min(int(count), len(PRESSED_KEY_FIELDS)))
+        if count == 0:
+            return frozenset()
+        values = self.__engine_state.get_many(
+            0, PRESSED_KEY_FIELDS[:count]
+        )
+        return unpack_pressed_keys(values.values())
 
     def __write_tick_heartbeat(self, tick):
         visual = self.GameObject.Visual
@@ -1078,31 +1363,43 @@ class script:
         game_object: dict,
         objects_cache,
         lock,
-        keyboard_input,
-        time_key,
+        engine_state,
+        motion_cache,
+        keyboard_ring,
         raw_visual_cache,
         visual_cache,
         raw_id_cache,
         id_cache,
         object_lock,
         camera_state,
-        tick_key=None
     ):
-        self.__keyboard_snapshot = getattr(keyboard_input, "snapshot", None)
-        self.__keyboard_input = (
-            None if self.__keyboard_snapshot is not None else keyboard_input
-        )
-        if self.__keyboard_snapshot is None:
-            self.__pressed_keys = frozenset(keyboard_input[:])
-        else:
-            self.__pressed_keys = self.__keyboard_snapshot()
+        self.__engine_state = engine_state
         self.__objects_cache = objects_cache
         mouse_events = objects_cache.get(Mouse.EVENTS_KEY) or ()
         self.__last_mouse_event_sequence = mouse_events[-1]["sequence"] if mouse_events else 0
         self.__visual_cache = raw_visual_cache
         self.__id_cache = raw_id_cache
-        self.__rawTime = ValueCache(time_key)
-        self.__rawTick = ValueCache(tick_key) if tick_key is not None else None
+        self.__rawTime = FieldView(engine_state, "time")
+        self.__rawTick = FieldView(engine_state, "tick")
+        self.__dict__["_script__rawTick"] = self.__rawTick
+        # Shared-memory pointer snapshot; mouse motion no longer goes through
+        # the Manager event list, so a moving pointer cannot starve keyboard
+        # input or force every script to copy event lists.
+        self.__motion_cache = motion_cache
+        # ``None`` forces one liveness check on the first loop iteration.
+        # Without it a script that was queued before its object got removed
+        # would accept the already-bumped counter as its starting point and
+        # never notice that the object is gone.
+        self.__last_object_generation = None
+        # Keyboard events live in a shared-memory ring, avoiding a Manager
+        # list copy for every script on every key press.
+        self.__keyboard_ring = keyboard_ring
+        self.__keyboard_sequence = FieldView(
+            engine_state, "keyboard_sequence"
+        )
+        self.__last_keyboard_sequence = None
+        self.__pressed_keys = self.__read_pressed_keys()
+        self.__last_input_sequence = None
         self.__camera_target_cache = ValueCache(camera_state[0])
         self.__camera_scale_cache = ValueCache(camera_state[1])
         self.GlobalTime = self.__rawTime.get()
@@ -1123,8 +1420,13 @@ class script:
 
         try:
             self.GameObject = GameObject(game_object, deps=self.__dependencies)
-            self.Mouse = Mouse(self.GameObject, objects_cache)
-            self.Keyboard = Keyboard(self, objects_cache)
+            self.Mouse = Mouse(self.GameObject, objects_cache, self.__motion_cache)
+            self.Keyboard = Keyboard(
+                self,
+                objects_cache,
+                self.__keyboard_ring,
+                self.__keyboard_sequence,
+            )
             self.__mouse_is_over = self.Mouse.is_over()
             self.ComponentConfig = copy.deepcopy(game_object.get("_component_config", {}))
             for property_name, property_value in self.ComponentConfig.items():
@@ -1145,25 +1447,78 @@ class script:
 
             self.start()
 
+            # Polling an event list costs one Manager round-trip per script.
+            # Scripts that never define the matching callbacks should not pay
+            # for it (and should not make the Manager copy the whole list on
+            # every key press or click).
+            def overrides(name):
+                return getattr(type(self), name) is not getattr(script, name)
+
+            self.__wants_keyboard_events = (
+                overrides("on_key_press") or overrides("on_key_release")
+            )
+            self.__wants_mouse_actions = any(
+                overrides(name) for name in (
+                    "on_mouse_press", "on_mouse_click",
+                    "on_mouse_release", "on_mouse_scroll",
+                )
+            )
+            self.__wants_mouse_motion = any(
+                overrides(name) for name in (
+                    "on_mouse_move", "on_mouse_enter", "on_mouse_exit",
+                )
+            )
+
             last_fixed_tick = self.__current_tick()
 
             while True:
-                if (self.__objects_cache is not None
-                        and self.GameObject._id not in self.__objects_cache):
-                    break
+                # One shared-memory read covers the clock, tick, input and
+                # removal counters plus the pressed-key count.  Previously
+                # each of them locked a separate ValueCache.
+                state = self.__engine_state.get_many(
+                    0, ENGINE_STATE_LOOP_FIELDS
+                )
+                now = state["time"]
+                current_tick = int(state["tick"])
 
-                if self.__keyboard_snapshot is None:
-                    self.__pressed_keys = frozenset(self.__keyboard_input[:])
-                else:
-                    self.__pressed_keys = self.__keyboard_snapshot()
+                # Manager calls are the expensive part of the loop.  Without
+                # the shared removal counter every script had to ask the
+                # Manager about its object every OBJECT_LIVENESS_PERIOD.
+                generation = state["object_generation"]
+                if generation != self.__last_object_generation:
+                    self.__last_object_generation = generation
+                    if (self.__objects_cache is not None
+                            and self.GameObject._id not in self.__objects_cache):
+                        break
 
-                now = self.__rawTime.get()
-                current_tick = self.__current_tick()
+                if state["keyboard_sequence"] != self.__last_keyboard_sequence:
+                    # Key names are published as a snapshot in shared memory,
+                    # so no Manager list proxy and no polling thread is needed.
+                    self.__last_keyboard_sequence = state["keyboard_sequence"]
+                    self.__pressed_keys = self.__read_pressed_keys(
+                        state["key_count"]
+                    )
+
                 self.GlobalTime = now
                 self.__dict__["_simulation_tick"] = current_tick
 
-                self.__dispatch_mouse_events()
-                self.__dispatch_keyboard_events()
+                # Pointer movement lives in shared memory, so it is checked
+                # locally every iteration.  Keyboard and click events still
+                # use the shared counter and the Manager event list.
+                if self.__wants_mouse_motion:
+                    self.__dispatch_mouse_motion()
+                wants_mouse_actions = self.__wants_mouse_actions or (
+                    self.__motion_cache is None and self.__wants_mouse_motion
+                )
+                if wants_mouse_actions or self.__wants_keyboard_events:
+                    input_sequence = state["input_sequence"]
+                    if input_sequence != self.__last_input_sequence:
+                        self.__last_input_sequence = input_sequence
+                        if wants_mouse_actions:
+                            self.__dispatch_mouse_events()
+                        if self.__wants_keyboard_events:
+                            self.__dispatch_keyboard_events()
+
                 self.update()
 
                 # Every script advances through the same shared tick sequence.
@@ -1208,6 +1563,7 @@ class script:
         for attribute in (
             "_script__rawTime",
             "_script__rawTick",
+            "_script__keyboard_sequence",
             "_script__camera_target_cache",
             "_script__camera_scale_cache",
             "_script__visual_cache",

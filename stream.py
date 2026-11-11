@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+from multiprocessing.managers import SyncManager
 from pathlib import Path
 import queue
 import threading
 import time
 import traceback
 
-from config import WORKER_READY_TIMEOUT, resolve_project_path
+from config import (
+    KEYBOARD_EVENT_DOWN,
+    KEYBOARD_EVENT_UP,
+    MOUSE_MOTION_STRUCT,
+    PRESSED_KEY_FIELDS,
+    WORKER_READY_TIMEOUT,
+    pack_pressed_keys,
+    resolve_project_path,
+    unpack_pressed_keys,
+)
 from pyengine import GameObject
 from scene import (
     OBJECT_TYPE_RULES,
@@ -17,7 +27,7 @@ from scene import (
     validate_object_data,
 )
 import scripter_runner
-from memory_lib import ObjectCache, ValueCache
+from memory_lib import FieldView, ObjectCache, ValueCache
 
 from radon.visitors import ComplexityVisitor
 
@@ -26,8 +36,120 @@ from radon.visitors import ComplexityVisitor
 SCENE_FILE = "scene1.json"
 
 
+# Small identity buckets stay as plain lists: creating a manager.list costs
+# a fresh Manager connection (~3 ms on Windows), which is more expensive than
+# copying a short list.  Once a value is shared by enough objects the bucket
+# is promoted once and every later append is O(1).
+INDEX_BUCKET_PROMOTE_AT = 16
+
+
 class Stream:
     INDEX_PREFIX = "__engine_index__"
+
+    @staticmethod
+    def __connect_index_manager(address, authkey):
+        """Create a Manager client for identity-index buckets.
+
+        The Stream process receives proxies created by the renderer, but it
+        cannot create new *server-side* objects through them: a proxy created
+        in the Stream process would be owned by that process and disappear
+        when it exits.  A second client connected to the same server creates
+        ``manager.list`` buckets that live in the Manager server and stay
+        valid for every reader.
+        """
+
+        if address is None or authkey is None:
+            return None
+        try:
+            manager = SyncManager(address=address, authkey=authkey)
+            manager.connect()
+            return manager
+        except Exception as error:
+            print(
+                f"[STREAM  ] Manager недоступен для индексов, "
+                f"используется совместимый режим: {error}",
+                flush=True,
+            )
+            return None
+
+    def __add_index_value(self, key, object_id):
+        """Append to an identity bucket without rewriting large buckets.
+
+        Small buckets are plain lists: creating a ``manager.list`` proxy costs
+        a new Manager connection, which is slower than copying a few ids.
+        When a value becomes shared, the bucket is promoted once and every
+        later append moves only one id instead of the whole list.
+        """
+
+        manager = getattr(self, "_index_manager", None)
+        if manager is None:
+            # In-process fallback for unit tests and custom embedders.
+            bucket = list(self.objects_cache.get(key, ()))
+            if object_id not in bucket:
+                bucket.append(object_id)
+            self.objects_cache[key] = bucket
+            return
+
+        # Stream is the only writer, so it can keep promoted proxies itself
+        # and skip one Manager lookup per object.
+        buckets = getattr(self, "_index_buckets", None)
+        if buckets is None:
+            buckets = {}
+            self._index_buckets = buckets
+
+        bucket = buckets.get(key)
+        if bucket is not None:
+            bucket.append(object_id)
+            return
+
+        values = self.objects_cache.get(key)
+        if values is None:
+            self.objects_cache[key] = [object_id]
+            return
+
+        if not isinstance(values, list):
+            # Already promoted, but this process lost its local cache.
+            buckets[key] = values
+            values.append(object_id)
+            return
+
+        values = list(values)
+        values.append(object_id)
+        if len(values) >= INDEX_BUCKET_PROMOTE_AT:
+            bucket = manager.list(values)
+            # Publish the promoted bucket before dropping the plain list.
+            self.objects_cache[key] = bucket
+            buckets[key] = bucket
+        else:
+            self.objects_cache[key] = values
+
+    def __remove_index_value(self, key, object_id):
+        manager = getattr(self, "_index_manager", None)
+        buckets = getattr(self, "_index_buckets", None) or {}
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = self.objects_cache.get(key)
+        if bucket is None:
+            return
+
+        if manager is None or isinstance(bucket, list):
+            bucket = list(bucket)
+            if object_id not in bucket:
+                return
+            bucket.remove(object_id)
+            if bucket:
+                self.objects_cache[key] = bucket
+            else:
+                self.objects_cache.pop(key, None)
+            return
+
+        try:
+            bucket.remove(object_id)
+        except ValueError:
+            return
+        if not bucket:
+            self.objects_cache.pop(key, None)
+            buckets.pop(key, None)
 
     def __add_identity_indexes(self, object_id, identity, object_type):
         if identity is None:
@@ -39,10 +161,7 @@ class Stream:
             if value is None:
                 continue
             key = (self.INDEX_PREFIX, field_name, value)
-            object_ids = list(self.objects_cache.get(key, ()))
-            if object_id not in object_ids:
-                object_ids.append(object_id)
-            self.objects_cache[key] = object_ids
+            self.__add_index_value(key, object_id)
 
     def __add_render_index(self, object_id, render_id):
         self.objects_cache[(self.INDEX_PREFIX, "render_id", render_id)] = object_id
@@ -51,17 +170,21 @@ class Stream:
         render_key = (self.INDEX_PREFIX, "render_id", render_id)
         if self.objects_cache.get(render_key) == object_id:
             self.objects_cache.pop(render_key, None)
+        # Tests and compatibility clients may build a Stream without the
+        # visual cache; layer buckets only exist when it was registered.
+        visual_cache = getattr(self, "visual_cache", None)
+        if visual_cache is not None:
+            layer = visual_cache.get(render_id, "layer")
+            if layer is not None:
+                self.__remove_index_value(
+                    (self.INDEX_PREFIX, "layer", float(layer)), object_id
+                )
         for field_name in ("name", "class", "type"):
             value = self.id_cache.get(render_id, field_name)
-            key = (self.INDEX_PREFIX, field_name, value)
-            object_ids = list(self.objects_cache.get(key, ()))
-            if object_id not in object_ids:
+            if value is None:
                 continue
-            object_ids.remove(object_id)
-            if object_ids:
-                self.objects_cache[key] = object_ids
-            else:
-                self.objects_cache.pop(key, None)
+            key = (self.INDEX_PREFIX, field_name, value)
+            self.__remove_index_value(key, object_id)
 
     def print(self, *args):
         print(f"[STREAM  : {self.stream_time.get():.4f}]", *args, flush=True)
@@ -81,6 +204,9 @@ class Stream:
                 match data.get("command"):
                     case "register":
                         self.__register(data)
+
+                    case "register_many":
+                        self.__register_many(data)
 
                     case "add_script":
                         self.__add_script(data)
@@ -103,10 +229,7 @@ class Stream:
         if event_type.startswith("mouse_"):
             events_key = ("__engine_mouse__", "events")
             state_key = ("__engine_mouse__", "state")
-            events = list(self.objects_cache.get(events_key) or ())
-            sequence = events[-1]["sequence"] + 1 if events else 1
             event = {
-                "sequence": sequence,
                 "type": event_type,
                 "render_id": data.get("render_id"),
                 "x": float(data.get("x", 0)),
@@ -119,8 +242,12 @@ class Stream:
                 "scroll_x": float(data.get("scroll_x", 0)),
                 "scroll_y": float(data.get("scroll_y", 0)),
             }
-            events.append(event)
-            self.objects_cache[events_key] = events[-128:]
+            is_motion = event_type == "mouse_move"
+            # New renderers publish the pointer snapshot directly to shared
+            # memory and mark the event, so only legacy clients pay for the
+            # extra write here.
+            if not data.get("pointer_published"):
+                self.__publish_pointer(event, is_motion)
 
             state = dict(self.objects_cache.get(state_key) or {})
             buttons = set(state.get("buttons", ()))
@@ -135,125 +262,333 @@ class Stream:
                 "buttons": tuple(buttons),
             })
             self.objects_cache[state_key] = state
+
+            if is_motion and self.motion_cache is not None:
+                # Motion is delivered through shared memory.  Keeping it out
+                # of the Manager event list means a moving pointer no longer
+                # wakes the keyboard path or makes every script copy events.
+                return
+
+            events = list(self.objects_cache.get(events_key) or ())
+            sequence = events[-1]["sequence"] + 1 if events else 1
+            event["sequence"] = sequence
+            # Scripts only need the newest pointer position.  Keeping every
+            # motion event made each script copy a full 128-event list from
+            # the Manager and replay stale moves that no longer matter.
+            if is_motion:
+                events = [
+                    pending for pending in events
+                    if pending["type"] != "mouse_move"
+                ]
+            events.append(event)
+            self.objects_cache[events_key] = events[-128:]
+            self.__bump_input_sequence()
             return
 
         key = data["key"]
-        if data["type"] == "key_down" and key not in self.keyboard_input:
-            self.keyboard_input.append(key)
-        elif data["type"] == "key_up" and key in self.keyboard_input:
-            self.keyboard_input.remove(key)
+        event_type = data["type"]
+        if event_type == "key_down":
+            self._pressed_keys.add(key)
+        elif event_type == "key_up":
+            self._pressed_keys.discard(key)
 
-        if data["type"] in {"key_down", "key_up"}:
-            events_key = ("__engine_keyboard__", "events")
-            events = list(self.objects_cache.get(events_key) or ())
-            sequence = events[-1]["sequence"] + 1 if events else 1
-            events.append({
-                "sequence": sequence,
-                "type": data["type"],
-                "key": key,
-                "modifiers": data.get("modifiers", 0),
-            })
-            self.objects_cache[events_key] = events[-128:]
+        if event_type in {"key_down", "key_up"}:
+            if self.keyboard_ring is not None:
+                self.__publish_keyboard_event(data)
+            else:
+                events_key = ("__engine_keyboard__", "events")
+                events = list(self.objects_cache.get(events_key) or ())
+                sequence = events[-1]["sequence"] + 1 if events else 1
+                events.append({
+                    "sequence": sequence,
+                    "type": event_type,
+                    "key": key,
+                    "modifiers": data.get("modifiers", 0),
+                })
+                self.objects_cache[events_key] = events[-128:]
+                self._keyboard_sequence += 1
+                self.__publish_pressed_keys(self._keyboard_sequence)
+        self.__bump_input_sequence()
 
-    def __register(self, data):
+    def __publish_pressed_keys(self, sequence):
+        """Publish the pressed-key snapshot and its sequence atomically.
+
+        Scripts read the count and then exactly that many string fields, so
+        stale chunks from a previous snapshot never leak into the key set.
+        """
+
+        chunks = pack_pressed_keys(self._pressed_keys)
+        values = {
+            "key_count": len(chunks),
+            "keyboard_sequence": sequence,
+        }
+        for index, chunk in enumerate(chunks):
+            values[PRESSED_KEY_FIELDS[index]] = chunk
+        self.engine_state.set_many(0, values)
+
+    def __publish_keyboard_event(self, data):
+        """Append one key event to the shared-memory ring."""
+
+        self._keyboard_sequence += 1
+        segment_id = self._keyboard_sequence % self.keyboard_ring.capacity
+        self.keyboard_ring.set_many(segment_id, {
+            "sequence": self._keyboard_sequence,
+            "type": (
+                KEYBOARD_EVENT_DOWN
+                if data["type"] == "key_down"
+                else KEYBOARD_EVENT_UP
+            ),
+            "key": data["key"],
+            "modifiers": int(data.get("modifiers", 0)),
+        })
+        # Write the event into the ring before advancing the sequence that
+        # scripts poll, so a new sequence always points at a visible event.
+        self.__publish_pressed_keys(self._keyboard_sequence)
+
+    def __publish_pointer(self, event, motion):
+        """Publish the latest pointer snapshot to shared memory.
+
+        ``seq`` advances only for motion, so scripts can distinguish movement
+        from clicks and wheel events without asking the Manager.
+        """
+
+        if self.motion_cache is None:
+            return
+        if motion:
+            # The renderer may already have advanced the sequence through the
+            # direct path; never move it backwards for a legacy client.
+            observed = int(self.motion_cache.get(0, "seq"))
+            self._motion_sequence = max(self._motion_sequence, observed) + 1
+        self.motion_cache.set_many(0, {
+            "seq": self._motion_sequence,
+            "x": event["x"],
+            "y": event["y"],
+            "dx": event["delta_x"],
+            "dy": event["delta_y"],
+            "screen_x": event["screen_x"],
+            "screen_y": event["screen_y"],
+            "hovered": (
+                -1 if event["render_id"] is None else int(event["render_id"])
+            ),
+        })
+
+    def __bump_input_sequence(self):
+        """Wake script loops only when a real input event arrived."""
+
+        self._input_sequence += 1
+        try:
+            self.engine_state.set(0, "input_sequence", self._input_sequence)
+        except (EOFError, BrokenPipeError, OSError):
+            pass
+
+    def __bump_object_generation(self):
+        """Wake script loops when an object may have been removed.
+
+        Liveness checks used to cost one Manager call per script every
+        ``OBJECT_LIVENESS_PERIOD``.  Now scripts only touch the Manager when
+        this shared counter changes, which happens on actual removals.
+        """
+
+        self._object_generation += 1
+        try:
+            self.engine_state.set(
+                0, "object_generation", self._object_generation
+            )
+        except (EOFError, BrokenPipeError, OSError):
+            pass
+
+    def __prepare_registration(self, data):
         request_id = data.get("request_id") or data.get("id")
         object_key = data.get("id")
         object = data.get("obj")
 
-        def reply(payload):
-            if request_id is not None:
-                self.main_out_stream.put({request_id: payload})
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("Регистрация требует непустой request_id")
+        if not isinstance(object_key, str) or not object_key:
+            raise ValueError("Регистрация требует непустой id")
+        validate_cache_string(object_key, "id")
+        if not isinstance(object, dict):
+            raise ValueError("Регистрация требует объект 'obj'")
+        dict_data = object.get("dict_data")
+        if not isinstance(dict_data, dict):
+            raise ValueError("Регистрация требует dict_data")
 
+        # Older clients sent a second copy of the object in ``script_data``.
+        # The record already contains the same dict, so new clients omit it.
+        script_data = data.get("script_data", dict_data)
+        validate_object_data(script_data)
+        return object_key, object
+
+    def __register_one(self, object_key, object, check_duplicate=True, state=None):
+        dict_data = object["dict_data"]
+
+        if check_duplicate and self.objects_cache.get(object_key) is not None:
+            raise ValueError(
+                f"Объект с id {object_key!r} уже зарегистрирован"
+            )
+        capacity = min(self.visual_cache.capacity, self.id_cache.capacity)
+        if self._next_render_id >= capacity:
+            raise ValueError(
+                "Закончились слоты VisualCache/IdCache. "
+                "Увеличьте размер общего кэша или уменьшите число объектов."
+            )
+
+        numeric_object_id = self._next_object_id
+        render_id = self._next_render_id
+        self._next_object_id += 1
+        self._next_render_id += 1
+
+        object["_id"] = object_key
+        object["_object_id"] = numeric_object_id
+        object["_render_id"] = render_id
+        object["_is_render"] = False
+        object["_is_changed"] = False
+        object["changes"] = []
+        object["dict_data"].update({
+            "object_id": numeric_object_id,
+            "render_id": render_id,
+        })
+        object["dict_data"]["_id"] = object_key
+        object["dict_data"]["_components"] = [
+            component
+            for component in ("id", "visual", "scripting", "transform", "components")
+            if component in object["dict_data"]
+        ] + custom_component_names(object["dict_data"])
+        object_type = object["dict_data"].get("object_type")
+        identity = object["dict_data"].pop("id", None)
+        object["dict_data"]["_identity"] = identity or {}
+        visual = object["dict_data"].pop("visual", None)
+
+        if identity is not None:
+            for field_name in ("name", "type", "class"):
+                value = identity.get(
+                    field_name,
+                    object_type if field_name == "type" else None,
+                )
+                if value is not None:
+                    self.id_cache.set(render_id, field_name, value)
+            self.id_cache.set(render_id, "id", object_key)
+            self.__add_identity_indexes(object_key, identity, object_type)
+
+        if visual is not None:
+            position = visual.get("position", [0, 0])
+            if state is None:
+                state = self.engine_state.get_many(0, ("time", "tick"))
+            layer = float(visual.get("layer", 0))
+            self.visual_cache.set_many(render_id, {
+                "x": float(position[0]),
+                "y": float(position[1]),
+                "sim_time": state["time"],
+                "tick": int(state["tick"]),
+                "rotation": float(visual.get("rotation", 0)),
+                "scale": float(visual.get("scale", 1)),
+                "alpha": float(visual.get("alpha", 1)),
+                "sprite": str(visual.get("sprite", "")),
+                "layer": layer,
+            })
+            self.__add_index_value(
+                (self.INDEX_PREFIX, "layer", layer), object_key
+            )
+
+        self.objects_cache[object_key] = object
+        self.__add_render_index(object_key, render_id)
+        return {
+            "object_id": numeric_object_id,
+            "render_id": render_id,
+        }
+
+    def __register(self, data):
+        request_id = data.get("request_id") or data.get("id")
+        try:
+            object_key, object = self.__prepare_registration(data)
+            state = self.engine_state.get_many(0, ("time", "tick"))
+            with self.object_lock:
+                payload = self.__register_one(object_key, object, state=state)
+        except (TypeError, ValueError) as error:
+            payload = {"error": str(error)}
+        except Exception as error:
+            traceback.print_exc()
+            payload = {"error": f"Ошибка регистрации: {error}"}
+
+        if request_id is not None:
+            self.main_out_stream.put({request_id: payload})
+
+    def __register_many(self, data):
+        request_id = data.get("request_id")
+        objects = data.get("objects")
         try:
             if not isinstance(request_id, str) or not request_id:
-                raise ValueError("Регистрация требует непустой request_id")
-            if not isinstance(object_key, str) or not object_key:
-                raise ValueError("Регистрация требует непустой id")
-            validate_cache_string(object_key, "id")
-            if not isinstance(object, dict):
-                raise ValueError("Регистрация требует объект 'obj'")
-            dict_data = object.get("dict_data")
-            if not isinstance(dict_data, dict):
-                raise ValueError("Регистрация требует dict_data")
+                raise ValueError("Пакетная регистрация требует непустой request_id")
+            if not isinstance(objects, list) or not objects:
+                raise ValueError(
+                    "Пакетная регистрация требует непустой список objects"
+                )
 
-            script_data = data.get("script_data", dict_data)
-            validate_object_data(script_data)
+            # One clock snapshot for the whole batch.  Individual reads would
+            # add thousands of shared-memory lock round trips on scene load.
+            state = self.engine_state.get_many(0, ("time", "tick"))
 
             with self.object_lock:
-                if self.objects_cache.get(object_key) is not None:
-                    raise ValueError(
-                        f"Объект с id {object_key!r} уже зарегистрирован"
-                    )
+                # Validate the whole batch before touching shared state, so a
+                # duplicate or a typo does not leave a half-registered batch.
+                prepared = []
+                seen = set()
+                for index, item in enumerate(objects):
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            f"Элемент списка #{index} должен быть JSON-объектом"
+                        )
+                    try:
+                        object_key, cached_object = self.__prepare_registration(
+                            item
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"Объект #{index}: {error}"
+                        ) from error
+                    if object_key in seen:
+                        raise ValueError(
+                            f"Объект {object_key!r} повторяется в пакете"
+                        )
+                    seen.add(object_key)
+                    if self.objects_cache.get(object_key) is not None:
+                        raise ValueError(
+                            f"Объект с id {object_key!r} уже зарегистрирован"
+                        )
+                    prepared.append((object_key, cached_object))
+
                 capacity = min(self.visual_cache.capacity, self.id_cache.capacity)
-                if self._next_render_id >= capacity:
+                if self._next_render_id + len(prepared) > capacity:
                     raise ValueError(
                         "Закончились слоты VisualCache/IdCache. "
                         "Увеличьте размер общего кэша или уменьшите число объектов."
                     )
 
-                numeric_object_id = self._next_object_id
-                render_id = self._next_render_id
-                self._next_object_id += 1
-                self._next_render_id += 1
-
-                object["_id"] = object_key
-                object["_object_id"] = numeric_object_id
-                object["_render_id"] = render_id
-                object["_is_render"] = False
-                object["_is_changed"] = False
-                object["changes"] = []
-                object["dict_data"].update({
-                    "object_id": numeric_object_id,
-                    "render_id": render_id,
-                })
-                object["dict_data"]["_id"] = object_key
-                object["dict_data"]["_components"] = [
-                    component
-                    for component in ("id", "visual", "scripting", "transform", "components")
-                    if component in object["dict_data"]
-                ] + custom_component_names(object["dict_data"])
-                object_type = object["dict_data"].get("object_type")
-                identity = object["dict_data"].pop("id", None)
-                object["dict_data"]["_identity"] = identity or {}
-                visual = object["dict_data"].pop("visual", None)
-
-                if identity is not None:
-                    for field_name in ("name", "type", "class"):
-                        value = identity.get(
-                            field_name,
-                            object_type if field_name == "type" else None,
+                results = []
+                for object_key, cached_object in prepared:
+                    try:
+                        results.append(
+                            self.__register_one(
+                                object_key,
+                                cached_object,
+                                check_duplicate=False,
+                                state=state,
+                            )
                         )
-                        if value is not None:
-                            self.id_cache.set(render_id, field_name, value)
-                    self.id_cache.set(render_id, "id", object_key)
-                    self.__add_identity_indexes(object_key, identity, object_type)
-
-                if visual is not None:
-                    position = visual.get("position", [0, 0])
-                    self.visual_cache.set_many(render_id, {
-                        "x": float(position[0]),
-                        "y": float(position[1]),
-                        "sim_time": self.stream_time.get(),
-                        "tick": int(self.tick_cache.get()),
-                        "rotation": float(visual.get("rotation", 0)),
-                        "scale": float(visual.get("scale", 1)),
-                        "alpha": float(visual.get("alpha", 1)),
-                        "sprite": str(visual.get("sprite", "")),
-                        "layer": float(visual.get("layer", 0)),
-                    })
-
-                self.objects_cache[object_key] = object
-                self.__add_render_index(object_key, render_id)
+                    except Exception as error:
+                        traceback.print_exc()
+                        results.append({
+                            "error": f"Ошибка регистрации: {error}",
+                        })
+            payload = {"objects": results}
         except (TypeError, ValueError) as error:
-            reply({"error": str(error)})
+            payload = {"error": str(error)}
         except Exception as error:
             traceback.print_exc()
-            reply({"error": f"Ошибка регистрации: {error}"})
-        else:
-            reply({
-                "object_id": numeric_object_id,
-                "render_id": render_id,
-            })
+            payload = {"error": f"Ошибка пакетной регистрации: {error}"}
+
+        if request_id is not None:
+            self.main_out_stream.put({request_id: payload})
 
     def __add_script(self, data):
         path = data.get("path")
@@ -365,6 +700,7 @@ class Stream:
                     self.camera_target_cache.set(-1)
 
         if object is not None:
+            self.__bump_object_generation()
             self.render_in_stream.put({
                 "command": "remove",
                 "render_id": render_id,
@@ -382,7 +718,9 @@ class Stream:
             worker = multiprocessing.Process(
                 target=scripter_runner.scripter_runner,
                 args=(
-                    self.time_key,
+                    self.engine_state_data,
+                    self.motion_cache_data,
+                    self.keyboard_ring_data,
                     worker_id,
                     self.render_in_stream,
                     self.change_in_stream,
@@ -392,13 +730,11 @@ class Stream:
                     worker_queue,
                     self.worker_ready,
                     self.lock,
-                    self.keyboard_input,
                     self.proccess_status_info,
                     self.visual_cache_data,
                     self.id_cache_data,
                     self.object_lock,
                     self.camera_state,
-                    self.tick_key
                 ),
                 daemon=True,
             )
@@ -440,12 +776,24 @@ class Stream:
             raise TypeError("Файл сцены должен содержать JSON-массив объектов")
 
         dependencies = self.__dependencies()
+        objects = []
         for index, data in enumerate(scene):
             try:
                 validate_object_data(data)
-                GameObject(data, deps=dependencies).register()
+                objects.append(GameObject(data, deps=dependencies))
             except Exception as error:
                 self.print(f"Объект #{index} не загружен: {error}")
+
+        try:
+            # One registration round trip instead of one per scene object.
+            GameObject.register_many(objects)
+        except Exception as error:
+            self.print(f"Пакетная регистрация не удалась: {error}")
+            for index, game_object in enumerate(objects):
+                try:
+                    game_object.register()
+                except Exception as register_error:
+                    self.print(f"Объект #{index} не загружен: {register_error}")
         self.print('Все обьекты инициализированы')
 
     def get_script_diff(self, path):
@@ -468,7 +816,7 @@ class Stream:
 
     def __init__(
         self,
-        time_key,
+        engine_state,
         render_in_stream,
         change_in_stream,
         main_in_stream,
@@ -478,12 +826,14 @@ class Stream:
         worker_queues,
         worker_ready,
         lock,
-        keyboard_input,
         visual_cache,
         id_cache,
         object_lock,
         camera_state,
-        tick_key
+        motion_cache_data=None,
+        keyboard_ring_data=None,
+        manager_address=None,
+        manager_authkey=None,
     ):
         self.render_in_stream = render_in_stream
         self.change_in_stream = change_in_stream
@@ -494,11 +844,43 @@ class Stream:
         self.worker_queues = worker_queues
         self.worker_ready = worker_ready
         self.lock = lock
-        self.keyboard_input = keyboard_input
-        self.time_key = time_key
-        self.stream_time = ValueCache(time_key)
-        self.tick_key = tick_key
-        self.tick_cache = ValueCache(tick_key)
+        self.engine_state_data = engine_state
+        self.engine_state = ObjectCache(*engine_state)
+        self.stream_time = FieldView(self.engine_state, "time")
+        self.tick_cache = FieldView(self.engine_state, "tick")
+        self.motion_cache_data = motion_cache_data
+        self.keyboard_ring_data = keyboard_ring_data
+        self.motion_cache = (
+            ObjectCache(*motion_cache_data)
+            if motion_cache_data is not None else None
+        )
+        self.keyboard_ring = (
+            ObjectCache(*keyboard_ring_data)
+            if keyboard_ring_data is not None else None
+        )
+        self._input_sequence = int(
+            self.engine_state.get(0, "input_sequence")
+        )
+        self._object_generation = int(
+            self.engine_state.get(0, "object_generation")
+        )
+        self._keyboard_sequence = int(
+            self.engine_state.get(0, "keyboard_sequence")
+        )
+        self._motion_sequence = (
+            int(self.motion_cache.get(0, "seq"))
+            if self.motion_cache is not None else 0
+        )
+        # A reloaded Stream may attach to a segment where keys are already
+        # held.  Seed the local set from the published snapshot.
+        self._pressed_keys = set()
+        key_count = int(self.engine_state.get(0, "key_count"))
+        if key_count > 0:
+            self._pressed_keys = set(unpack_pressed_keys(
+                self.engine_state.get_many(
+                    0, PRESSED_KEY_FIELDS[:key_count]
+                ).values()
+            ))
         self.visual_cache_data = visual_cache
         self.id_cache_data = id_cache
         self.visual_cache = ObjectCache(*visual_cache)
@@ -514,6 +896,11 @@ class Stream:
         self._next_render_id = 0
 
         self._script_complexity_cache = {}
+        self._index_manager = self.__connect_index_manager(
+            manager_address, manager_authkey
+        )
+        # Tells script-side find_object("layer") that layer buckets exist.
+        self.objects_cache[(self.INDEX_PREFIX, "layer", "__ready__")] = True
 
         self.__start_scripter_runners()
 
@@ -525,8 +912,11 @@ class Stream:
             while True:
                 time.sleep(1)
         finally:
-            self.stream_time.detach()
-            self.tick_cache.detach()
+            self.engine_state.detach()
+            if self.motion_cache is not None:
+                self.motion_cache.detach()
+            if self.keyboard_ring is not None:
+                self.keyboard_ring.detach()
             self.visual_cache.detach()
             self.id_cache.detach()
             self.camera_target_cache.detach()

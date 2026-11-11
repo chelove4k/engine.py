@@ -39,6 +39,82 @@ _OVERLAY_COLORS = {
     "white": (255, 255, 255, 255), "orange": (255, 165, 0, 255),
 }
 
+_CLEAR_SELECTORS = {
+    "c": "class", "class": "class", "класс": "class",
+    "n": "name", "name": "name", "имя": "name",
+    "l": "layer", "layer": "layer", "уровень": "layer",
+    "t": "type", "type": "type", "тип": "type",
+}
+
+
+def _clear_usage():
+    print("Использование: clear <class|layer|name|type> <value>")
+    print("Сокращения: c, l, n, t")
+
+
+def _clear_command(args, cache, vcache, main_in_stream):
+    """Remove every object matching one identity field or its visual layer."""
+
+    if not args or args[0].lower() in {"help", "?"}:
+        _clear_usage()
+        return
+
+    field = _CLEAR_SELECTORS.get(args[0].lower())
+    if field is None:
+        _clear_usage()
+        return
+    if len(args) < 2:
+        _clear_usage()
+        return
+
+    raw_value = " ".join(args[1:])
+    if field == "layer":
+        try:
+            value = float(raw_value)
+        except ValueError:
+            print(f"Слой должен быть числом: {raw_value!r}")
+            return
+    else:
+        value = raw_value
+
+    if main_in_stream is None:
+        print("Очередь команд движка недоступна")
+        return
+
+    removed = 0
+    for object_id, record in list(cache.items()):
+        if not isinstance(record, dict):
+            continue
+
+        dict_data = record.get("dict_data")
+        if not isinstance(dict_data, dict):
+            continue
+
+        if field == "layer":
+            if "visual" not in dict_data.get("_components", ()):
+                continue
+            render_id = record.get("_render_id")
+            if render_id is None:
+                continue
+            current = vcache.get(render_id, "layer")
+            if not math.isclose(current, value, rel_tol=1e-6, abs_tol=1e-6):
+                continue
+        else:
+            identity = dict_data.get("_identity")
+            if not isinstance(identity, dict):
+                continue
+            current = (
+                (identity.get("type") or dict_data.get("object_type"))
+                if field == "type" else identity.get(field)
+            )
+            if current != value:
+                continue
+
+        main_in_stream.put({"command": "remove", "id": object_id})
+        removed += 1
+
+    print(f"clear {field} {raw_value}: удалено объектов — {removed}")
+
 
 def _parse_overlay_color(value):
     color = _OVERLAY_COLORS.get(value.lower())
@@ -129,21 +205,32 @@ def _overlay_command(args, overlay_settings):
         print("Неверные параметры overlay. Введите 'overlay help'.")
 
 
-def console(shared_queue, cache, proccess_status_info, vcache_data, icache_data, overlay_settings=None):
+def console(
+    shared_queue,
+    cache,
+    proccess_status_info,
+    vcache_data,
+    icache_data,
+    overlay_settings=None,
+    main_in_stream=None,
+):
     vcache = ObjectCache(*vcache_data)
     icache = ObjectCache(*icache_data)
     try:
         while True:
             try:
-                parts = input('').strip().lower().split()
+                raw_parts = input('').strip().split()
             except EOFError:
                 return
             except KeyboardInterrupt:
                 return
 
-            if not parts:
+            if not raw_parts:
                 continue
 
+            # Existing commands are case-insensitive.  The original tokens are
+            # kept for clear, because names and classes are case-sensitive.
+            parts = [part.lower() for part in raw_parts]
             command, arg = parts[0], parts[1:]
             try:
                 if command == 'show':
@@ -165,6 +252,8 @@ def console(shared_queue, cache, proccess_status_info, vcache_data, icache_data,
                     print(icache.get(int(arg[0]), arg[1]))
                 elif command == 'overlay':
                     _overlay_command(arg, overlay_settings)
+                elif command == 'clear':
+                    _clear_command(raw_parts[1:], cache, vcache, main_in_stream)
                 else:
                     shared_queue.put(command)
             except Exception as error:

@@ -15,6 +15,10 @@ class ValueCache:
     def __init__(self, data=None, name=None, lock=None):
         self.__memory = None
         self._owner = False
+        self._fmt = None
+        self._size = None
+        self._struct = None
+        self.fmt_char = None
 
         if isinstance(data, list):
             name = data[1]
@@ -26,12 +30,7 @@ class ValueCache:
                 self.size = self.MEMORY_TYPES_SIZE[type(data)] + 1
             except KeyError as error:
                 raise TypeError(f"Unsupported ValueCache type: {type(data)!r}") from error
-            if type(data) is str:
-                self.fmt_char = "s"
-            elif type(data) is float:
-                self.fmt_char = "f"
-            else:
-                self.fmt_char = "i"
+            self._set_format(data)
 
         if name is not None:
             if lock is None:
@@ -40,6 +39,10 @@ class ValueCache:
             self.lock = lock
             self.name = name
             self._owner = False
+            # The payload type never changes after creation.  Cache the
+            # struct format instead of re-reading the header and rebuilding
+            # the format string on every get()/set().
+            self._apply_raw_format(self.__memory.buf[0])
         elif name is None:
             if data is None:
                 raise ValueError("ValueCache requires an initial value or a shared memory name")
@@ -60,6 +63,34 @@ class ValueCache:
 
             self.set(data)
 
+    def _set_format(self, data):
+        if type(data) is str:
+            self.fmt_char = "s"
+            self._fmt = f"{MAX_CACHE_STRING_BYTES}s"
+        elif type(data) is float:
+            self.fmt_char = "f"
+            self._fmt = "f"
+        else:
+            self.fmt_char = "i"
+            self._fmt = "i"
+        self._size = MAX_CACHE_STRING_BYTES if self.fmt_char == "s" else 4
+        self._struct = struct.Struct(self._fmt)
+
+    def _apply_raw_format(self, raw_fml):
+        if raw_fml == 0:
+            self.fmt_char = "f"
+            self._fmt = "f"
+        elif raw_fml == 1:
+            self.fmt_char = "i"
+            self._fmt = "i"
+        elif raw_fml == 2:
+            self.fmt_char = "s"
+            self._fmt = f"{MAX_CACHE_STRING_BYTES}s"
+        else:
+            raise ValueError(f"Unknown ValueCache payload type: {raw_fml}")
+        self._size = MAX_CACHE_STRING_BYTES if self.fmt_char == "s" else 4
+        self._struct = struct.Struct(self._fmt)
+
     def get_fml(self):
         raw_fml = self.__memory.buf[0]
         if raw_fml == 0:
@@ -75,8 +106,7 @@ class ValueCache:
 
     def get(self):
         with self.lock:
-            memory_segment = bytes(self.__memory.buf[1:self.get_size() + 1])
-            raw_val = struct.unpack(self.get_fml(), memory_segment)[0]
+            raw_val = self._struct.unpack_from(self.__memory.buf, 1)[0]
 
             if isinstance(raw_val, bytes):
                 return raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
@@ -90,12 +120,11 @@ class ValueCache:
                     f"String value is too long: {len(encoded)} bytes "
                     f"(maximum {MAX_CACHE_STRING_BYTES})"
                 )
-            data = encoded.ljust(MAX_CACHE_STRING_BYTES, b"\x00")
+            data = encoded
 
-        packed_data = struct.pack(self.get_fml(), data)
-
+        packed_data = self._struct.pack(data)
         with self.lock:
-            self.__memory.buf[1:self.get_size() + 1] = packed_data
+            self.__memory.buf[1:self._size + 1] = packed_data
 
     def close(self):
         memory = self.__memory
@@ -128,6 +157,7 @@ class ObjectCache:
     def __init__(self, id_or_name, data, locks=None):
         self.__memory = None
         self._fields = {}
+        self._many_plans = {}
         self.segment_len = 4
         self.field_bit_mapping = {}
         self._owner = False
@@ -195,28 +225,30 @@ class ObjectCache:
         return [bounds[0] + start, bounds[1] + start]
 
     def get(self, segment_id: int, object_name: str):
-        self._field(object_name)
+        try:
+            bounds, fmt_type = self._fields[object_name]
+        except KeyError as error:
+            raise TypeError(f"Запрошен незаданый обьект: {object_name!r}") from error
         if segment_id < 0 or segment_id >= self.segments_count:
             raise IndexError("Индекс сегмента выходит за границы")
 
-        frame = self.get_frame(segment_id, object_name)
-        fmt_type = self._field(object_name)[1]
-
+        offset = segment_id * self.segment_len + bounds[0]
         with self._lock_for(segment_id):
-            memory_segment = bytes(self.__memory.buf[frame[0]:frame[1]])
-            raw_val = struct.unpack(fmt_type, memory_segment)[0]
+            raw_val = struct.unpack_from(
+                fmt_type, self.__memory.buf, offset
+            )[0]
 
             if isinstance(raw_val, bytes):
                 return raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
             return raw_val
 
     def set(self, segment_id: int, object_name: str, data):
-        self._field(object_name)
+        try:
+            bounds, fmt_type = self._fields[object_name]
+        except KeyError as error:
+            raise TypeError(f"Запрошен незаданый обьект: {object_name!r}") from error
         if segment_id < 0 or segment_id >= self.segments_count:
             raise IndexError("Индекс сегмента выходит за границы")
-
-        frame = self.get_frame(segment_id, object_name)
-        fmt_type = self._field(object_name)[1]
 
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -228,15 +260,17 @@ class ObjectCache:
 
         packed_data = struct.pack(fmt_type, data)
 
+        frame_start = segment_id * self.segment_len + bounds[0]
+        frame_end = segment_id * self.segment_len + bounds[1]
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
 
         with self._lock_for(segment_id):
-            if bytes(self.__memory.buf[frame[0]:frame[1]]) == packed_data:
+            if bytes(self.__memory.buf[frame_start:frame_end]) == packed_data:
                 return
-            self.__memory.buf[frame[0]:frame[1]] = packed_data
+            self.__memory.buf[frame_start:frame_end] = packed_data
 
-            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
+            current_mask = struct.unpack_from("i", self.__memory.buf, mask_start)[0]
             new_mask = current_mask | self.field_bit_mapping[object_name]
             self.__memory.buf[mask_start:mask_end] = struct.pack("i", new_mask)
 
@@ -244,15 +278,19 @@ class ObjectCache:
         if segment_id < 0 or segment_id >= self.segments_count:
             raise IndexError("segment index out of range")
         object_names = tuple(object_names)
-        for object_name in object_names:
-            self._field(object_name)
+        plan = self._many_plans.get(object_names)
+        if plan is None:
+            plan = tuple(
+                (name, *self._field(name)) for name in object_names
+            )
+            self._many_plans[object_names] = plan
 
+        base = segment_id * self.segment_len
+        buf = self.__memory.buf
         with self._lock_for(segment_id):
             values = {}
-            for object_name in object_names:
-                frame = self.get_frame(segment_id, object_name)
-                fmt_type = self._field(object_name)[1]
-                raw_val = struct.unpack(fmt_type, bytes(self.__memory.buf[frame[0]:frame[1]]))[0]
+            for object_name, (start, _end), fmt_type in plan:
+                raw_val = struct.unpack_from(fmt_type, buf, base + start)[0]
                 if isinstance(raw_val, bytes):
                     raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
                 values[object_name] = raw_val
@@ -266,8 +304,7 @@ class ObjectCache:
 
         prepared = []
         for object_name, data in values.items():
-            self._field(object_name)
-            fmt_type = self._field(object_name)[1]
+            bounds, fmt_type = self._field(object_name)
             if isinstance(data, str):
                 data = data.encode("utf-8")
                 if len(data) > MAX_CACHE_STRING_BYTES:
@@ -276,53 +313,87 @@ class ObjectCache:
                     )
             packed_data = struct.pack(fmt_type, data)
             prepared.append((
-                self.get_frame(segment_id, object_name),
+                bounds[0],
+                bounds[1],
                 packed_data,
                 self.field_bit_mapping[object_name],
             ))
 
         mask_start = segment_id * self.segment_len
         mask_end = mask_start + 4
+        base = segment_id * self.segment_len
         with self._lock_for(segment_id):
             changed_mask = 0
-            for frame, packed_data, bit_value in prepared:
-                if bytes(self.__memory.buf[frame[0]:frame[1]]) == packed_data:
+            for start, end, packed_data, bit_value in prepared:
+                frame_start = base + start
+                frame_end = base + end
+                if bytes(self.__memory.buf[frame_start:frame_end]) == packed_data:
                     continue
-                self.__memory.buf[frame[0]:frame[1]] = packed_data
+                self.__memory.buf[frame_start:frame_end] = packed_data
                 changed_mask |= bit_value
             if changed_mask == 0:
                 return
-            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
+            current_mask = struct.unpack_from("i", self.__memory.buf, mask_start)[0]
             self.__memory.buf[mask_start:mask_end] = struct.pack("i", current_mask | changed_mask)
+
+    def _changed_values_locked(self, segment_id: int):
+        """Read and clear one segment.  The caller must hold its stripe lock."""
+
+        buf = self.__memory.buf
+        mask_start = segment_id * self.segment_len
+        current_mask = struct.unpack_from("i", buf, mask_start)[0]
+        if current_mask == 0:
+            return None
+
+        values = {}
+        for field_name, bit_value in self.field_bit_mapping.items():
+            if not current_mask & bit_value:
+                continue
+            bounds, fmt_type = self._fields[field_name]
+            raw_val = struct.unpack_from(
+                fmt_type, buf, mask_start + bounds[0]
+            )[0]
+            if isinstance(raw_val, bytes):
+                raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
+            values[field_name] = raw_val
+
+        struct.pack_into("i", buf, mask_start, 0)
+        return values
 
     def get_changed_values(self, segment_id: int):
         """Return and clear the changed fields while holding one segment lock."""
         if segment_id < 0 or segment_id >= self.segments_count:
             raise IndexError("segment index out of range")
 
-        mask_start = segment_id * self.segment_len
-        mask_end = mask_start + 4
         with self._lock_for(segment_id):
-            current_mask = struct.unpack("i", self.__memory.buf[mask_start:mask_end])[0]
-            if current_mask == 0:
-                return {}
+            return self._changed_values_locked(segment_id) or {}
 
-            values = {}
-            for field_name, bit_value in self.field_bit_mapping.items():
-                if not current_mask & bit_value:
-                    continue
-                frame = self.get_frame(segment_id, field_name)
-                fmt_type = self._field(field_name)[1]
-                raw_val = struct.unpack(
-                    fmt_type,
-                    bytes(self.__memory.buf[frame[0]:frame[1]]),
-                )[0]
-                if isinstance(raw_val, bytes):
-                    raw_val = raw_val.rstrip(b"\x00").decode("utf-8", errors="ignore")
-                values[field_name] = raw_val
+    def get_changed_values_many(self, segment_ids):
+        """Return changed fields for several segments with one lock per stripe.
 
-            self.__memory.buf[mask_start:mask_end] = struct.pack("i", 0)
-            return values
+        Polling every sprite separately acquires the same striped locks over
+        and over.  Grouping segment ids by lock turns thousands of semaphore
+        operations per frame into at most ``len(self.locks)``.
+        """
+
+        grouped = {}
+        for segment_id in segment_ids:
+            if segment_id < 0 or segment_id >= self.segments_count:
+                raise IndexError("segment index out of range")
+            grouped.setdefault(segment_id % len(self.locks), []).append(
+                segment_id
+            )
+        if not grouped:
+            return {}
+
+        result = {}
+        for lock_index, ids in grouped.items():
+            with self.locks[lock_index]:
+                for segment_id in ids:
+                    values = self._changed_values_locked(segment_id)
+                    if values:
+                        result[segment_id] = values
+        return result
 
     def get_changes(self, segment_id: int) -> list:
         if segment_id < 0 or segment_id >= self.segments_count:
@@ -364,3 +435,35 @@ class ObjectCache:
             return
         self.__memory = None
         memory.close()
+
+
+class FieldView:
+    """Expose one ObjectCache field through the small ValueCache API.
+
+    The engine clock, tick and counters now live together in a single
+    segment.  Components that previously expected a dedicated ValueCache can
+    keep calling ``get()``/``set()``; the hot script loop still reads all of
+    them with one ``ObjectCache.get_many()`` call.
+    """
+
+    __slots__ = ("_cache", "_segment_id", "_field")
+
+    def __init__(self, cache, field, segment_id=0):
+        cache._field(field)
+        self._cache = cache
+        self._segment_id = segment_id
+        self._field = field
+
+    def get(self):
+        return self._cache.get(self._segment_id, self._field)
+
+    def set(self, value):
+        self._cache.set(self._segment_id, self._field, value)
+
+    @property
+    def name(self):
+        return (self._cache.key, self._segment_id, self._field)
+
+    def detach(self):
+        # The view does not own the shared memory; its owner closes it.
+        pass

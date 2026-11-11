@@ -5,36 +5,7 @@ import threading
 import traceback
 
 from config import PROJECT_DIR, resolve_project_path
-from memory_lib import ObjectCache, ValueCache
-
-
-class KeyboardSnapshot:
-    """Keep a local key snapshot so scripts don't poll a Manager proxy."""
-
-    def __init__(self, keyboard_input, poll_rate=1 / 120):
-        self._keyboard_input = keyboard_input
-        self._pressed = frozenset(keyboard_input[:])
-        self._poll_rate = poll_rate
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._poll,
-            name="keyboard-snapshot",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def _poll(self):
-        while not self._stop_event.wait(self._poll_rate):
-            try:
-                self._pressed = frozenset(self._keyboard_input[:])
-            except (EOFError, BrokenPipeError, OSError, AttributeError):
-                return
-
-    def stop(self):
-        self._stop_event.set()
-
-    def snapshot(self):
-        return self._pressed
+from memory_lib import FieldView, ObjectCache
 
 
 class VisualCache(ObjectCache):
@@ -74,7 +45,9 @@ class scripter_runner:
 
     def __init__(
         self,
-        time_key,
+        engine_state,
+        motion_cache,
+        keyboard_ring,
         id,
         render_in_stream,
         change_in_stream,
@@ -84,18 +57,21 @@ class scripter_runner:
         worker_queue,
         worker_ready,
         lock,
-        keyboard_input,
         proccess_status_info,
         visual_cache,
         id_cache,
         object_lock,
         camera_state,
-        tick_key
     ):
-        self.core_time = ValueCache(time_key)
+        self.engine_state = ObjectCache(*engine_state)
+        self.core_time = FieldView(self.engine_state, "time")
+        self.motion_cache = (
+            ObjectCache(*motion_cache) if motion_cache is not None else None
+        )
+        self.keyboard_ring = (
+            ObjectCache(*keyboard_ring) if keyboard_ring is not None else None
+        )
         self.id = id
-        self.time_key = time_key
-        self.tick_key = tick_key
         self._script_modules = {}
         if str(PROJECT_DIR) not in sys.path:
             sys.path.insert(0, str(PROJECT_DIR))
@@ -108,8 +84,6 @@ class scripter_runner:
         self.worker_ready = worker_ready
         self.proccess_status_info = proccess_status_info
         self.lock = lock
-        self.keyboard_input = keyboard_input
-        self.keyboard_snapshot = KeyboardSnapshot(keyboard_input)
         self.visual_cache = visual_cache
         self.id_cache = id_cache
         self.object_lock = object_lock
@@ -134,8 +108,11 @@ class scripter_runner:
                 self.worker_ready[id] = False
             except (EOFError, BrokenPipeError, OSError):
                 pass
-            self.keyboard_snapshot.stop()
-            self.core_time.detach()
+            self.engine_state.detach()
+            if self.motion_cache is not None:
+                self.motion_cache.detach()
+            if self.keyboard_ring is not None:
+                self.keyboard_ring.detach()
 
     def __load_script_module(self, path):
         """Load a script by file path, independent of the current directory."""
@@ -190,15 +167,15 @@ class scripter_runner:
                         obj_data,
                         self.objects_cache,
                         self.lock,
-                        self.keyboard_snapshot,
-                        self.time_key,
+                        self.engine_state,
+                        self.motion_cache,
+                        self.keyboard_ring,
                         visual_attachment,
                         self.visual_cache,
                         id_attachment,
                         self.id_cache,
                         self.object_lock,
                         self.camera_state,
-                        self.tick_key,
                     ),
                     complexity,
                     data,
