@@ -1,7 +1,7 @@
-"""Scene object schema and validation.
+"""Схема объектов сцены и валидация.
 
-The rules live in their own module so both ``stream`` and ``pyengine`` can use
-them without importing the rendering stack or creating circular imports.
+Правила вынесены в отдельный модуль, чтобы и ``stream``, и ``pyengine`` могли
+использовать их, не импортируя стек рендеринга и не создавая циклических импортов.
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ ENGINE_FIELDS = frozenset(
     {"object_type", *ENGINE_COMPONENT_NAMES, "_id", "object_id", "render_id"}
 )
 
-# These names belong to the engine or to the script lifecycle and cannot be
-# overwritten by custom component properties.
+# Эти имена принадлежат движку или жизненному циклу скрипта и не могут быть
+# перезаписаны свойствами пользовательских компонентов.
 RESERVED_COMPONENT_PROPERTIES = frozenset({
     "GameObject", "Camera", "Mouse", "Keyboard", "ComponentConfig", "GlobalTime",
     "start", "update", "fixed_update", "stop", "is_pressed",
@@ -53,7 +53,7 @@ RESERVED_COMPONENT_PROPERTIES = frozenset({
 
 
 def custom_component_names(data: dict) -> list[str]:
-    """Return top-level keys that describe custom components."""
+    """Возвращает ключи верхнего уровня, описывающие пользовательские компоненты."""
 
     if not isinstance(data, dict):
         return []
@@ -67,7 +67,7 @@ def custom_component_names(data: dict) -> list[str]:
 
 
 def resolve_component_path(name: str):
-    """Resolve a component name to access/components/<name>.py."""
+    """Сопоставляет имя компонента с access/components/<name>.py."""
 
     if not isinstance(name, str) or not name.isidentifier():
         return None
@@ -78,9 +78,9 @@ def resolve_component_path(name: str):
     if exact.is_file():
         return exact.resolve()
 
-    # Be forgiving about filename case on case-sensitive filesystems while
-    # still passing the real file name to the script loader (the class name
-    # must match the file stem).
+    # Снисходительно относимся к регистру имени файла в регистрозависимых
+    # файловых системах, но передаём загрузчику скриптов настоящее имя файла
+    # (имя класса должно совпадать с именем файла без расширения).
     matches = sorted(
         path
         for path in COMPONENTS_DIR.glob("*.py")
@@ -99,7 +99,7 @@ def _component_path_for_spec(path) -> str:
 
 
 def validate_component_properties(component_name: str, properties) -> None:
-    """Validate properties written directly inside a component entry."""
+    """Проверяет свойства, записанные напрямую внутри записи компонента."""
 
     if not isinstance(properties, dict):
         raise ValueError(
@@ -122,15 +122,15 @@ def validate_component_properties(component_name: str, properties) -> None:
 
 
 def component_specs_from_data(data: dict) -> list[dict]:
-    """Collect legacy ``components`` entries and top-level components."""
+    """Собирает устаревшие записи ``components`` и компоненты верхнего уровня."""
 
     specs = []
     legacy_specs = data.get("components", []) or []
     if not isinstance(legacy_specs, list):
-        raise ValueError("components must be a list of component definitions")
+        raise ValueError("components должно быть списком определений компонентов")
     for index, spec in enumerate(legacy_specs):
         if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
-            raise ValueError(f"components[{index}] must contain a path")
+            raise ValueError(f"components[{index}] должен содержать path")
         specs.append({
             "path": spec["path"],
             "properties": copy.deepcopy(spec.get("properties", {})),
@@ -154,17 +154,17 @@ def component_specs_from_data(data: dict) -> list[dict]:
 
 
 def validate_cache_string(value: str, field_name: str, *, allow_empty: bool = False) -> None:
-    """Validate a string that will be stored in a 64-byte shared-memory slot."""
+    """Проверяет строку, которая будет сохранена в 64-байтовом слоте shared memory."""
 
     if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a string")
+        raise ValueError(f"{field_name} должно быть строкой")
     if not allow_empty and not value:
-        raise ValueError(f"{field_name} must not be empty")
+        raise ValueError(f"{field_name} не должно быть пустым")
     encoded = value.encode("utf-8")
     if len(encoded) > MAX_CACHE_STRING_BYTES:
         raise ValueError(
-            f"{field_name} is too long: {len(encoded)} bytes "
-            f"(maximum {MAX_CACHE_STRING_BYTES} bytes in UTF-8)"
+            f"{field_name} слишком длинное: {len(encoded)} байт "
+            f"(максимум {MAX_CACHE_STRING_BYTES} байт в UTF-8)"
         )
 
 
@@ -172,9 +172,9 @@ def _finite_float(value, field_name: str) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError) as error:
-        raise ValueError(f"{field_name} must be a number") from error
+        raise ValueError(f"{field_name} должно быть числом") from error
     if not math.isfinite(result):
-        raise ValueError(f"{field_name} must be a finite number")
+        raise ValueError(f"{field_name} должно быть конечным числом")
     return result
 
 
@@ -209,9 +209,9 @@ def validate_object_data(data: dict) -> None:
             details.append(f"обязательны компоненты: {', '.join(sorted(missing))}")
         raise ValueError(f"Тип {object_type!r}: {'; '.join(details)}")
 
-    # Any other top-level key is a custom component.  Its name must match a
-    # Python file in access/components, and its value holds the properties
-    # directly (no "path"/"properties" wrapper).
+    # Любой другой ключ верхнего уровня — пользовательский компонент.  Его имя
+    # должно совпадать с Python-файлом в access/components, а значение содержит
+    # свойства напрямую (без обёртки "path"/"properties").
     for name in data:
         if name in ENGINE_FIELDS:
             continue
@@ -237,7 +237,7 @@ def validate_object_data(data: dict) -> None:
                 f"В компоненте 'id' отсутствуют поля: {', '.join(sorted(missing_identity))}"
             )
         if "layer" in identity:
-            raise ValueError("id.layer was moved to visual.layer")
+            raise ValueError("id.layer перенесён в visual.layer")
         validate_cache_string(identity["name"], "id.name")
         validate_cache_string(identity["class"], "id.class")
         if "type" in identity:
@@ -268,22 +268,22 @@ def validate_object_data(data: dict) -> None:
     if "transform" in data:
         transform = data["transform"]
         if not isinstance(transform, dict) or set(transform) != {"polygon"}:
-            raise ValueError("transform must contain only a polygon field")
+            raise ValueError("transform должен содержать только поле polygon")
         if "visual" not in data:
-            raise ValueError("transform collider requires visual for position, rotation, and scale")
+            raise ValueError("коллайдер transform требует visual для position, rotation и scale")
         validate_convex_polygon(transform["polygon"])
 
     if "components" in data:
         specs = data["components"]
         if not isinstance(specs, list):
-            raise ValueError("components must be a list of component definitions")
+            raise ValueError("components должен быть списком определений компонентов")
         for index, spec in enumerate(specs):
             if not isinstance(spec, dict):
-                raise ValueError(f"components[{index}] must be an object")
+                raise ValueError(f"components[{index}] должен быть объектом")
             if not isinstance(spec.get("path"), str) or not spec["path"].endswith(".py"):
-                raise ValueError(f"components[{index}].path must be a Python file path")
+                raise ValueError(f"components[{index}].path должен быть путём к Python-файлу")
             if not isinstance(spec.get("properties", {}), dict):
-                raise ValueError(f"components[{index}].properties must be an object")
+                raise ValueError(f"components[{index}].properties должен быть объектом")
 
     if "scripting" in data:
         scripting = data["scripting"]

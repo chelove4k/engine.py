@@ -1,20 +1,20 @@
-"""Spawn and animate the visual performance stress scene.
+"""Создание и анимация визуальной стресс-сцены производительности.
 
-The controller is attached to the manager object in
-``access/scenes/stress_motion.json``.  It creates a dense grid of small
-sprites and moves all of them on circular paths.
+Контроллер прикрепляется к объекту-менеджеру в
+``access/scenes/stress_motion.json``.  Он создаёт плотную сетку маленьких
+спрайтов и двигает их все по круговым траекториям.
 
-Two modes are available:
+Доступны два режима:
 
-* director mode (default) - one ``fixed_update`` writes every position.  This
-  is the smooth visual benchmark for the shared position cache, polling,
-  interpolation and render batching.
-* per-object script mode - set ``per_object_scripts`` to ``true``.  Every
-  sprite receives its own ``stress_mover`` component, which additionally
-  stresses the worker script loops and is expected to saturate the workers
-  long before the renderer becomes the bottleneck.
+* режим режиссёра (по умолчанию) — один ``fixed_update`` записывает каждую
+  позицию.  Это плавный визуальный бенчмарк для общего кэша позиций, опроса,
+  интерполяции и пакетной отрисовки.
+* режим скриптов на каждый объект — установите ``per_object_scripts`` в ``true``.
+  Каждый спрайт получает собственный компонент ``stress_mover``, который
+  дополнительно нагружает циклы воркеров скриптов и, как ожидается, насытит
+  воркеров задолго до того, как узким местом станет рендерер.
 
-Run the scene directly with::
+Запустите сцену напрямую::
 
     $env:PYENGINE_SCENE = "stress_motion.json"
     python render.py
@@ -56,9 +56,9 @@ class stress_scene(Component):
         self._centers = []
         self._phases = []
 
-        # Batch registration keeps scene creation to one Stream round trip per
-        # chunk instead of one per object.  Chunks also let worker scripts
-        # start while the rest of the grid is still being registered.
+        # Пакетная регистрация сокращает создание сцены до одного обращения
+        # к Stream на чанк вместо одного на объект.  Чанки также позволяют
+        # скриптовым воркерам стартовать, пока остальная сетка ещё регистрируется.
         for chunk_start in range(0, count, chunk_size):
             chunk_end = min(count, chunk_start + chunk_size)
             entries = []
@@ -96,7 +96,7 @@ class stress_scene(Component):
             created = self.create_object(entries)
             self._objects.extend(created)
             print(
-                f"[STRESS] registered {chunk_end}/{count} sprites",
+                f"[STRESS] зарегистрировано {chunk_end}/{count} спрайтов",
                 flush=True,
             )
             if per_object:
@@ -117,8 +117,8 @@ class stress_scene(Component):
                 self._phases.append(column * 0.45 + row * 0.65)
 
         self.Camera.moveto_camera(0.0, 0.0)
-        mode = "per-object scripts" if per_object else "director"
-        print(f"[STRESS] {count} moving sprites, {mode} mode")
+        mode = "скрипты на каждый объект" if per_object else "режиссёрский"
+        print(f"[STRESS] {count} движущихся спрайтов, режим: {mode}")
 
     def fixed_update(self):
         visuals = self._visuals

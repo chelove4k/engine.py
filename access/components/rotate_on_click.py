@@ -2,7 +2,7 @@ from pyengine import Component
 
 
 class rotate_on_click(Component):
-    """Rotate the attached object's visual when it is clicked."""
+    """Вращает визуальное представление прикреплённого объекта при клике."""
 
     degrees = 45
 

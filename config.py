@@ -1,7 +1,7 @@
-"""Shared engine constants.
+"""Общие константы движка.
 
-Keeping these values in one place prevents the simulation clock, renderer and
-script loop from drifting apart.
+Хранение этих значений в одном месте не позволяет часам симуляции, рендереру и
+циклу скриптов расходиться.
 """
 
 from pathlib import Path
@@ -11,7 +11,7 @@ COMPONENTS_DIR = PROJECT_DIR / "access" / "components"
 
 
 def resolve_project_path(path):
-    """Resolve a scene/script/asset path against the project directory."""
+    """Разрешает путь к сцене/скрипту/ресурсу относительно каталога проекта."""
 
     result = Path(path).expanduser()
     if not result.is_absolute():
@@ -30,26 +30,27 @@ POSITION_HISTORY_SIZE = 10
 
 SNAPSHOT_ACTIVE_WINDOW = 0.1
 
-# Scripts used to ask the Manager whether their object still exists on every
-# loop iteration.  That is one remote call per script per frame; at a few
-# dozen scripts it starts to dominate the loop.  Checking every 50 ms is
-# enough to stop a removed script promptly without touching the Manager in
-# the common case.
+# Раньше скрипты на каждой итерации цикла спрашивали у Manager, существует ли
+# ещё их объект.  Это один удалённый вызов на скрипт за кадр; уже при
+# нескольких десятках скриптов он начинает доминировать в цикле.  Проверки
+# каждые 50 мс достаточно, чтобы своевременно остановить удалённый скрипт,
+# не обращаясь к Manager в обычном случае.
 OBJECT_LIVENESS_PERIOD = 0.05
 
 MAX_CACHE_STRING_BYTES = 64
 MAX_CATCH_UP_STEPS = 5
 
-# Per-stripe ring of segment ids that became dirty since the last poll.  Its
-# purpose is to make the common "a few scripts moved" frame proportional to
-# the number of dirty sprites instead of the number of active sprites in every
-# dirty stripe.  When a stripe ring overflows, the reader falls back to a full
-# scan of that stripe and resets the ring.
+# Кольцевой буфер на каждую полосу (stripe) с id сегментов, ставших dirty с
+# момента последнего опроса.  Его цель — сделать обычный кадр «сдвинулось
+# несколько скриптов» пропорциональным числу грязных спрайтов, а не числу
+# активных спрайтов в каждой грязной полосе.  При переполнении кольца полосы
+# читатель переходит к полному сканированию этой полосы и сбрасывает кольцо.
 DIRTY_RING_CAPACITY = 256
 
-# Pointer snapshot shared through one ObjectCache segment.  Scripts read it
-# directly from shared memory instead of asking the Manager for an event list
-# on every mouse move.  ``hovered`` is -1 when no sprite is under the pointer.
+# Снимок состояния указателя, передаваемый через один сегмент ObjectCache.
+# Скрипты читают его напрямую из shared memory вместо запроса списка событий у
+# Manager на каждое движение мыши.  ``hovered`` равен -1, если под указателем
+# нет спрайта.
 MOUSE_MOTION_STRUCT = {
     "seq": int,
     "x": float,
@@ -63,9 +64,10 @@ MOUSE_MOTION_STRUCT = {
 MOUSE_MOTION_FIELDS = tuple(MOUSE_MOTION_STRUCT)
 MOUSE_MOTION_BYTES = 4 + 4 * len(MOUSE_MOTION_STRUCT)
 
-# Keyboard events live in a shared-memory ring.  Every script used to copy
-# the whole Manager event list on each key press; with many scripts that both
-# saturated the Manager and made old events replay in a burst.
+# События клавиатуры хранятся в кольцевом буфере в shared memory.  Раньше
+# каждый скрипт копировал весь список событий Manager при каждом нажатии
+# клавиши; при большом числе скриптов это и перегружало Manager, и приводило
+# к пачке повторно проигранных старых событий.
 KEYBOARD_EVENT_DOWN = 1
 KEYBOARD_EVENT_UP = 2
 KEYBOARD_EVENT_CAPACITY = 128
@@ -79,11 +81,11 @@ KEYBOARD_EVENT_FIELDS = tuple(KEYBOARD_EVENT_STRUCT)
 KEYBOARD_EVENT_SEGMENT_BYTES = 4 + 4 + 4 + MAX_CACHE_STRING_BYTES + 4
 KEYBOARD_EVENT_BYTES = KEYBOARD_EVENT_SEGMENT_BYTES * KEYBOARD_EVENT_CAPACITY
 
-# The engine clock, tick, input counters and the currently pressed keys used
-# to live in six separate ValueCache segments.  Every script loop iteration
-# locked each of them separately, and key state was additionally polled from
-# the Manager by a background thread per worker.  One segment lets a script
-# read the whole hot path with a single get_many() call.
+# Часы движка, tick, счётчики ввода и текущие нажатые клавиши раньше жили в
+# шести отдельных сегментах ValueCache.  Каждая итерация цикла скрипта
+# блокировала каждый из них по отдельности, а состояние клавиш дополнительно
+# опрашивалось у Manager фоновым потоком на каждый worker.  Один сегмент
+# позволяет скрипту прочитать весь горячий путь одним вызовом get_many().
 PRESSED_KEY_CHUNKS = 8
 PRESSED_KEY_SEPARATOR = "\x1f"
 ENGINE_STATE_STRUCT = {
@@ -113,7 +115,7 @@ PRESSED_KEY_FIELDS = tuple(
 
 
 def _struct_segment_bytes(struct):
-    """Size of one ObjectCache segment for a {name: type} description."""
+    """Размер одного сегмента ObjectCache для описания {name: type}."""
 
     return 4 + sum(
         MAX_CACHE_STRING_BYTES if value_type is str else 4
@@ -125,11 +127,11 @@ ENGINE_STATE_SEGMENT_BYTES = _struct_segment_bytes(ENGINE_STATE_STRUCT)
 
 
 def pack_pressed_keys(keys):
-    """Pack pressed key names into the fixed-size shared string fields.
+    """Упаковывает имена нажатых клавиш в строковые поля shared memory фиксированного размера.
 
-    Chunks are kept below the per-field string limit.  The number of used
-    chunks is published separately, so stale chunks from a previous snapshot
-    are simply ignored by readers.
+    Фрагменты (chunks) не превышают лимит строки на одно поле.  Число занятых
+    фрагментов публикуется отдельно, поэтому устаревшие фрагменты от
+    предыдущего снимка читатели просто игнорируют.
     """
 
     chunks = []
@@ -137,14 +139,14 @@ def pack_pressed_keys(keys):
     for key in sorted(keys):
         if len(key.encode("utf-8")) > MAX_CACHE_STRING_BYTES:
             raise ValueError(
-                f"Key name exceeds {MAX_CACHE_STRING_BYTES} bytes: {key!r}"
+                f"Имя клавиши превышает {MAX_CACHE_STRING_BYTES} байт: {key!r}"
             )
         candidate = key if not current else current + PRESSED_KEY_SEPARATOR + key
         if len(candidate.encode("utf-8")) > MAX_CACHE_STRING_BYTES:
             chunks.append(current)
             if len(chunks) > PRESSED_KEY_CHUNKS:
                 raise ValueError(
-                    "Too many pressed keys to publish to shared memory"
+                    "Слишком много нажатых клавиш для публикации в shared memory"
                 )
             current = key
         else:
@@ -152,12 +154,12 @@ def pack_pressed_keys(keys):
     if current:
         chunks.append(current)
     if len(chunks) > PRESSED_KEY_CHUNKS:
-        raise ValueError("Too many pressed keys to publish to shared memory")
+        raise ValueError("Слишком много нажатых клавиш для публикации в shared memory")
     return chunks
 
 
 def unpack_pressed_keys(chunks):
-    """Rebuild pressed key names from published chunks."""
+    """Восстанавливает имена нажатых клавиш из опубликованных фрагментов."""
 
     keys = []
     for chunk in chunks:
@@ -169,7 +171,7 @@ def unpack_pressed_keys(chunks):
 
 
 def unpack_input_state(value):
-    """Accept the shared input-state dict and the older key tuple form."""
+    """Принимает общий словарь состояния ввода и старую форму в виде кортежа ключей."""
 
     if isinstance(value, dict):
         return {

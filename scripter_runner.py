@@ -109,7 +109,7 @@ class scripter_runner:
                 self.keyboard_ring.detach()
 
     def __load_script_module(self, path):
-        """Load a script by file path, independent of the current directory."""
+        """Загружает скрипт по пути к файлу независимо от текущего каталога."""
 
         resolved_path = resolve_project_path(path)
         cache_key = str(resolved_path)

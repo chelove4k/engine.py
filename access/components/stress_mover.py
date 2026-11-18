@@ -1,4 +1,4 @@
-"""Orbit one sprite around its spawn point in the visual stress scene."""
+"""Двигает спрайт по орбите вокруг точки появления в визуальной стресс-сцене."""
 
 from math import cos, sin
 
@@ -6,12 +6,12 @@ from pyengine import Component
 
 
 class stress_mover(Component):
-    """Move a single sprite on a circular path.
+    """Двигает один спрайт по круговой траектории.
 
-    The component is used only when the scene controller enables
-    ``per_object_scripts``.  In the default director mode the controller
-    updates every sprite itself, which keeps the motion smooth while still
-    exercising the shared position cache and the render batches.
+    Компонент используется только когда контроллер сцены включает
+    ``per_object_scripts``.  В режиме режиссёра по умолчанию контроллер
+    сам обновляет каждый спрайт, что сохраняет плавность движения и при этом
+    нагружает общий кэш позиций и пакеты рендера.
     """
 
     radius = 4.0

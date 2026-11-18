@@ -53,7 +53,7 @@ def _clear_usage():
 
 
 def _clear_command(args, cache, vcache, main_in_stream):
-    """Remove every object matching one identity field or its visual layer."""
+    """Удаляет все объекты, совпадающие по одному полю идентичности или визуальному слою."""
 
     if not args or args[0].lower() in {"help", "?"}:
         _clear_usage()
@@ -228,8 +228,8 @@ def console(
             if not raw_parts:
                 continue
 
-            # Existing commands are case-insensitive.  The original tokens are
-            # kept for clear, because names and classes are case-sensitive.
+            # Существующие команды нечувствительны к регистру.  Исходные токены
+            # сохраняются для clear, поскольку имена и классы чувствительны к регистру.
             parts = [part.lower() for part in raw_parts]
             command, arg = parts[0], parts[1:]
             try:
@@ -259,7 +259,7 @@ def console(
             except Exception as error:
                 print(error)
     finally:
-        # These are read-only attachments to shared memory owned by the
-        # renderer/main process, so they must be detached, not unlinked.
+        # Это присоединения только для чтения к shared memory, которой владеет
+        # процесс рендерера/главный процесс, поэтому их нужно отсоединять (detach), а не удалять (unlink).
         vcache.detach()
         icache.detach()

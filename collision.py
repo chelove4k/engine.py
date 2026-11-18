@@ -1,4 +1,4 @@
-"""Convex polygon collision helpers used by Transform colliders."""
+"""Вспомогательные функции коллизий выпуклых многоугольников для коллайдеров Transform."""
 
 from math import cos, isfinite, radians, sin
 
@@ -7,27 +7,27 @@ _EPSILON = 1e-9
 
 
 def validate_convex_polygon(points):
-    """Return normalized local-space vertices or raise ValueError."""
+    """Возвращает нормализованные вершины в локальном пространстве или вызывает ValueError."""
     if not isinstance(points, (list, tuple)) or len(points) < 3:
-        raise ValueError("transform.polygon must contain at least three [x, y] points")
+        raise ValueError("transform.polygon должен содержать как минимум три точки [x, y]")
 
     vertices = []
     for index, point in enumerate(points):
         if not isinstance(point, (list, tuple)) or len(point) != 2:
-            raise ValueError(f"transform.polygon[{index}] must be a pair [x, y]")
+            raise ValueError(f"transform.polygon[{index}] должен быть парой [x, y]")
         try:
             x, y = float(point[0]), float(point[1])
         except (TypeError, ValueError) as error:
-            raise ValueError(f"transform.polygon[{index}] must contain numbers") from error
+            raise ValueError(f"transform.polygon[{index}] должен содержать числа") from error
         if not isfinite(x) or not isfinite(y):
-            raise ValueError(f"transform.polygon[{index}] must contain finite numbers")
+            raise ValueError(f"transform.polygon[{index}] должен содержать конечные числа")
         vertices.append((x, y))
 
     count = len(vertices)
     for index, point in enumerate(vertices):
         following = vertices[(index + 1) % count]
         if abs(point[0] - following[0]) <= _EPSILON and abs(point[1] - following[1]) <= _EPSILON:
-            raise ValueError("transform.polygon must not contain duplicate adjacent points")
+            raise ValueError("transform.polygon не должен содержать совпадающие соседние точки")
 
     area_twice = sum(
         vertices[index][0] * vertices[(index + 1) % count][1]
@@ -35,7 +35,7 @@ def validate_convex_polygon(points):
         for index in range(count)
     )
     if abs(area_twice) <= _EPSILON:
-        raise ValueError("transform.polygon must have non-zero area")
+        raise ValueError("transform.polygon должен иметь ненулевую площадь")
 
     direction = 0
     for index in range(count):
@@ -45,15 +45,15 @@ def validate_convex_polygon(points):
             continue
         current = 1 if cross > 0 else -1
         if direction and current != direction:
-            raise ValueError("transform.polygon vertices must describe a convex polygon in order")
+            raise ValueError("вершины transform.polygon должны описывать выпуклый многоугольник по порядку")
         direction = current
     if direction == 0:
-        raise ValueError("transform.polygon must have at least three non-collinear vertices")
+        raise ValueError("transform.polygon должен иметь как минимум три неколлинеарные вершины")
     return tuple(vertices)
 
 
 def polygon_bounds(polygon):
-    """Return ``(min_x, max_x, min_y, max_y)`` for a non-empty polygon."""
+    """Возвращает ``(min_x, max_x, min_y, max_y)`` для непустого многоугольника."""
 
     return (
         min(point[0] for point in polygon),
@@ -64,7 +64,7 @@ def polygon_bounds(polygon):
 
 
 def transform_polygon(vertices, position, rotation_degrees, scale):
-    """Convert local polygon vertices to world-space coordinates."""
+    """Преобразует вершины многоугольника из локальных координат в мировые."""
     angle = radians(float(rotation_degrees))
     cosine, sine = cos(angle), sin(angle)
     scale = float(scale)
@@ -80,12 +80,12 @@ def transform_polygon(vertices, position, rotation_degrees, scale):
 
 def convex_polygons_overlap(first, second, first_bounds=None,
                             second_bounds=None):
-    """Return whether two convex polygons overlap or touch (SAT).
+    """Проверяет, пересекаются ли два выпуклых многоугольника или касаются (SAT).
 
-    ``first_bounds``/``second_bounds`` may contain previously computed
-    ``polygon_bounds()`` values.  Transform colliders cache them together with
-    their world polygon, so a pair check avoids rebuilding four min/max values
-    for each side.
+    ``first_bounds``/``second_bounds`` могут содержать ранее вычисленные
+    значения ``polygon_bounds()``.  Коллайдеры Transform кэшируют их вместе со
+    своим мировым многоугольником, поэтому парная проверка не пересчитывает
+    четыре значения min/max для каждой стороны.
     """
 
     if not first or not second:
