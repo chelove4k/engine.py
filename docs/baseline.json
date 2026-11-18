@@ -1,0 +1,139 @@
+{
+  "generated_at": "2026-11-18T14:17:45",
+  "config": {
+    "scenario": "cache,collision",
+    "duration": 2.0,
+    "objects": 1000,
+    "pairs": 100000,
+    "frames": 60,
+    "cache_ops": 100000,
+    "processes": 4,
+    "workers": 2,
+    "scripts": 1,
+    "motion_objects": 16,
+    "iterations": 100,
+    "timeout": 20.0,
+    "list": false
+  },
+  "ok": true,
+  "results": [
+    {
+      "name": "cache",
+      "ok": true,
+      "duration_s": 2.9395476000208873,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "cache",
+          "name": "object_cache.set",
+          "value": 296167.21126150416,
+          "unit": "ops/s",
+          "note": "655 segments"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.get",
+          "value": 381560.552136213,
+          "unit": "ops/s",
+          "note": ""
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.set_many",
+          "value": 86071.43050850678,
+          "unit": "ops/s",
+          "note": "9 fields"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.get_many",
+          "value": 168561.2956315787,
+          "unit": "ops/s",
+          "note": "9 fields"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.dirty_cycle",
+          "value": 107082.77606714978,
+          "unit": "ops/s",
+          "note": "set_many + get_changed_values"
+        },
+        {
+          "scenario": "cache",
+          "name": "value_cache.set+get",
+          "value": 207750.4202825423,
+          "unit": "ops/s",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "cache roundtrip",
+          "ok": true,
+          "detail": "{'x': 12.5, 'tick': 7, 'sprite': 'probe_sprite'}"
+        },
+        {
+          "name": "dirty mask fields",
+          "ok": true,
+          "detail": "['sprite', 'tick', 'x']"
+        },
+        {
+          "name": "dirty mask cleared",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "value cache roundtrip",
+          "ok": true,
+          "detail": "42.5"
+        }
+      ]
+    },
+    {
+      "name": "collision",
+      "ok": true,
+      "duration_s": 3.1401584000268485,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "collision",
+          "name": "collision.transform",
+          "value": 414605.38689190964,
+          "unit": "ops/s",
+          "note": "4-vertex polygon"
+        },
+        {
+          "scenario": "collision",
+          "name": "collision.overlap",
+          "value": 110587.05135980519,
+          "unit": "checks/s",
+          "note": "precomputed polygons"
+        },
+        {
+          "scenario": "collision",
+          "name": "collision.pipeline",
+          "value": 50162.04094921817,
+          "unit": "pairs/s",
+          "note": "2 transforms + SAT"
+        }
+      ],
+      "checks": [
+        {
+          "name": "SAT detects overlap",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "SAT rejects gap",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "collision pipeline produced both outcomes",
+          "ok": true,
+          "detail": "56111/100000 overlaps"
+        }
+      ]
+    }
+  ]
+}
