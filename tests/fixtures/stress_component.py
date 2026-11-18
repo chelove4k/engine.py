@@ -1,16 +1,16 @@
-"""CPU and cache load component used by ``tests/stress_test.py``.
+"""Компонент нагрузки на CPU и кэш для ``tests/stress_test.py``.
 
-The component is intentionally simple: every script-loop iteration performs a
-configurable amount of arithmetic and then publishes one visual change.  That
-lets the stress runner measure the real script loop together with its shared
-cache writes.
+Компонент намеренно простой: каждая итерация цикла скрипта выполняет
+настраиваемое количество арифметических операций, а затем публикует одно
+визуальное изменение.  Это позволяет стресс-раннеру измерять реальный цикл
+скрипта вместе с записями в общий кэш.
 """
 
 from pyengine import Component
 
 
 class stress_component(Component):
-    """Burn ``iterations`` arithmetic steps and publish one rotation update."""
+    """Выполняет ``iterations`` арифметических шагов и публикует одно обновление поворота."""
 
     iterations = 100
     stride = 1.0
@@ -19,7 +19,7 @@ class stress_component(Component):
         total = 0.0
         for index in range(int(self.iterations)):
             total += (index & 7) * 0.125
-        # Keep the result reachable so the loop cannot be folded away.
+        # Оставляем результат доступным, чтобы цикл нельзя было выбросить при оптимизации.
         self._last_total = total
 
         visual = self.GameObject.Visual
@@ -27,8 +27,8 @@ class stress_component(Component):
             visual.rotation += float(self.stride)
 
     def on_key_press(self, event):
-        # The stress runner sends one key after measuring update rates and
-        # checks that every script received it through the shared ring.
+        # Стресс-раннер отправляет одну клавишу после замера частоты обновлений
+        # и проверяет, что каждый скрипт получил её через общее кольцо.
         self.key_presses = getattr(self, "key_presses", 0) + 1
         visual = self.GameObject.Visual
         if visual is not None:

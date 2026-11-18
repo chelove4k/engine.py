@@ -1,8 +1,8 @@
-"""Moving-object component used by the live ``motion`` stress scenario.
+"""Компонент движущегося объекта для живого стресс-сценария ``motion``.
 
-Each fixed step moves the object by a constant distance.  The stress runner
-then checks that the shared render tick keeps advancing smoothly and that
-every object publishes position updates inside the interpolation window.
+На каждом фиксированном шаге объект смещается на постоянное расстояние.
+Затем стресс-раннер проверяет, что общий render tick продолжает плавно
+идти, а каждый объект публикует обновления позиции внутри окна интерполяции.
 """
 
 from pyengine import Component

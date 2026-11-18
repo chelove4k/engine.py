@@ -311,9 +311,9 @@ class EngineStateTests(unittest.TestCase):
             "key_count": 1,
         })
 
-        # Holding the segment lock proves the lock-free read never takes it;
-        # a plain threading.Lock is not reentrant, so a locked read would
-        # block forever here.
+        # Удержание блокировки сегмента доказывает, что чтение без блокировки
+        # её никогда не берёт; обычный threading.Lock не реентерабелен,
+        # поэтому чтение с блокировкой зависло бы здесь навсегда.
         with cache.locks[0]:
             state = cache.get_many_lockless(0, ENGINE_STATE_LOOP_FIELDS)
         self.assertEqual(state["time"], 3.5)
@@ -409,7 +409,7 @@ class FakeInputSequence:
 
 
 class FakeEngineState:
-    """In-memory stand-in for the shared engine-state segment."""
+    """Заменитель общего сегмента состояния движка в памяти."""
 
     def __init__(self, **values):
         self.values = {
@@ -426,7 +426,7 @@ class FakeEngineState:
         return "" if field.startswith("keys_") else 0
 
     def _field(self, field):
-        # FieldView asks the cache to validate a field name.
+        # FieldView просит кэш проверить имя поля.
         if field not in self.values:
             raise TypeError(f"Запрошен незаданый обьект: {field!r}")
         return (0, 0)
@@ -1015,7 +1015,7 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(set(changes), {"x", "y", "tick"})
         self.assertEqual(cache.get_changed_values(1), {})
 
-        # Writing the same packed span must not mark the segment dirty again.
+        # Запись того же упакованного участка не должна снова помечать сегмент изменённым.
         cache.set_position(1, 12.5, -3.25, 7)
         self.assertEqual(cache.get_changed_values(1), {})
 
@@ -1023,7 +1023,7 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(cache.get_position(1), (13.0, -1.25, 7))
         self.assertEqual(set(cache.get_changed_values(1)), {"x", "y", "tick"})
 
-        # A missing tick preserves the current one under the same lock.
+        # Отсутствующий tick сохраняет текущий под той же блокировкой.
         self.assertEqual(cache.move_position(1, -1.0, 1.0), (12.0, -0.25))
         self.assertEqual(cache.get_position(1), (12.0, -0.25, 7))
 
@@ -1045,8 +1045,8 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(cache.get_position(0), (2.5, 2.0, 3))
 
 
-        # 130 segments share 64 stripe locks, so 0 and 64 must be read
-        # under the same lock acquisition.
+        # 130 сегментов делят 64 блокировки полос, поэтому 0 и 64 должны
+        # читаться в рамках одного захвата блокировки.
         cache = ObjectCache(100 * 130, VISUAL_STRUCT)
         self.addCleanup(cache.close)
         cache.set_many(0, {"x": 1.0, "y": 2.0, "sprite": "a.png"})
@@ -1073,13 +1073,13 @@ class MemoryCacheTests(unittest.TestCase):
         self.addCleanup(cache.close)
         self.assertIs(cache.dirty_counts, counts)
 
-        # Segments 0 and 8 share stripe 0.
+        # Сегменты 0 и 8 делят полосу 0.
         cache.set(0, "x", 1.0)
         cache.set(8, "y", 2.0)
         self.assertEqual(counts[0], 2)
         self.assertEqual(counts[1], 0)
 
-        # A second write to an already-dirty segment must not double count.
+        # Вторая запись в уже изменённый сегмент не должна учитываться дважды.
         cache.set_many(0, {"x": 2.0, "rotation": 5.0})
         self.assertEqual(counts[0], 2)
 
@@ -1087,7 +1087,7 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(set(changes), {0, 8})
         self.assertEqual(counts[0], 0)
 
-        # Writing unchanged values must keep the stripe clean.
+        # Запись неизменённых значений должна оставлять полосу чистой.
         cache.set_many(0, {"x": 2.0, "rotation": 5.0, "y": 0.0})
         self.assertEqual(counts[0], 0)
         self.assertEqual(cache.get_changed_values_many((0, 8)), {})
@@ -1108,8 +1108,8 @@ class MemoryCacheTests(unittest.TestCase):
 
         cache._changed_values_locked = spy
 
-        # 0 and 4 map to stripe 0, 1 and 5 map to stripe 1.  Only the dirty
-        # stripe may be scanned.
+        # 0 и 4 соответствуют полосе 0, 1 и 5 — полосе 1.  Сканироваться
+        # должна только изменённая полоса.
         changes = cache.get_changed_values_many((0, 1, 4, 5))
         self.assertEqual(set(changes), {0})
         self.assertNotIn(1, scanned)
@@ -1157,15 +1157,15 @@ class MemoryCacheTests(unittest.TestCase):
         )
         self.addCleanup(cache.close)
         groups = [set() for _ in range(len(locks))]
-        # Keep the stripe sparse relative to its active set so the ring path
-        # is used instead of the dense sequential scan.
+        # Держим полосу разреженной относительно её активного набора, чтобы
+        # использовался путь через кольцо, а не плотное последовательное сканирование.
         groups[1].update((1, 5, 9, 13, 17))
         stride = 3 + ring_size
 
         cache.set(1, "x", 1.0)
         cache.set(1, "y", 2.0)
-        # The second write is not a new dirty transition, so only one ring
-        # entry may exist for segment 1.
+        # Вторая запись — не новый переход в изменённое состояние, поэтому
+        # для сегмента 1 должна существовать только одна запись кольца.
         self.assertEqual(queue_data[stride], 0)
         self.assertEqual(queue_data[stride + 1], 1)
         changes = cache.get_changed_values_by_stripe(groups)
@@ -1199,8 +1199,8 @@ class MemoryCacheTests(unittest.TestCase):
         self.addCleanup(cache.close)
         groups = [set(), set()]
 
-        # 0 and 2 share stripe 0.  The ring holds one id, so the second
-        # transition sets the overflow flag instead of overwriting it.
+        # 0 и 2 делят полосу 0.  Кольцо вмещает один id, поэтому второй
+        # переход ставит флаг переполнения вместо перезаписи.
         cache.set(0, "x", 1.0)
         cache.set(2, "x", 2.0)
         self.assertEqual(queue_data[2], 1)
@@ -1232,8 +1232,8 @@ class MemoryCacheTests(unittest.TestCase):
         groups = [set(), set(), set(), set()]
         groups[0].add(0)
 
-        # Segment 4 is in the same stripe but outside the caller's active set.
-        # A dense stripe is scanned sequentially, which must clear it too.
+        # Сегмент 4 находится в той же полосе, но вне активного набора вызывающего кода.
+        # Плотная полоса сканируется последовательно, и это тоже должно её очищать.
         cache.set(0, "x", 1.0)
         cache.set(4, "y", 2.0)
         self.assertEqual(counts[0], 2)
@@ -1391,7 +1391,7 @@ class MemoryCacheTests(unittest.TestCase):
         cache.set_many(1, {"x": 1.0, "y": 2.0})
         self.assertEqual(set(cache.get_changed_values(1)), {"x", "y"})
 
-        # Repeating the same values must not dirty anything.
+        # Повторение тех же значений не должно ничего помечать как изменённое.
         cache.set_many(1, {"x": 1.0, "y": 2.0})
         self.assertEqual(cache.get_changed_values(1), {})
 
@@ -1683,9 +1683,9 @@ class MouseHitTestTests(unittest.TestCase):
         sprite = self.add(game, 1, (0, 0, 10, 10))
         self.assertEqual(game._hit_test((5, 5)), 1)
 
-        # The sprite moved without an explicit dirty mark, as interpolation
-        # does.  A far query must not pay for re-indexing it, but approaching
-        # the new position must still find it.
+        # Спрайт переместился без явной пометки об изменении, как это делает
+        # интерполяция.  Дальний запрос не должен тратиться на его переиндексацию,
+        # но при приближении к новой позиции он всё равно должен находиться.
         sprite.place((3000, 3000, 3010, 3010))
         game._moving_render_ids.add(1)
 
@@ -1732,7 +1732,7 @@ class MouseHitTestTests(unittest.TestCase):
             game._hit_geometry_by_render_id[1][:4], initial_cells
         )
         self.assertEqual(game._hit_test((25, 25)), 1)
-        # The candidate set is still valid; the hit box itself decides.
+        # Набор кандидатов всё ещё действителен; решает сам hit box.
         self.assertEqual(game._hit_test((45, 45)), 1)
         self.assertIsNone(game._hit_test((15, 15)))
 
@@ -1751,8 +1751,8 @@ class MouseHitTestTests(unittest.TestCase):
         game._apply_update(1, sprite, {"x": 26.0, "tick": 1})
 
         self.assertNotIn(1, game._hit_dirty_ids)
-        # The lazy pointer refresh must also see that the sprite stayed in
-        # its cached cells and leave the index alone.
+        # Ленивое обновление указателя тоже должно увидеть, что спрайт остался
+        # в своих кэшированных ячейках, и не трогать индекс.
         game._hit_index_dirty()
         self.assertEqual(
             game._hit_geometry_by_render_id[1][:4], initial_cells
@@ -1774,15 +1774,15 @@ class MouseHitTestTests(unittest.TestCase):
         game._apply_update(
             1, sprite, {"x": 3000.0, "y": 3000.0, "tick": 1}
         )
-        # The update only records the sample.  Interpolation draws the sprite
-        # at the new position, but neither one touches the hit grid.
+        # Обновление только записывает сэмпл.  Интерполяция рисует спрайт
+        # в новой позиции, но ни то, ни другое не трогает сетку попаданий.
         self.assertNotIn(1, game._hit_dirty_ids)
         game._interpolate_sprite_positions(1.0)
         self.assertEqual((sprite.center_x, sprite.center_y), (3000.0, 3000.0))
         self.assertNotIn(1, game._hit_dirty_ids)
         self.assertEqual(game._hit_geometry_by_render_id[1], old_geometry)
 
-        # A pointer query promotes the moved sprite and re-indexes it.
+        # Запрос указателя переводит перемещённый спрайт в активные и переиндексирует его.
         game._hit_index_dirty()
         new_geometry = game._hit_geometry_by_render_id[1]
         self.assertNotEqual(new_geometry, old_geometry)
@@ -1898,7 +1898,7 @@ class MouseHitTestTests(unittest.TestCase):
         stream = self.prepare_send(game)
         game._send_mouse_event("mouse_move", 50, 60, dx=1, dy=2)
 
-        # Motion is published directly and does not touch the Manager queue.
+        # Движение публикуется напрямую и не трогает очередь Manager.
         self.assertEqual(stream.messages, [])
         self.assertEqual(game.motion_cache.values["hovered"], 3)
         self.assertEqual(game.motion_cache.values["x"], 50.0)
@@ -1920,7 +1920,7 @@ class MouseHitTestTests(unittest.TestCase):
         self.assertTrue(message["pointer_published"])
         self.assertEqual(message["button"], "left")
         self.assertEqual(game.motion_cache.values["hovered"], 3)
-        # Only motion advances the pointer sequence.
+        # Только движение продвигает последовательность указателя.
         self.assertEqual(game.motion_cache.values["seq"], 0)
 
 
@@ -2048,7 +2048,7 @@ class RenderQueueTests(unittest.TestCase):
                 return {0: {"x": 5.0}}
 
             def get_changed_values_many(self, segment_ids):
-                raise AssertionError("pre-grouped path must be used")
+                raise AssertionError("должен использоваться путь с предварительной группировкой")
 
         class EmptyQueue:
             def get_nowait(self):
@@ -2121,9 +2121,9 @@ class SnapshotInterpolationTests(unittest.TestCase):
     def test_common_tick_keeps_relative_offset_stable(self):
         probe = self.Probe()
 
-        # The object and the camera target move at the same speed.  The
-        # target's samples are recorded with a different arrival pattern, but
-        # both carry the same shared tick numbers.
+        # Объект и цель камеры движутся с одинаковой скоростью.  Сэмплы цели
+        # записываются с другим паттерном поступления, но оба несут одинаковые
+        # номера общего tick.
         for tick in range(0, 20):
             probe._record_position(10, (100.0 + tick * 2, 0.0), tick)
         for tick in (0, 3, 6, 9, 12, 15, 18):
@@ -2157,8 +2157,8 @@ class SnapshotInterpolationTests(unittest.TestCase):
         probe._latest_tick_by_render_id = {1: 100, 2: 90}
         probe._last_tick_update_by_render_id = {1: now, 2: now}
 
-        # Object 2 is 10 ticks late, but the shared clock must keep moving so
-        # every other object stays smooth.  Only object 2 holds its sample.
+        # Объект 2 отстаёт на 10 тиков, но общие часы должны продолжать идти,
+        # чтобы остальные объекты оставались плавными.  Только объект 2 держит сэмпл.
         render_tick = probe._resolve_render_tick()
         self.assertGreater(render_tick, 89.0)
         probe._position_history_by_render_id[2] = deque(
@@ -2174,8 +2174,8 @@ class SnapshotInterpolationTests(unittest.TestCase):
         probe._latest_tick_by_render_id = {1: 100, 2: 50}
         probe._last_tick_update_by_render_id = {1: now, 2: now}
 
-        # Render id 2 is an idle camera target without its own script loop.
-        # Its stale tick must not freeze the whole frame and cause a jump.
+        # Render id 2 — простаивающая цель камеры без собственного цикла скрипта.
+        # Её устаревший tick не должен замораживать весь кадр и вызывать скачок.
         render_tick = probe._resolve_render_tick()
         self.assertGreater(render_tick, 90.0)
 
@@ -2204,8 +2204,8 @@ class SnapshotInterpolationTests(unittest.TestCase):
         self.assertAlmostEqual(moving_sprite.center_x, 5.0)
         self.assertAlmostEqual(moving_sprite.center_y, -5.0)
 
-        # A long silence removes the sprite from the moving set and snaps it
-        # to the last received sample instead of leaving it interpolated.
+        # Долгая тишина убирает спрайт из набора движущихся и перемещает его
+        # к последнему полученному сэмплу, а не оставляет интерполированным.
         probe._interpolate_sprite_positions(1000.0)
         self.assertNotIn(2, probe._moving_render_ids)
         self.assertEqual(
@@ -2269,8 +2269,8 @@ class CreateObjectTests(CacheTestCase):
             },
         }, deps=deps)
 
-        # A position update must not rewrite sim_time: the renderer uses the
-        # shared tick, and only registration needs the compatibility field.
+        # Обновление позиции не должно перезаписывать sim_time: рендерер
+        # использует общий tick, а поле совместимости нужно только при регистрации.
         visual.set(0, "sim_time", 123.0)
         game_object.Visual.position = Vector2(5, 6)
         self.assertEqual(visual.get(0, "tick"), 17)
@@ -2300,7 +2300,7 @@ class CreateObjectTests(CacheTestCase):
         self.assertEqual(visual.get_position(0), (3.5, 0.5, 17))
         self.assertEqual((position.x, position.y), (3.5, 0.5))
 
-        # Pair form and fallback-free return value.
+        # Вариант с парой и возвращаемое значение без fallback.
         position = game_object.Visual.move((-1.0, 2.0))
         self.assertEqual(visual.get_position(0), (2.5, 2.5, 17))
         self.assertEqual((position.x, position.y), (2.5, 2.5))
@@ -2337,9 +2337,9 @@ class CreateObjectTests(CacheTestCase):
         first.Visual.__dict__["_simulation_time_owner"] = owner
         second.Visual.__dict__["_simulation_time_owner"] = owner
 
-        # A script can move another object through find_object().  Every
-        # position write must carry the current tick for the object it belongs
-        # to, not for the script's own object.
+        # Скрипт может двигать другой объект через find_object().  Каждая
+        # запись позиции должна нести текущий tick того объекта, к которому
+        # она относится, а не объекта самого скрипта.
         first.Visual.position = Vector2(1, 2)
         second.Visual.position = Vector2(3, 4)
 
@@ -2398,11 +2398,11 @@ class CreateObjectTests(CacheTestCase):
             self.assertTrue(first.Transform.overlaps(second))
             self.assertEqual(mocked.call_count, 2)
 
-            # Both transforms keep their world polygon and AABB across checks.
+            # Оба трансформа сохраняют свой мировой полигон и AABB между проверками.
             self.assertTrue(first.Transform.overlaps(second))
             self.assertEqual(mocked.call_count, 2)
 
-            # A pose change invalidates only the transform that moved.
+            # Изменение позы сбрасывает кэш только у сдвинувшегося трансформа.
             visual.set_many(0, {"x": 10.0})
             self.assertFalse(first.Transform.overlaps(second))
             self.assertEqual(mocked.call_count, 3)
@@ -2650,8 +2650,8 @@ class CreateObjectTests(CacheTestCase):
         old_key = (Stream.INDEX_PREFIX, "layer", 2.0)
         new_key = (Stream.INDEX_PREFIX, "layer", 4.5)
         visual.set_many(0, {"layer": 2.0})
-        # Registration in a live Stream seeds this bucket; the fake stream
-        # only acknowledges the registration.
+        # Регистрация в живом Stream заполняет эту корзину; фиктивный поток
+        # только подтверждает регистрацию.
         deps["objects_cache"][old_key] = [game_object._id]
 
         game_object.Visual.layer = 4.5
@@ -2659,13 +2659,13 @@ class CreateObjectTests(CacheTestCase):
         self.assertNotIn(old_key, deps["objects_cache"])
         self.assertEqual(deps["objects_cache"][new_key], [game_object._id])
 
-        # Repeating the same layer must not duplicate the object.
+        # Повторная установка того же слоя не должна дублировать объект.
         game_object.Visual.layer = 4.5
         self.assertEqual(deps["objects_cache"][new_key], [game_object._id])
 
 
 class IdentityIndexTests(CacheTestCase):
-    """Identity indexes must be O(1) buckets, not whole-list rewrites."""
+    """Индексы идентичности должны быть O(1)-корзинами, а не перезаписью целых списков."""
 
     @classmethod
     def setUpClass(cls):
@@ -2702,7 +2702,7 @@ class IdentityIndexTests(CacheTestCase):
                 "dynamic_object",
             )
 
-        # Shared class/type buckets were promoted to manager.list proxies.
+        # Общие корзины class/type были переведены в прокси manager.list.
         class_bucket = stream_object.objects_cache[class_key]
         self.assertNotIsInstance(class_bucket, list)
         self.assertEqual(
@@ -2711,7 +2711,7 @@ class IdentityIndexTests(CacheTestCase):
         )
         self.assertNotIsInstance(stream_object.objects_cache[type_key], list)
 
-        # A name used once stays a plain list and is not promoted.
+        # Имя, использованное один раз, остаётся обычным списком и не повышается до прокси.
         self.assertNotIn(hero_key, stream_object.objects_cache)
         stream_object._Stream__add_identity_indexes(
             "solo", {"name": "hero", "class": "Unit"}, "dynamic_object"
@@ -2734,13 +2734,13 @@ class IdentityIndexTests(CacheTestCase):
                 "id": object_id,
             })
 
-        # Remove from both the plain (name) and promoted (class/type) buckets.
+        # Удаляем из обычной корзины (name) и из повышенных (class/type).
         stream_object._Stream__remove_identity_indexes("unit_0", 0)
         stream_object._Stream__remove_identity_indexes("solo", 16)
         self.assertEqual(class_bucket[:], added_ids[1:16] + ["extra"])
         self.assertNotIn(hero_key, stream_object.objects_cache)
 
-        # Empty promoted buckets are removed from the index and local cache.
+        # Пустые повышенные корзины удаляются из индекса и локального кэша.
         for render_id, object_id in enumerate(added_ids):
             if object_id in {"unit_0", "solo"}:
                 continue
@@ -2778,7 +2778,7 @@ class IdentityIndexTests(CacheTestCase):
 
         stream_object._Stream__remove_identity_indexes("unit_2", 2)
         self.assertNotIn(layer_two, stream_object.objects_cache)
-        # Other layers are untouched.
+        # Остальные слои не затрагиваются.
         self.assertEqual(
             stream_object.objects_cache[
                 (Stream.INDEX_PREFIX, "layer", 5.0)

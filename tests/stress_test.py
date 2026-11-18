@@ -1,27 +1,28 @@
-"""Standalone stress tests for the engine core.
+"""Автономные стресс-тесты ядра движка.
 
-The runner is deliberately not named ``test_*.py`` so the normal unittest
-discovery does not execute it.  It covers different workloads instead of a
-single synthetic loop:
+Раннер намеренно не называется ``test_*.py``, чтобы обычный discovery
+unittest его не запускал.  Вместо одного синтетического цикла он покрывает
+разные нагрузки:
 
-* raw ``ObjectCache`` / ``ValueCache`` throughput;
-* multi-process cache contention through shared memory and segment locks;
-* convex collision math (transform + SAT);
-* render-tick position history and interpolation;
-* live object registration through ``Stream``;
-* batch creation through the local ``create_object`` path;
-* component/script update loops through a live ``Stream``.
+* чистую пропускную способность ``ObjectCache`` / ``ValueCache``;
+* конкуренцию многопроцессного кэша через shared memory и блокировки сегментов;
+* математику выпуклых коллизий (transform + SAT);
+* историю позиций по render tick и интерполяцию;
+* регистрацию объектов в реальном времени через ``Stream``;
+* пакетное создание через локальный путь ``create_object``;
+* циклы обновления компонентов/скриптов через живой ``Stream``.
 
-Run it from the project root (or anywhere else; paths resolve from the project):
+Запуск из корня проекта (или из любого другого места; пути разрешаются
+относительно проекта):
 
     python tests/stress_test.py
     python tests/stress_test.py --scenario cache,contention --processes 8
     python tests/stress_test.py --scenario all --objects 2000 --duration 5
     python tests/stress_test.py --json stress-report.json
 
-The live scenarios start real ``Stream`` and worker processes, so keep the
-``if __name__ == "__main__"`` guard and the top-level worker functions intact
-on Windows.
+Живые сценарии запускают настоящие процессы ``Stream`` и рабочие процессы,
+поэтому на Windows сохраняйте защиту ``if __name__ == "__main__"`` и
+функции-обработчики верхнего уровня неизменными.
 """
 
 from __future__ import annotations
@@ -79,14 +80,14 @@ CONTENTION_STRUCT = {"value": float, "counter": int}
 
 
 def _segment_len(struct):
-    """ObjectCache layout: 4-byte dirty mask + 4/64 bytes per field."""
+    """Раскладка ObjectCache: 4-байтовая маска изменений + 4/64 байта на поле."""
 
     return 4 + sum(64 if field_type is str else 4 for field_type in struct.values())
 
 
-VISUAL_SEGMENT_LEN = _segment_len(VISUAL_STRUCT)  # 100 bytes
-ID_SEGMENT_LEN = _segment_len(ID_STRUCT)  # 260 bytes
-CONTENTION_SEGMENT_LEN = _segment_len(CONTENTION_STRUCT)  # 12 bytes
+VISUAL_SEGMENT_LEN = _segment_len(VISUAL_STRUCT)  # 100 байт
+ID_SEGMENT_LEN = _segment_len(ID_STRUCT)  # 260 байт
+CONTENTION_SEGMENT_LEN = _segment_len(CONTENTION_STRUCT)  # 12 байт
 
 SCENE_OBJECT_COUNT = 5  # access/scenes/scene1.json
 INTERPOLATION_DELAY_TICKS = int(
@@ -163,7 +164,7 @@ def _stress_object(index: int, prefix: str = "stress_object") -> dict:
 
 
 def run_cache(args) -> ScenarioResult:
-    """Measure raw shared-cache operations in one process."""
+    """Измеряет чистые операции с общим кэшем в одном процессе."""
 
     result = ScenarioResult("cache")
     cache = None
@@ -179,7 +180,7 @@ def run_cache(args) -> ScenarioResult:
             cache.set(index % segments, "x", float(index % 997))
         elapsed = time.perf_counter() - started
         result.metric("object_cache.set", _rate(operations, elapsed), "ops/s",
-                      f"{segments} segments")
+                      f"{segments} сегментов")
 
         started = time.perf_counter()
         for index in range(operations):
@@ -207,7 +208,7 @@ def run_cache(args) -> ScenarioResult:
             cache.set_many(index % segments, packed)
         elapsed = time.perf_counter() - started
         result.metric("object_cache.set_many", _rate(operations, elapsed), "ops/s",
-                      "9 fields")
+                      "9 полей")
 
         started = time.perf_counter()
         for index in range(operations):
@@ -218,7 +219,7 @@ def run_cache(args) -> ScenarioResult:
             )
         elapsed = time.perf_counter() - started
         result.metric("object_cache.get_many", _rate(operations, elapsed), "ops/s",
-                      "9 fields")
+                      "9 полей")
 
         cycles = max(1000, operations // 10)
         started = time.perf_counter()
@@ -237,8 +238,8 @@ def run_cache(args) -> ScenarioResult:
         elapsed = time.perf_counter() - started
         result.metric("value_cache.set+get", _rate(operations, elapsed), "ops/s")
 
-        # Functional checks: the benchmark must not just produce plausible
-        # timings while corrupting field ordering or the dirty mask.
+        # Функциональные проверки: бенчмарк не должен выдавать правдоподобное
+        # время, портя при этом порядок полей или маску изменений.
         check_segment = 0
         cache.set_many(check_segment, {
             "x": 12.5,
@@ -277,7 +278,7 @@ def run_cache(args) -> ScenarioResult:
 
 def _contention_worker(cache_key, struct, locks, capacity, mode, worker_id,
                        start_event, stop_event, ready_queue, result_queue):
-    """Top-level worker so the function is picklable on Windows spawn."""
+    """Функция-обработчик верхнего уровня, чтобы её можно было сериализовать при spawn в Windows."""
 
     cache = None
     try:
@@ -286,11 +287,11 @@ def _contention_worker(cache_key, struct, locks, capacity, mode, worker_id,
         counter = 0
         ready_queue.put({"worker": worker_id, "ok": True})
         if not start_event.wait(15.0):
-            raise RuntimeError("timed out waiting for the start event")
+            raise RuntimeError("истекло время ожидания стартового события")
 
         started = time.perf_counter()
         while True:
-            # Check the stop flag once per batch instead of in the hot loop.
+            # Проверяем флаг остановки раз за пакет, а не в горячем цикле.
             for _ in range(512):
                 counter += 1
                 cache.set_many(segment, {
@@ -352,7 +353,7 @@ def _run_contention_mode(cache, mode, process_count, duration):
         failures = [message for message in ready if not message.get("ok")]
         if len(ready) != process_count or failures:
             raise RuntimeError(
-                f"contention workers did not start: ready={len(ready)}/"
+                f"рабочие процессы конкуренции не запустились: ready={len(ready)}/"
                 f"{process_count}, failures={failures}"
             )
 
@@ -375,7 +376,7 @@ def _run_contention_mode(cache, mode, process_count, duration):
             raise RuntimeError("\n".join(errors))
         if len(results) != process_count:
             raise RuntimeError(
-                f"contention workers returned {len(results)}/{process_count} results"
+                f"рабочие процессы конкуренции вернули {len(results)}/{process_count} результатов"
             )
 
         return {
@@ -395,7 +396,7 @@ def _run_contention_mode(cache, mode, process_count, duration):
 
 
 def run_contention(args) -> ScenarioResult:
-    """Measure multi-process shared-memory cache contention."""
+    """Измеряет конкуренцию многопроцессного кэша в shared memory."""
 
     result = ScenarioResult("contention")
     cache = None
@@ -421,13 +422,13 @@ def run_contention(args) -> ScenarioResult:
                 f"contention.{mode}.throughput",
                 throughput,
                 "ops/s",
-                f"{process_count} processes",
+                f"{process_count} процессов",
             )
             result.metric(
                 f"contention.{mode}.latency",
                 latency,
                 "us/op",
-                "aggregate wall time",
+                "суммарное реальное время",
             )
             if mode == "distinct":
                 result.metric(
@@ -461,7 +462,7 @@ def run_contention(args) -> ScenarioResult:
 
 
 def run_collision(args) -> ScenarioResult:
-    """Measure polygon transforms and SAT overlap checks."""
+    """Измеряет преобразования полигонов и проверки пересечения SAT."""
 
     from collision import (
         convex_polygons_overlap,
@@ -491,7 +492,7 @@ def run_collision(args) -> ScenarioResult:
         )
     elapsed = time.perf_counter() - started
     result.metric("collision.transform", _rate(pairs, elapsed), "ops/s",
-                  "4-vertex polygon")
+                  "полигон из 4 вершин")
 
     variants = [
         transform_polygon(
@@ -510,13 +511,13 @@ def run_collision(args) -> ScenarioResult:
         )
     elapsed = time.perf_counter() - started
     result.metric("collision.overlap", _rate(pairs, elapsed), "checks/s",
-                  "precomputed polygons")
+                  "предвычисленные полигоны")
 
     hits = 0
     started = time.perf_counter()
     for index in range(pairs):
         first_x = index % 100
-        # Offsets 0..39 include both overlapping and separated pairs.
+        # Смещения 0..39 включают как пересекающиеся, так и разделённые пары.
         offset = index % 40
         first = transform_polygon(
             polygon, (first_x, 0), index % 360, 1.0
@@ -528,7 +529,7 @@ def run_collision(args) -> ScenarioResult:
             hits += 1
     elapsed = time.perf_counter() - started
     result.metric("collision.pipeline", _rate(pairs, elapsed), "pairs/s",
-                  "2 transforms + SAT")
+                  "2 трансформа + SAT")
     result.check(
         "collision pipeline produced both outcomes",
         hits > 0 and hits < pairs,
@@ -569,7 +570,7 @@ class _FakeSprite:
 
 
 def run_render(args) -> ScenarioResult:
-    """Measure the real render position-history and interpolation code."""
+    """Измеряет реальный код истории позиций рендера и интерполяции."""
 
     import render
 
@@ -622,7 +623,7 @@ def run_render(args) -> ScenarioResult:
         game._position_history_by_render_id[render_id] = history
         game._sprites_by_render_id[render_id] = _FakeSprite()
 
-    # This scenario measures the worst case: every object moves every frame.
+    # Этот сценарий измеряет худший случай: каждый объект движется каждый кадр.
     game._moving_render_ids = set(range(objects))
 
     frame_times = []
@@ -646,12 +647,12 @@ def run_render(args) -> ScenarioResult:
     elapsed = time.perf_counter() - started
 
     result.metric("render.interpolation.frames", _rate(frames, elapsed), "frames/s",
-                  f"{objects} objects")
+                  f"{objects} объектов")
     result.metric(
         "render.interpolation.objects",
         _rate(objects * frames, elapsed),
         "objects/s",
-        f"{objects} objects x {frames} frames",
+        f"{objects} объектов x {frames} кадров",
     )
     result.metric(
         "render.interpolation.frame_p95",
@@ -672,7 +673,7 @@ def run_render(args) -> ScenarioResult:
         ),
     )
 
-    # A static scene must not pay for interpolation at all.
+    # Статическая сцена не должна тратить время на интерполяцию вообще.
     game._moving_render_ids.clear()
     static_sample = game._sprites_by_render_id[0]
     static_sample.center_x = -12345.0
@@ -686,7 +687,7 @@ def run_render(args) -> ScenarioResult:
         "render.interpolation.static_frame_p95",
         static_elapsed / max(1, frames) * 1000.0,
         "ms/frame",
-        f"{objects} static objects",
+        f"{objects} статических объектов",
     )
     result.check(
         "static sprites untouched",
@@ -698,7 +699,7 @@ def run_render(args) -> ScenarioResult:
 
 
 class _LoopbackInStream:
-    """Answer registration requests immediately, without a Stream process."""
+    """Немедленно отвечает на запросы регистрации, без процесса Stream."""
 
     def __init__(self, out_stream, objects_cache=None):
         self._out_stream = out_stream
@@ -714,8 +715,8 @@ class _LoopbackInStream:
         if command == "register":
             object_id = self._next_id
             self._next_id += 1
-            # Emulate the part of Stream that stores the registered record;
-            # ids and cache writes are done by GameObject.register itself.
+            # Имитируем часть Stream, которая сохраняет зарегистрированную запись;
+            # id и записи в кэш выполняет сам GameObject.register.
             if self._objects_cache is not None:
                 self._objects_cache[message["id"]] = message["obj"]
             self._out_stream.put({
@@ -741,7 +742,7 @@ class _LoopbackInStream:
 
 
 def run_batch(args) -> ScenarioResult:
-    """Measure the local create_object batch path (validation + caches)."""
+    """Измеряет локальный пакетный путь create_object (валидация + кэши)."""
 
     from pyengine import create_object
 
@@ -774,7 +775,7 @@ def run_batch(args) -> ScenarioResult:
         elapsed = time.perf_counter() - started
 
         result.metric("batch.objects", _rate(count, elapsed), "objects/s",
-                      "one create_object(list) call")
+                      "один вызов create_object(list)")
         result.metric("batch.per_object", elapsed * 1000.0 / count, "ms/object")
 
         result.check("batch returned every object", len(created) == count,
@@ -817,7 +818,7 @@ def run_batch(args) -> ScenarioResult:
 
 
 class LiveStreamHarness:
-    """Start a real Stream process plus worker processes for live scenarios."""
+    """Запускает настоящий процесс Stream и рабочие процессы для живых сценариев."""
 
     def __init__(self, workers=2, capacity=256, timeout=20.0):
         self.workers = max(1, int(workers))
@@ -1014,7 +1015,7 @@ class LiveStreamHarness:
         while time.monotonic() < deadline:
             if not self.process.is_alive():
                 raise RuntimeError(
-                    "Stream process exited during startup; see its traceback"
+                    "Процесс Stream завершился при запуске; смотрите его traceback"
                 )
             if (all(self.worker_ready)
                     and self._scene_object_count() >= SCENE_OBJECT_COUNT):
@@ -1022,7 +1023,7 @@ class LiveStreamHarness:
                 return
             time.sleep(0.05)
         raise RuntimeError(
-            f"Stream did not become ready in {self.timeout:.1f}s "
+            f"Stream не стал готов за {self.timeout:.1f}с "
             f"(workers={list(self.worker_ready)}, "
             f"scene_objects={self._scene_object_count()})"
         )
@@ -1070,7 +1071,7 @@ class LiveStreamHarness:
 
 
 def run_registration(args) -> ScenarioResult:
-    """Measure live object registration through Stream."""
+    """Измеряет регистрацию объектов в реальном времени через Stream."""
 
     from pyengine import create_object
 
@@ -1091,7 +1092,7 @@ def run_registration(args) -> ScenarioResult:
         elapsed = time.perf_counter() - started
 
         result.metric("registration.objects", _rate(count, elapsed), "objects/s",
-                      f"{count} objects, {args.workers} workers")
+                      f"{count} объектов, {args.workers} рабочих")
         result.metric("registration.p50", _percentile(latencies, 50) * 1000.0,
                       "ms/object")
         result.metric("registration.p95", _percentile(latencies, 95) * 1000.0,
@@ -1144,7 +1145,7 @@ def run_registration(args) -> ScenarioResult:
 
 
 def run_scripts(args) -> ScenarioResult:
-    """Measure live component update loops and their cache writes."""
+    """Измеряет циклы обновления живых компонентов и их записи в кэш."""
 
     from pyengine import create_object
 
@@ -1201,13 +1202,13 @@ def run_scripts(args) -> ScenarioResult:
         ]
         average = sum(rates) / len(rates) if rates else 0.0
         result.metric("scripts.updates", average, "updates/s",
-                      f"average of {count}, {iterations} iterations/update")
+                      f"среднее по {count}, {iterations} итераций/обновление")
         result.metric("scripts.target", float(SCRIPT_UPDATE_HZ), "updates/s",
                       "SCRIPT_UPDATE_HZ")
         result.metric(
             "scripts.efficiency",
             average / SCRIPT_UPDATE_HZ * 100.0 if SCRIPT_UPDATE_HZ > 0 else 0.0,
-            "% of target",
+            "% от цели",
         )
         result.metric("scripts.min_updates", min(rates) if rates else 0.0,
                       "updates/s")
@@ -1228,7 +1229,7 @@ def run_scripts(args) -> ScenarioResult:
             all(current > previous for previous, current in zip(before, after)),
         )
 
-        # Shared-memory keyboard ring: one key press must reach every script.
+        # Кольцо клавиатуры в shared memory: одно нажатие клавиши должно дойти до каждого скрипта.
         harness.main_in_stream.put({
             "command": "input",
             "type": "key_down",
@@ -1260,7 +1261,7 @@ def run_scripts(args) -> ScenarioResult:
 
 
 def run_motion(args) -> ScenarioResult:
-    """Check that many moving scripts do not freeze the shared render tick."""
+    """Проверяет, что множество движущихся скриптов не замораживает общий render tick."""
 
     import render
 
@@ -1271,8 +1272,8 @@ def run_motion(args) -> ScenarioResult:
     component_path = "tests/fixtures/motion_component.py"
     capacity = count + max(64, SCENE_OBJECT_COUNT * 4)
     delay_ticks = POSITION_INTERPOLATION_DELAY / FIXED_DT
-    # Position writes carry the tick of their fixed_update(), so the expected
-    # rate is bound by the simulation clock, not by SCRIPT_UPDATE_HZ.
+    # Записи позиции несут tick из своего fixed_update(), поэтому ожидаемая
+    # частота ограничена часами симуляции, а не SCRIPT_UPDATE_HZ.
     min_rate = max(10.0, SIMULATION_HZ * 0.3)
 
     with LiveStreamHarness(
@@ -1292,7 +1293,7 @@ def run_motion(args) -> ScenarioResult:
                 }]
                 created.append(create_object(data, deps=harness.deps))
 
-            # Let every worker start its script threads and fall into rhythm.
+            # Даём каждому рабочему процессу запустить свои потоки скриптов и войти в ритм.
             time.sleep(1.5)
 
             tick_probe = render.Game.__new__(render.Game)
@@ -1355,9 +1356,9 @@ def run_motion(args) -> ScenarioResult:
             result.metric("motion.updates_mean",
                           sum(rates) / len(rates) if rates else 0.0, "updates/s")
             result.metric("motion.updates_min", min(rates) if rates else 0.0,
-                          "updates/s", f"target {SCRIPT_UPDATE_HZ}")
+                          "updates/s", f"цель {SCRIPT_UPDATE_HZ}")
             result.metric("motion.gap_p95", _percentile(all_gaps, 95) * 1000.0,
-                          "ms", f"{count} objects")
+                          "ms", f"{count} объектов")
             result.metric("motion.gap_max",
                           max(all_gaps) * 1000.0 if all_gaps else 0.0, "ms")
             result.metric("motion.render_step_std",
@@ -1366,10 +1367,10 @@ def run_motion(args) -> ScenarioResult:
             result.metric(
                 "motion.render_frozen",
                 100.0 * frozen / len(steps) if steps else 0.0,
-                "% of frames",
+                "% от кадров",
             )
             result.metric("motion.render_big_jumps", float(big_jumps),
-                          "frames", "step > 2 ticks")
+                          "frames", "шаг > 2 тиков")
             result.metric("motion.render_max_step",
                           max(steps) if steps else 0.0, "ticks")
 
@@ -1432,10 +1433,10 @@ def _format_value(value: float) -> str:
 
 
 def print_report(results: list[ScenarioResult]) -> None:
-    print("\n=== Stress test report ===")
+    print("\n=== Отчёт стресс-теста ===")
     header = (
-        f"{'Scenario':<14} {'Metric':<38} {'Value':>15} "
-        f"{'Unit':<12} {'Status':<6}"
+        f"{'Сценарий':<14} {'Метрика':<38} {'Значение':>15} "
+        f"{'Единица':<12} {'Статус':<6}"
     )
     print(header)
     print("-" * len(header))
@@ -1456,7 +1457,7 @@ def print_report(results: list[ScenarioResult]) -> None:
             )
         for check in result.checks:
             if not check.ok:
-                print(f"  CHECK FAILED: {check.name}: {check.detail}")
+                print(f"  ПРОВЕРКА НЕ ПРОЙДЕНА: {check.name}: {check.detail}")
 
     total_checks = sum(len(result.checks) for result in results)
     failed_checks = sum(
@@ -1464,11 +1465,11 @@ def print_report(results: list[ScenarioResult]) -> None:
     )
     failed_scenarios = [result.name for result in results if not result.ok]
     print(
-        f"\nScenarios: {len(results) - len(failed_scenarios)}/{len(results)} passed"
+        f"\nСценарии: {len(results) - len(failed_scenarios)}/{len(results)} пройдено"
     )
-    print(f"Checks: {total_checks - failed_checks}/{total_checks} passed")
+    print(f"Проверки: {total_checks - failed_checks}/{total_checks} пройдено")
     if failed_scenarios:
-        print("Failed:", ", ".join(failed_scenarios))
+        print("Провалены:", ", ".join(failed_scenarios))
     else:
         print("ALL_STRESS_OK")
 
@@ -1509,20 +1510,20 @@ def write_report(path: Path, results: list[ScenarioResult], args) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"JSON report: {path}")
+    print(f"JSON-отчёт: {path}")
 
 
 def _resolve_scenarios(value: str) -> list[str]:
     requested = [item.strip() for item in value.split(",") if item.strip()]
     if not requested:
-        raise ValueError("--scenario must not be empty")
+        raise ValueError("--scenario не должен быть пустым")
     if "all" in requested:
         return list(SCENARIOS)
     unknown = [name for name in requested if name not in SCENARIOS]
     if unknown:
         raise ValueError(
-            f"Unknown scenarios: {', '.join(unknown)}. "
-            f"Available: {', '.join(SCENARIOS)}"
+            f"Неизвестные сценарии: {', '.join(unknown)}. "
+            f"Доступные: {', '.join(SCENARIOS)}"
         )
     return requested
 
@@ -1530,64 +1531,64 @@ def _resolve_scenarios(value: str) -> list[str]:
 def build_parser() -> argparse.ArgumentParser:
     cpu_count = os.cpu_count() or 2
     parser = argparse.ArgumentParser(
-        description="Stress-test the engine core with several workloads.",
+        description="Стресс-тестирование ядра движка с несколькими нагрузками.",
     )
     parser.add_argument(
         "--scenario",
         default="all",
-        help="all or comma-separated: " + ",".join(SCENARIOS),
+        help="all или список через запятую: " + ",".join(SCENARIOS),
     )
     parser.add_argument(
         "--duration", type=float, default=2.0,
-        help="seconds per timed scenario (default: 2.0)",
+        help="секунд на сценарий с замером (по умолчанию: 2.0)",
     )
     parser.add_argument(
         "--objects", type=int, default=1000,
-        help="object count for batch/registration/render (default: 1000)",
+        help="количество объектов для batch/registration/render (по умолчанию: 1000)",
     )
     parser.add_argument(
         "--pairs", type=int, default=100_000,
-        help="collision pairs per benchmark (default: 100000)",
+        help="пар коллизий на бенчмарк (по умолчанию: 100000)",
     )
     parser.add_argument(
         "--frames", type=int, default=60,
-        help="render frames (default: 60)",
+        help="кадров рендера (по умолчанию: 60)",
     )
     parser.add_argument(
         "--cache-ops", type=int, default=100_000,
-        help="operations per cache benchmark (default: 100000)",
+        help="операций на бенчмарк кэша (по умолчанию: 100000)",
     )
     parser.add_argument(
         "--processes", type=int, default=max(2, min(4, cpu_count)),
-        help="contention processes (default: 2..4)",
+        help="процессов конкуренции (по умолчанию: 2..4)",
     )
     parser.add_argument(
         "--workers", type=int, default=max(1, min(2, cpu_count - 1)),
-        help="Stream script workers (default: 1..2)",
+        help="рабочих процессов скриптов Stream (по умолчанию: 1..2)",
     )
     parser.add_argument(
         "--scripts", type=int, default=1,
-        help="scripted objects in the scripts scenario (default: 1)",
+        help="объектов со скриптами в сценарии scripts (по умолчанию: 1)",
     )
     parser.add_argument(
         "--motion-objects", type=int, default=16,
-        help="moving objects in the motion scenario (default: 16)",
+        help="движущихся объектов в сценарии motion (по умолчанию: 16)",
     )
     parser.add_argument(
         "--iterations", type=int, default=100,
-        help="arithmetic iterations per component update (default: 100)",
+        help="арифметических итераций на обновление компонента (по умолчанию: 100)",
     )
     parser.add_argument(
         "--timeout", type=float, default=20.0,
-        help="Stream startup timeout in seconds (default: 20)",
+        help="таймаут запуска Stream в секундах (по умолчанию: 20)",
     )
     parser.add_argument(
         "--json", type=Path, default=None,
-        help="write a JSON report to this path",
+        help="записать JSON-отчёт по этому пути",
     )
     parser.add_argument(
         "--list", action="store_true",
-        help="list scenarios and exit",
+        help="вывести список сценариев и выйти",
     )
     return parser
 
@@ -1608,7 +1609,7 @@ def main(argv=None) -> int:
 
     results = []
     for name in names:
-        print(f"[stress] running {name} ...", flush=True)
+        print(f"[stress] запуск {name} ...", flush=True)
         started = time.perf_counter()
         try:
             result = SCENARIOS[name](args)
