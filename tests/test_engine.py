@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import math
 import multiprocessing
 import os
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 import console
 import render
+from collision import convex_polygons_overlap, polygon_bounds, transform_polygon
 from memory_lib import FieldView, ObjectCache, ValueCache
 from pyengine import (
     GameObject,
@@ -47,8 +49,8 @@ from config import (
 VISUAL_STRUCT = {
     "x": float,
     "y": float,
-    "sim_time": float,
     "tick": int,
+    "sim_time": float,
     "rotation": float,
     "scale": float,
     "alpha": float,
@@ -292,6 +294,44 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(state["object_generation"], 2)
         self.assertEqual(state["keyboard_sequence"], 7)
         self.assertEqual(state["key_count"], 1)
+
+    def test_lockless_read_matches_locked_read_without_the_lock(self):
+        cache = ObjectCache(
+            ENGINE_STATE_SEGMENT_BYTES,
+            ENGINE_STATE_STRUCT,
+            [threading.Lock()],
+        )
+        self.addCleanup(cache.close)
+        cache.set_many(0, {
+            "time": 3.5,
+            "tick": 350,
+            "input_sequence": 4,
+            "object_generation": 2,
+            "keyboard_sequence": 7,
+            "key_count": 1,
+        })
+
+        # Holding the segment lock proves the lock-free read never takes it;
+        # a plain threading.Lock is not reentrant, so a locked read would
+        # block forever here.
+        with cache.locks[0]:
+            state = cache.get_many_lockless(0, ENGINE_STATE_LOOP_FIELDS)
+        self.assertEqual(state["time"], 3.5)
+        self.assertEqual(state["tick"], 350)
+        self.assertEqual(state["input_sequence"], 4)
+        self.assertEqual(state["object_generation"], 2)
+        self.assertEqual(state["keyboard_sequence"], 7)
+        self.assertEqual(state["key_count"], 1)
+
+    def test_lockless_read_rejects_string_fields(self):
+        cache = ObjectCache(
+            ENGINE_STATE_SEGMENT_BYTES,
+            ENGINE_STATE_STRUCT,
+            [threading.Lock()],
+        )
+        self.addCleanup(cache.close)
+        with self.assertRaises(TypeError):
+            cache.get_many_lockless(0, ("keys_0",))
 
     def test_pressed_keys_round_trip_across_chunks(self):
         keys = {
@@ -929,6 +969,25 @@ class ValidationTests(unittest.TestCase):
             }],
         })
 
+    def test_stress_motion_scene_is_valid(self):
+        scene_path = (
+            PROJECT_DIR / "access" / "scenes" / "stress_motion.json"
+        )
+        with scene_path.open(encoding="utf-8") as scene_file:
+            scene = json.load(scene_file)
+
+        self.assertEqual(
+            [item["object_type"] for item in scene],
+            ["camera", "manager"],
+        )
+        for item in scene:
+            validate_object_data(item)
+
+        config = scene[1]["stress_scene"]
+        self.assertGreaterEqual(config["count"], 100)
+        self.assertGreater(config["columns"], 0)
+        self.assertFalse(config["per_object_scripts"])
+
 
 class MemoryCacheTests(unittest.TestCase):
     def test_object_cache_roundtrip_and_capacity(self):
@@ -944,7 +1003,48 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(changes["x"], 1.5)
         self.assertEqual(cache.get_changed_values(2), {})
 
-    def test_object_cache_batch_reads_changed_values(self):
+    def test_object_cache_position_fast_path_roundtrip(self):
+        cache = ObjectCache(100 * 4, VISUAL_STRUCT)
+        self.addCleanup(cache.close)
+        self.assertIsNotNone(cache._position_struct)
+
+        cache.get_changed_values_many(range(4))
+        cache.set_position(1, 12.5, -3.25, 7)
+        self.assertEqual(cache.get_position(1), (12.5, -3.25, 7))
+        changes = cache.get_changed_values(1)
+        self.assertEqual(set(changes), {"x", "y", "tick"})
+        self.assertEqual(cache.get_changed_values(1), {})
+
+        # Writing the same packed span must not mark the segment dirty again.
+        cache.set_position(1, 12.5, -3.25, 7)
+        self.assertEqual(cache.get_changed_values(1), {})
+
+        self.assertEqual(cache.move_position(1, 0.5, 2.0), (13.0, -1.25))
+        self.assertEqual(cache.get_position(1), (13.0, -1.25, 7))
+        self.assertEqual(set(cache.get_changed_values(1)), {"x", "y", "tick"})
+
+        # A missing tick preserves the current one under the same lock.
+        self.assertEqual(cache.move_position(1, -1.0, 1.0), (12.0, -0.25))
+        self.assertEqual(cache.get_position(1), (12.0, -0.25, 7))
+
+    def test_object_cache_position_falls_back_for_noncontiguous_layout(self):
+        struct_def = {
+            "x": float,
+            "scale": float,
+            "y": float,
+            "tick": int,
+            "sprite": str,
+        }
+        cache = ObjectCache(100 * 2, struct_def)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache._position_struct)
+
+        cache.set_position(0, 1.5, 2.5, 3)
+        self.assertEqual(cache.get_position(0), (1.5, 2.5, 3))
+        self.assertEqual(cache.move_position(0, 1.0, -0.5), (2.5, 2.0))
+        self.assertEqual(cache.get_position(0), (2.5, 2.0, 3))
+
+
         # 130 segments share 64 stripe locks, so 0 and 64 must be read
         # under the same lock acquisition.
         cache = ObjectCache(100 * 130, VISUAL_STRUCT)
@@ -965,6 +1065,307 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertEqual(cache.get_changed_values_many((0, 1, 2, 64)), {})
         with self.assertRaises(IndexError):
             cache.get_changed_values_many((0, 130))
+
+    def test_dirty_counters_follow_stripe_transitions(self):
+        locks = [multiprocessing.Lock() for _ in range(8)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        cache = ObjectCache(100 * 16, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(cache.close)
+        self.assertIs(cache.dirty_counts, counts)
+
+        # Segments 0 and 8 share stripe 0.
+        cache.set(0, "x", 1.0)
+        cache.set(8, "y", 2.0)
+        self.assertEqual(counts[0], 2)
+        self.assertEqual(counts[1], 0)
+
+        # A second write to an already-dirty segment must not double count.
+        cache.set_many(0, {"x": 2.0, "rotation": 5.0})
+        self.assertEqual(counts[0], 2)
+
+        changes = cache.get_changed_values_many((0, 8))
+        self.assertEqual(set(changes), {0, 8})
+        self.assertEqual(counts[0], 0)
+
+        # Writing unchanged values must keep the stripe clean.
+        cache.set_many(0, {"x": 2.0, "rotation": 5.0, "y": 0.0})
+        self.assertEqual(counts[0], 0)
+        self.assertEqual(cache.get_changed_values_many((0, 8)), {})
+
+    def test_changed_values_many_skips_clean_stripes(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        cache = ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(cache.close)
+        cache.set_many(0, {"x": 1.0})
+
+        scanned = []
+        original = cache._changed_values_locked
+
+        def spy(segment_id, current_mask=None, lock_index=None):
+            scanned.append(segment_id)
+            return original(segment_id, current_mask, lock_index)
+
+        cache._changed_values_locked = spy
+
+        # 0 and 4 map to stripe 0, 1 and 5 map to stripe 1.  Only the dirty
+        # stripe may be scanned.
+        changes = cache.get_changed_values_many((0, 1, 4, 5))
+        self.assertEqual(set(changes), {0})
+        self.assertNotIn(1, scanned)
+        self.assertNotIn(5, scanned)
+
+    def test_get_changed_values_by_stripe_skips_clean_groups(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        cache = ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(cache.close)
+        groups = [set(), set(), set(), set()]
+        groups[0].update((0, 4))
+        groups[1].update((1, 5))
+        groups[2].add(2)
+        groups[3].add(3)
+
+        cache.set_many(0, {"x": 1.0})
+        cache.set_many(5, {"y": 2.0})
+
+        changes = cache.get_changed_values_by_stripe(groups)
+        self.assertEqual(set(changes), {0, 5})
+        self.assertEqual(changes[0]["x"], 1.0)
+        self.assertEqual(changes[5]["y"], 2.0)
+        self.assertEqual(counts[0], 0)
+        self.assertEqual(counts[1], 0)
+        self.assertEqual(cache.get_changed_values_by_stripe(groups), {})
+
+        with self.assertRaises(ValueError):
+            cache.get_changed_values_by_stripe([set()])
+
+    def test_dirty_queue_visits_only_newly_dirty_segments(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        ring_size = 8
+        queue_data = multiprocessing.Array(
+            "i", len(locks) * (3 + ring_size), lock=False
+        )
+        cache = ObjectCache(
+            100 * 8,
+            VISUAL_STRUCT,
+            locks,
+            counts,
+            dirty_queue=queue_data,
+            dirty_ring_size=ring_size,
+        )
+        self.addCleanup(cache.close)
+        groups = [set() for _ in range(len(locks))]
+        # Keep the stripe sparse relative to its active set so the ring path
+        # is used instead of the dense sequential scan.
+        groups[1].update((1, 5, 9, 13, 17))
+        stride = 3 + ring_size
+
+        cache.set(1, "x", 1.0)
+        cache.set(1, "y", 2.0)
+        # The second write is not a new dirty transition, so only one ring
+        # entry may exist for segment 1.
+        self.assertEqual(queue_data[stride], 0)
+        self.assertEqual(queue_data[stride + 1], 1)
+        changes = cache.get_changed_values_by_stripe(groups)
+        self.assertEqual(set(changes), {1})
+        self.assertEqual(changes[1]["x"], 1.0)
+        self.assertEqual(changes[1]["y"], 2.0)
+        self.assertEqual(queue_data[stride:stride + 3], [0, 0, 0])
+
+        cache.set(5, "rotation", 45.0)
+        self.assertEqual(queue_data[stride + 1], 1)
+        changes = cache.get_changed_values_by_stripe(groups)
+        self.assertEqual(set(changes), {5})
+        self.assertEqual(changes[5]["rotation"], 45.0)
+        self.assertEqual(cache.get_changed_values_by_stripe(groups), {})
+
+    def test_dirty_queue_overflow_scans_whole_stripe(self):
+        locks = [multiprocessing.Lock() for _ in range(2)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        ring_size = 1
+        queue_data = multiprocessing.Array(
+            "i", len(locks) * (3 + ring_size), lock=False
+        )
+        cache = ObjectCache(
+            100 * 8,
+            VISUAL_STRUCT,
+            locks,
+            counts,
+            dirty_queue=queue_data,
+            dirty_ring_size=ring_size,
+        )
+        self.addCleanup(cache.close)
+        groups = [set(), set()]
+
+        # 0 and 2 share stripe 0.  The ring holds one id, so the second
+        # transition sets the overflow flag instead of overwriting it.
+        cache.set(0, "x", 1.0)
+        cache.set(2, "x", 2.0)
+        self.assertEqual(queue_data[2], 1)
+
+        changes = cache.get_changed_values_by_stripe(groups)
+        self.assertEqual(set(changes), {0, 2})
+        self.assertEqual(changes[0]["x"], 1.0)
+        self.assertEqual(changes[2]["x"], 2.0)
+        self.assertEqual(queue_data[0:3], [0, 0, 0])
+        self.assertEqual(counts[0], 0)
+        self.assertEqual(cache.get_changed_values_by_stripe(groups), {})
+
+    def test_dense_stripe_scans_inactive_segments_and_resets_ring(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        ring_size = 8
+        queue_data = multiprocessing.Array(
+            "i", len(locks) * (3 + ring_size), lock=False
+        )
+        cache = ObjectCache(
+            100 * 8,
+            VISUAL_STRUCT,
+            locks,
+            counts,
+            dirty_queue=queue_data,
+            dirty_ring_size=ring_size,
+        )
+        self.addCleanup(cache.close)
+        groups = [set(), set(), set(), set()]
+        groups[0].add(0)
+
+        # Segment 4 is in the same stripe but outside the caller's active set.
+        # A dense stripe is scanned sequentially, which must clear it too.
+        cache.set(0, "x", 1.0)
+        cache.set(4, "y", 2.0)
+        self.assertEqual(counts[0], 2)
+
+        changes = cache.get_changed_values_by_stripe(groups)
+        self.assertEqual(set(changes), {0, 4})
+        self.assertEqual(changes[0]["x"], 1.0)
+        self.assertEqual(changes[4]["y"], 2.0)
+        self.assertEqual(counts[0], 0)
+
+        base = 0
+        self.assertEqual(queue_data[base:base + 3], [0, 0, 0])
+        self.assertEqual(cache.get_changed_values_by_stripe(groups), {})
+
+    def test_attached_cache_shares_dirty_queue(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        ring_size = 4
+        queue_data = multiprocessing.Array(
+            "i", len(locks) * (3 + ring_size), lock=False
+        )
+        owner = ObjectCache(
+            100 * 8,
+            VISUAL_STRUCT,
+            locks,
+            counts,
+            dirty_queue=queue_data,
+            dirty_ring_size=ring_size,
+        )
+        self.addCleanup(owner.close)
+        attached = ObjectCache(
+            owner.key,
+            VISUAL_STRUCT,
+            locks,
+            counts,
+            owner.capacity,
+            queue_data,
+            ring_size,
+        )
+        self.addCleanup(attached.detach)
+        groups = [set() for _ in range(len(locks))]
+        groups[0].update((0, 4, 8))
+
+        attached.set(0, "x", 3.0)
+        self.assertEqual(
+            owner.get_changed_values_by_stripe(groups),
+            {0: {"x": 3.0}},
+        )
+        self.assertEqual(counts[0], 0)
+
+    def test_dirty_queue_requires_matching_ring_size(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        with self.assertRaises(ValueError):
+            ObjectCache(
+                100 * 8,
+                VISUAL_STRUCT,
+                locks,
+                counts,
+                dirty_queue=multiprocessing.Array("i", 4, lock=False),
+                dirty_ring_size=8,
+            )
+        with self.assertRaises(ValueError):
+            ObjectCache(
+                100 * 8, VISUAL_STRUCT, locks, counts, dirty_ring_size=8
+            )
+
+    def test_clear_changes_clears_mask_and_stripe_counter(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        cache = ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(cache.close)
+
+        cache.set_many(2, {"x": 5.0})
+        self.assertEqual(counts[2], 1)
+        self.assertTrue(cache.clear_changes(2))
+        self.assertEqual(counts[2], 0)
+        self.assertFalse(cache.clear_changes(2))
+        self.assertEqual(cache.get_changed_values_many((2,)), {})
+
+    def test_attached_cache_shares_dirty_counters(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        owner = ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(owner.close)
+        attached = ObjectCache(
+            owner.key, VISUAL_STRUCT, locks, counts, owner.capacity
+        )
+        self.addCleanup(attached.detach)
+
+        attached.set_many(0, {"x": 3.0})
+        self.assertEqual(counts[0], 1)
+        self.assertEqual(
+            owner.get_changed_values_many((0,)),
+            {0: {"x": 3.0}},
+        )
+        self.assertEqual(counts[0], 0)
+
+    def test_cache_without_counters_falls_back_to_full_scan(self):
+        cache = ObjectCache(100 * 4, VISUAL_STRUCT)
+        self.addCleanup(cache.close)
+        self.assertIsNone(cache.dirty_counts)
+        self.assertTrue(cache.has_pending_changes())
+
+        cache.set_many(0, {"x": 1.0})
+        self.assertEqual(
+            cache.get_changed_values_many((0,)),
+            {0: {"x": 1.0}},
+        )
+
+    def test_has_pending_changes_reads_counters(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", len(locks), lock=False)
+        cache = ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
+        self.addCleanup(cache.close)
+
+        self.assertFalse(cache.has_pending_changes())
+        cache.set_many(0, {"x": 1.0})
+        self.assertTrue(cache.has_pending_changes())
+        cache.get_changed_values_many((0,))
+        self.assertFalse(cache.has_pending_changes())
+
+        cache.set_many(2, {"y": 2.0})
+        self.assertTrue(cache.has_pending_changes())
+        cache.clear_changes(2)
+        self.assertFalse(cache.has_pending_changes())
+
+    def test_dirty_counts_must_match_lock_stripes(self):
+        locks = [multiprocessing.Lock() for _ in range(4)]
+        counts = multiprocessing.Array("i", 3, lock=False)
+        with self.assertRaises(ValueError):
+            ObjectCache(100 * 8, VISUAL_STRUCT, locks, counts)
 
     def test_object_cache_get_many_reuses_plan_across_segments(self):
         cache = ObjectCache(100 * 8, VISUAL_STRUCT)
@@ -1064,6 +1465,127 @@ class MemoryCacheTests(unittest.TestCase):
             cache.set("x" * (MAX_CACHE_STRING_BYTES + 1))
 
 
+class CollisionTests(unittest.TestCase):
+    square = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+
+    def test_polygon_bounds_and_precomputed_bounds(self):
+        left = transform_polygon(self.square, (0, 0), 0, 1)
+        touching = transform_polygon(self.square, (2, 0), 0, 1)
+        apart = transform_polygon(self.square, (5, 0), 0, 1)
+
+        self.assertEqual(polygon_bounds(left), (-1.0, 1.0, -1.0, 1.0))
+        self.assertTrue(convex_polygons_overlap(
+            left, touching, polygon_bounds(left), polygon_bounds(touching)
+        ))
+        self.assertFalse(convex_polygons_overlap(
+            left, apart, polygon_bounds(left), polygon_bounds(apart)
+        ))
+
+
+class ApplyUpdateTests(unittest.TestCase):
+    class Sprite:
+        def __init__(self):
+            self.texture = None
+            self.angle = 0.0
+            self.scale = 1.0
+            self.alpha = 255
+
+    def make_game(self):
+        game = render.Game.__new__(render.Game)
+        game._world_data_by_render_id = {1: {
+            "position": (0.0, 0.0),
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+            "layer": 0.0,
+        }}
+        game._latest_tick_by_render_id = {}
+        game._moving_render_ids = set()
+        game._position_history_by_render_id = {}
+        game._render_order_dirty = False
+        game._dirty_hits = set()
+        game._hit_mark_dirty = game._dirty_hits.add
+        game._texture_for_path = lambda path: ("texture", path)
+        return game
+
+    def test_tick_only_update_does_not_touch_sprite(self):
+        game = self.make_game()
+        sprite = self.Sprite()
+
+        game._apply_update(1, sprite, {"tick": 12})
+
+        self.assertEqual(game._latest_tick_by_render_id, {1: 12})
+        self.assertEqual(sprite.angle, 0.0)
+        self.assertEqual(sprite.scale, 1.0)
+        self.assertNotIn(1, game._moving_render_ids)
+        self.assertEqual(
+            game._world_data_by_render_id[1]["position"], (0.0, 0.0)
+        )
+
+    def test_single_field_updates_reuse_generic_semantics(self):
+        game = self.make_game()
+        sprite = self.Sprite()
+        world = game._world_data_by_render_id[1]
+
+        game._apply_update(1, sprite, {"rotation": 1.5})
+        self.assertEqual(world["rotation"], 1.5)
+        self.assertEqual(sprite.angle, 1.5)
+        self.assertIn(1, game._dirty_hits)
+
+        game._dirty_hits.clear()
+        game._apply_update(1, sprite, {"rotation": 1.5})
+        self.assertNotIn(1, game._dirty_hits)
+
+        game._apply_update(1, sprite, {"scale": 2.0})
+        self.assertEqual(world["scale"], 2.0)
+        self.assertEqual(sprite.scale, 2.0)
+        self.assertIn(1, game._dirty_hits)
+
+        game._apply_update(1, sprite, {"alpha": 0.5})
+        self.assertEqual(world["alpha"], 0.5)
+        self.assertEqual(sprite.alpha, 127)
+
+        game._apply_update(1, sprite, {"layer": 3})
+        self.assertEqual(world["layer"], 3.0)
+        self.assertEqual(sprite._engine_sort_key, (3.0, -1))
+        self.assertTrue(game._render_order_dirty)
+
+        game._dirty_hits.clear()
+        game._apply_update(1, sprite, {"sprite": "new.png"})
+        self.assertEqual(sprite.texture, ("texture", "new.png"))
+        self.assertIn(1, game._dirty_hits)
+
+    def test_sort_render_layers_uses_cached_keys(self):
+        class RenderList:
+            def __init__(self):
+                self.sprites = []
+
+            def sort(self, *, key):
+                self.sprites.sort(key=key)
+
+        class SortedSprite:
+            def __init__(self, render_id, layer):
+                self._engine_render_id = render_id
+                self._engine_sort_key = (layer, -render_id)
+
+        game = render.Game.__new__(render.Game)
+        game.renders = RenderList()
+        game.renders.sprites = [
+            SortedSprite(1, 0.0),
+            SortedSprite(2, 2.0),
+            SortedSprite(3, 2.0),
+        ]
+        game._render_order_dirty = True
+
+        game._sort_render_layers()
+
+        self.assertEqual(
+            [sprite._engine_render_id for sprite in game.renders.sprites],
+            [1, 3, 2],
+        )
+        self.assertFalse(game._render_order_dirty)
+
+
 class MouseHitTestTests(unittest.TestCase):
     class HitBox:
         def __init__(self, bounds):
@@ -1082,6 +1604,14 @@ class MouseHitTestTests(unittest.TestCase):
             self.hit_box = MouseHitTestTests.HitBox(bounds)
             self.alpha = alpha
             self.collide_calls = 0
+            self.center_x = (bounds[0] + bounds[2]) * 0.5
+            self.center_y = (bounds[1] + bounds[3]) * 0.5
+
+        def place(self, bounds):
+            self.bounds = bounds
+            self.hit_box = MouseHitTestTests.HitBox(bounds)
+            self.center_x = (bounds[0] + bounds[2]) * 0.5
+            self.center_y = (bounds[1] + bounds[3]) * 0.5
 
         def collides_with_point(self, point):
             self.collide_calls += 1
@@ -1089,14 +1619,29 @@ class MouseHitTestTests(unittest.TestCase):
             left, bottom, right, top = self.bounds
             return left <= x <= right and bottom <= y <= top
 
+        @property
+        def position(self):
+            return (self.center_x, self.center_y)
+
+        @position.setter
+        def position(self, value):
+            self.center_x, self.center_y = value
+
     def make_game(self):
         game = render.Game.__new__(render.Game)
         game._sprites_by_render_id = {}
         game._world_data_by_render_id = {}
         game._hit_cells = {}
-        game._hit_cell_bounds = {}
+        game._hit_geometry_by_render_id = {}
+        game._hit_bounds_by_render_id = {}
+        game._hit_max_extent = 0.0
+        game._hit_max_count = 0
         game._hit_large_ids = set()
         game._hit_dirty_ids = set()
+        game._position_history_by_render_id = {}
+        game._moving_render_ids = set()
+        game._latest_tick_by_render_id = {}
+        game._last_tick_update_by_render_id = {}
         return game
 
     def add(self, game, render_id, bounds, layer=0.0, alpha=255):
@@ -1124,6 +1669,29 @@ class MouseHitTestTests(unittest.TestCase):
             1,
         )
 
+    def test_aabb_rejects_candidates_before_polygon_test(self):
+        game = self.make_game()
+        hit = self.add(game, 1, (0, 0, 10, 10))
+        missed = self.add(game, 2, (0, 20, 10, 30))
+
+        self.assertEqual(game._hit_test((5, 5)), 1)
+        self.assertEqual(hit.collide_calls, 1)
+        self.assertEqual(missed.collide_calls, 0)
+
+    def test_far_stale_sprite_is_reindexed_when_pointer_approaches(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (0, 0, 10, 10))
+        self.assertEqual(game._hit_test((5, 5)), 1)
+
+        # The sprite moved without an explicit dirty mark, as interpolation
+        # does.  A far query must not pay for re-indexing it, but approaching
+        # the new position must still find it.
+        sprite.place((3000, 3000, 3010, 3010))
+        game._moving_render_ids.add(1)
+
+        self.assertIsNone(game._hit_test((5, 5)))
+        self.assertEqual(game._hit_test((3005, 3005)), 1)
+
     def test_highest_layer_wins_and_render_id_breaks_ties(self):
         game = self.make_game()
         self.add(game, 5, (0, 0, 100, 100), layer=2)
@@ -1144,22 +1712,166 @@ class MouseHitTestTests(unittest.TestCase):
         sprite = self.add(game, 1, (0, 0, 40, 40))
         self.assertEqual(game._hit_test((10, 10)), 1)
 
-        sprite.bounds = (5000, 5000, 5040, 5040)
-        sprite.hit_box = self.HitBox(sprite.bounds)
+        sprite.place((5000, 5000, 5040, 5040))
         game._hit_mark_dirty(1)
         self.assertIsNone(game._hit_test((10, 10)))
         self.assertEqual(game._hit_test((5010, 5010)), 1)
+
+    def test_movement_inside_the_same_cells_does_not_reindex(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        self.assertEqual(game._hit_test((20, 20)), 1)
+        self.assertNotIn(1, game._hit_dirty_ids)
+        initial_cells = game._hit_geometry_by_render_id[1][:4]
+
+        sprite.place((20, 20, 50, 50))
+        game._hit_mark_position(1, sprite.center_x, sprite.center_y)
+
+        self.assertNotIn(1, game._hit_dirty_ids)
+        self.assertEqual(
+            game._hit_geometry_by_render_id[1][:4], initial_cells
+        )
+        self.assertEqual(game._hit_test((25, 25)), 1)
+        # The candidate set is still valid; the hit box itself decides.
+        self.assertEqual(game._hit_test((45, 45)), 1)
+        self.assertIsNone(game._hit_test((15, 15)))
+
+    def test_position_update_inside_same_cells_does_not_reindex(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        game._world_data_by_render_id[1].update({
+            "position": (25.0, 25.0),
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+        })
+        self.assertEqual(game._hit_test((20, 20)), 1)
+        initial_cells = game._hit_geometry_by_render_id[1][:4]
+
+        game._apply_update(1, sprite, {"x": 26.0, "tick": 1})
+
+        self.assertNotIn(1, game._hit_dirty_ids)
+        # The lazy pointer refresh must also see that the sprite stayed in
+        # its cached cells and leave the index alone.
+        game._hit_index_dirty()
+        self.assertEqual(
+            game._hit_geometry_by_render_id[1][:4], initial_cells
+        )
+        self.assertNotIn(1, game._hit_dirty_ids)
+
+    def test_position_update_is_indexed_lazily_on_hit_query(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        game._world_data_by_render_id[1].update({
+            "position": (25.0, 25.0),
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+        })
+        self.assertEqual(game._hit_test((20, 20)), 1)
+        old_geometry = game._hit_geometry_by_render_id[1]
+
+        game._apply_update(
+            1, sprite, {"x": 3000.0, "y": 3000.0, "tick": 1}
+        )
+        # The update only records the sample.  Interpolation draws the sprite
+        # at the new position, but neither one touches the hit grid.
+        self.assertNotIn(1, game._hit_dirty_ids)
+        game._interpolate_sprite_positions(1.0)
+        self.assertEqual((sprite.center_x, sprite.center_y), (3000.0, 3000.0))
+        self.assertNotIn(1, game._hit_dirty_ids)
+        self.assertEqual(game._hit_geometry_by_render_id[1], old_geometry)
+
+        # A pointer query promotes the moved sprite and re-indexes it.
+        game._hit_index_dirty()
+        new_geometry = game._hit_geometry_by_render_id[1]
+        self.assertNotEqual(new_geometry, old_geometry)
+        cell_size = render.HIT_TEST_CELL_SIZE
+        local_left = new_geometry[0] * cell_size - new_geometry[4]
+        self.assertAlmostEqual(local_left, 10.0 - 3000.0)
+
+    def test_stale_snap_refreshes_hit_grid(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        game._world_data_by_render_id[1].update({
+            "position": (25.0, 25.0),
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+        })
+        self.assertEqual(game._hit_test((20, 20)), 1)
+
+        game._apply_update(
+            1, sprite, {"x": 3000.0, "y": 3000.0, "tick": 1}
+        )
+        game._interpolate_sprite_positions(1.0)
+        self.assertNotIn(1, game._hit_dirty_ids)
+
+        game._interpolate_sprite_positions(1000.0)
+        self.assertNotIn(1, game._moving_render_ids)
+        self.assertIn(1, game._hit_dirty_ids)
+
+    def test_movement_across_cells_reindexes_on_next_query(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        self.assertEqual(game._hit_test((20, 20)), 1)
+
+        sprite.place((300, 300, 340, 340))
+        game._hit_mark_position(1, sprite.center_x, sprite.center_y)
+
+        self.assertIn(1, game._hit_dirty_ids)
+        self.assertIsNone(game._hit_test((20, 20)))
+        self.assertEqual(game._hit_test((310, 310)), 1)
+
+    def test_large_sprite_motion_does_not_need_grid_reindexing(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (0, 0, 4000, 4000))
+        self.assertEqual(game._hit_test((3210, 1230)), 1)
+        self.assertIn(1, game._hit_large_ids)
+
+        sprite.place((1000, 1000, 5000, 5000))
+        game._hit_mark_position(1, sprite.center_x, sprite.center_y)
+
+        self.assertNotIn(1, game._hit_dirty_ids)
+        self.assertIn(1, game._hit_large_ids)
+        self.assertEqual(game._hit_test((4210, 2230)), 1)
+
+    def test_scale_change_forces_reindex_even_inside_the_same_cells(self):
+        game = self.make_game()
+        sprite = self.add(game, 1, (10, 10, 40, 40))
+        game._world_data_by_render_id[1].update({
+            "position": (25.0, 25.0),
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+        })
+        self.assertEqual(game._hit_test((20, 20)), 1)
+
+        game._apply_update(1, sprite, {"scale": 2.0})
+
+        self.assertIn(1, game._hit_dirty_ids)
 
     def test_huge_sprite_uses_the_large_sprite_fallback(self):
         game = self.make_game()
         self.add(game, 1, (0, 0, 4000, 4000))
         self.assertEqual(game._hit_test((3210, 1230)), 1)
         self.assertIn(1, game._hit_large_ids)
-        self.assertNotIn(1, game._hit_cell_bounds)
+        self.assertNotIn(1, game._hit_geometry_by_render_id)
 
         game._hit_remove(1)
         self.assertEqual(game._hit_test((3210, 1230)), None)
         self.assertNotIn(1, game._hit_large_ids)
+
+    def test_removing_largest_sprite_recomputes_max_extent(self):
+        game = self.make_game()
+        self.add(game, 1, (0, 0, 100, 100))
+        self.add(game, 2, (200, 200, 220, 220))
+        self.assertEqual(game._hit_test((50, 50)), 1)
+        self.assertEqual(game._hit_max_extent, 50.0)
+
+        game._hit_remove(1)
+        self.assertEqual(game._hit_max_extent, 10.0)
+        self.assertEqual(game._hit_max_count, 1)
 
     class Camera:
         @staticmethod
@@ -1298,6 +2010,67 @@ class RenderQueueTests(unittest.TestCase):
         self.assertEqual(set(calls[0]), {0, 1})
         self.assertEqual(applied, [(0, {"x": 5.0})])
 
+    def test_idle_frame_skips_dirty_batch_when_counters_are_clean(self):
+        calls = []
+
+        class VisualCache:
+            def has_pending_changes(self):
+                return False
+
+            def get_changed_values_many(self, segment_ids):
+                calls.append(tuple(segment_ids))
+                return {}
+
+        class EmptyQueue:
+            def get_nowait(self):
+                raise queue.Empty
+
+        game = render.Game.__new__(render.Game)
+        game.render_in_stream = EmptyQueue()
+        game._sprites_by_render_id = {0: object()}
+        game.visual_cache = VisualCache()
+        game._sort_render_layers = lambda: None
+        game.print = lambda *args, **kwargs: None
+        game._apply_update = lambda *args, **kwargs: None
+
+        game._render_queue()
+
+        self.assertEqual(calls, [])
+
+    def test_render_queue_uses_pre_grouped_stripe_buckets(self):
+        calls = []
+
+        class VisualCache:
+            dirty_counts = [1, 0, 0, 0]
+
+            def get_changed_values_by_stripe(self, groups):
+                calls.append([set(group) for group in groups])
+                return {0: {"x": 5.0}}
+
+            def get_changed_values_many(self, segment_ids):
+                raise AssertionError("pre-grouped path must be used")
+
+        class EmptyQueue:
+            def get_nowait(self):
+                raise queue.Empty
+
+        game = render.Game.__new__(render.Game)
+        game.render_in_stream = EmptyQueue()
+        game._sprites_by_render_id = {0: object()}
+        game._render_ids_by_stripe = [{0}, {1}, set(), set()]
+        game.visual_cache = VisualCache()
+        game._sort_render_layers = lambda: None
+        game.print = lambda *args, **kwargs: None
+        applied = []
+        game._apply_update = lambda render_id, sprite, entry: applied.append(
+            (render_id, entry)
+        )
+
+        game._render_queue()
+
+        self.assertEqual(calls, [[{0}, {1}, set(), set()]])
+        self.assertEqual(applied, [(0, {"x": 5.0})])
+
 
 class SnapshotInterpolationTests(unittest.TestCase):
     class Probe:
@@ -1320,6 +2093,7 @@ class SnapshotInterpolationTests(unittest.TestCase):
             self._moving_render_ids = set()
 
         _record_position = render.Game._record_position
+        _append_position_sample = render.Game._append_position_sample
         _position_from_history = render.Game.__dict__["_position_from_history"]
         _position_at_tick = render.Game._position_at_tick
         _resolve_render_tick = render.Game._resolve_render_tick
@@ -1329,9 +2103,20 @@ class SnapshotInterpolationTests(unittest.TestCase):
         def _hit_mark_dirty(self, render_id):
             pass
 
+        def _hit_mark_position(self, render_id, x, y):
+            pass
+
     class Sprite:
         center_x = 0.0
         center_y = 0.0
+
+        @property
+        def position(self):
+            return (self.center_x, self.center_y)
+
+        @position.setter
+        def position(self, value):
+            self.center_x, self.center_y = value
 
     def test_common_tick_keeps_relative_offset_stable(self):
         probe = self.Probe()
@@ -1484,9 +2269,41 @@ class CreateObjectTests(CacheTestCase):
             },
         }, deps=deps)
 
+        # A position update must not rewrite sim_time: the renderer uses the
+        # shared tick, and only registration needs the compatibility field.
+        visual.set(0, "sim_time", 123.0)
         game_object.Visual.position = Vector2(5, 6)
         self.assertEqual(visual.get(0, "tick"), 17)
         self.assertEqual(visual.get(0, "x"), 5.0)
+        self.assertEqual(visual.get(0, "sim_time"), 123.0)
+
+    def test_visual_move_updates_position_and_tick(self):
+        visual, identity = self.make_caches()
+        deps, _, _ = self.make_deps(visual, identity)
+        tick_cache = ValueCache(17)
+        self.addCleanup(tick_cache.close)
+        deps["tick_cache"] = tick_cache
+
+        game_object = create_object({
+            "object_type": "background_object",
+            "visual": {
+                "sprite": "img.png",
+                "position": [1, 2],
+                "scale": 1,
+                "rotation": 0,
+                "alpha": 1,
+            },
+        }, deps=deps)
+
+        visual.set_many(0, {"x": 1.0, "y": 2.0, "tick": 17})
+        position = game_object.Visual.move(2.5, -1.5)
+        self.assertEqual(visual.get_position(0), (3.5, 0.5, 17))
+        self.assertEqual((position.x, position.y), (3.5, 0.5))
+
+        # Pair form and fallback-free return value.
+        position = game_object.Visual.move((-1.0, 2.0))
+        self.assertEqual(visual.get_position(0), (2.5, 2.5, 17))
+        self.assertEqual((position.x, position.y), (2.5, 2.5))
 
     def test_tick_bookkeeping_is_tracked_per_object(self):
         visual, identity = self.make_caches()
@@ -1520,18 +2337,16 @@ class CreateObjectTests(CacheTestCase):
         first.Visual.__dict__["_simulation_time_owner"] = owner
         second.Visual.__dict__["_simulation_time_owner"] = owner
 
-        # A script can move another object through find_object().  Such a
-        # write must not be mistaken for a heartbeat of the script's own
-        # object, so the bookkeeping is keyed by render_id.
+        # A script can move another object through find_object().  Every
+        # position write must carry the current tick for the object it belongs
+        # to, not for the script's own object.
         first.Visual.position = Vector2(1, 2)
         second.Visual.position = Vector2(3, 4)
 
-        self.assertEqual(
-            owner.__dict__["_visual_tick_written_by_render_id"],
-            {0: 23, 1: 23},
-        )
         self.assertEqual(visual.get(0, "tick"), 23)
         self.assertEqual(visual.get(1, "tick"), 23)
+        self.assertEqual(visual.get_position(0), (1.0, 2.0, 23))
+        self.assertEqual(visual.get_position(1), (3.0, 4.0, 23))
 
     def test_transform_is_rebound_after_registration(self):
         visual, identity = self.make_caches()
@@ -1552,6 +2367,45 @@ class CreateObjectTests(CacheTestCase):
         visual.set_many(0, {"x": 10.0, "y": 20.0, "rotation": 0.0, "scale": 1.0})
         polygon = game_object.Transform._world_polygon()
         self.assertEqual(len(polygon), 4)
+
+    def test_transform_caches_world_geometry_until_pose_changes(self):
+        visual, identity = self.make_caches()
+        deps, _, responses = self.make_deps(visual, identity)
+        data = {
+            "object_type": "background_object",
+            "visual": {
+                "sprite": "img.png",
+                "position": [0, 0],
+                "scale": 1,
+                "rotation": 0,
+                "alpha": 1,
+            },
+            "transform": {"polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]]},
+        }
+        first = create_object(dict(data), deps=deps)
+        second_requests = FakeRequestQueue(responses, render_id=1, object_id=1)
+        second = create_object(
+            dict(data), deps=dict(deps, main_in_stream=second_requests)
+        )
+        visual.set_many(0, {
+            "x": 0.0, "y": 0.0, "rotation": 0.0, "scale": 1.0,
+        })
+        visual.set_many(1, {
+            "x": 1.0, "y": 0.0, "rotation": 0.0, "scale": 1.0,
+        })
+
+        with patch("pyengine.transform_polygon", wraps=transform_polygon) as mocked:
+            self.assertTrue(first.Transform.overlaps(second))
+            self.assertEqual(mocked.call_count, 2)
+
+            # Both transforms keep their world polygon and AABB across checks.
+            self.assertTrue(first.Transform.overlaps(second))
+            self.assertEqual(mocked.call_count, 2)
+
+            # A pose change invalidates only the transform that moved.
+            visual.set_many(0, {"x": 10.0})
+            self.assertFalse(first.Transform.overlaps(second))
+            self.assertEqual(mocked.call_count, 3)
 
     def test_create_from_dict_and_alias(self):
         visual, identity = self.make_caches()

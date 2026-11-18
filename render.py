@@ -17,6 +17,7 @@ import console
 import stream
 from collision import transform_polygon, validate_convex_polygon
 from config import (
+    DIRTY_RING_CAPACITY,
     ENGINE_STATE_SEGMENT_BYTES,
     ENGINE_STATE_STRUCT,
     FIXED_DT,
@@ -36,7 +37,9 @@ NO_SPRITE = "None"
 
 # Mouse hit-testing used to walk every render id on every motion event.  A
 # uniform grid keeps that cost proportional to the sprites near the pointer.
-HIT_TEST_CELL_SIZE = 128.0
+# Dense scenes benefit from small cells: at 32 units a 1000-sprite grid leaves
+# only a handful of candidates per query instead of a hundred-plus.
+HIT_TEST_CELL_SIZE = 32.0
 # Huge sprites (backgrounds) would touch thousands of cells.  Keep them in a
 # separate short list that is checked on every query instead.
 HIT_TEST_MAX_CELLS = 32
@@ -106,6 +109,14 @@ class Game(arcade.Window):
         self.object_cache = data[2]
         self.overlay_settings = overlay_settings or console.OverlaySettings()
         self.visual_cache = ObjectCache(*data[3])
+        # When the cache exposes stripe counters, keep active render ids
+        # pre-grouped by stripe.  Polling then visits only dirty stripes and
+        # does not rebuild a 10k-entry grouping dictionary every frame.
+        self._render_ids_by_stripe = None
+        if self.visual_cache.dirty_counts is not None:
+            self._render_ids_by_stripe = [
+                set() for _ in range(len(self.visual_cache.locks))
+            ]
         self.camera_target_cache = data[4]
         self.camera_scale_cache = data[5]
         # When present, pointer snapshots are published straight to shared
@@ -121,14 +132,16 @@ class Game(arcade.Window):
         self._sprites_by_render_id = {}
         self._render_order_dirty = False
         self._hit_cells = {}
-        self._hit_cell_bounds = {}
+        self._hit_geometry_by_render_id = {}
+        self._hit_bounds_by_render_id = {}
+        self._hit_max_extent = 0.0
+        self._hit_max_count = 0
         self._hit_large_ids = set()
         self._hit_dirty_ids = set()
         self._world_data_by_render_id = {}
         self._position_history_by_render_id = {}
         self._moving_render_ids = set()
         self._latest_tick_by_render_id = {}
-        self._last_tick_update_by_render_id = {}
         self._scripted_render_ids = set()
         self._waiting_updates = {}
         self._textures = {}
@@ -208,29 +221,32 @@ class Game(arcade.Window):
         return {1: "left", 2: "middle", 4: "right"}.get(button, str(button))
 
     def _sort_render_layers(self):
-        # Rebuilds only happen on add/remove/layer changes.  A bucket sort
-        # would still have to rebuild arcade's GPU index buffer, so the small
-        # Python-side win is not worth touching SpriteList internals.
+        # Rebuilds only happen on add/remove/layer changes.  Each sprite caches
+        # its (layer, -render_id) key so a re-sort does not rebuild the same
+        # tuple and dictionary lookup for every sprite on every rebuild.  A
+        # bucket sort would still have to rebuild arcade's GPU index buffer,
+        # so the small Python-side win is not worth touching SpriteList
+        # internals.
         if not self._render_order_dirty:
             return
-        self.renders.sort(
-            key=lambda sprite: (
-                self._world_data_by_render_id[sprite._engine_render_id]["layer"],
-                -sprite._engine_render_id,
-            )
-        )
+        self.renders.sort(key=lambda sprite: sprite._engine_sort_key)
         self._render_order_dirty = False
 
     def _hit_drop_cells(self, render_id):
         """Remove one sprite from the spatial hit-test grid."""
 
-        bounds = self._hit_cell_bounds.pop(render_id, None)
-        if bounds is None:
+        geometry = self._hit_geometry_by_render_id.pop(render_id, None)
+        bounds = self._hit_bounds_by_render_id.pop(render_id, None)
+        if bounds is not None:
+            extent = max(-bounds[0], bounds[1], -bounds[2], bounds[3])
+            if extent == self._hit_max_extent and self._hit_max_count:
+                self._hit_max_count -= 1
+        if geometry is None:
             self._hit_large_ids.discard(render_id)
             return
         cells = self._hit_cells
-        for cell_x in range(bounds[0], bounds[2] + 1):
-            for cell_y in range(bounds[1], bounds[3] + 1):
+        for cell_x in range(geometry[0], geometry[2] + 1):
+            for cell_y in range(geometry[1], geometry[3] + 1):
                 cell = (cell_x, cell_y)
                 ids = cells.get(cell)
                 if ids is None:
@@ -242,6 +258,22 @@ class Game(arcade.Window):
     def _hit_remove(self, render_id):
         self._hit_drop_cells(render_id)
         self._hit_dirty_ids.discard(render_id)
+        # Recompute only once the last sprite at the current maximum is gone.
+        # Ties and re-indexing must not turn unloading a large scene into an
+        # O(n^2) full scan of every remaining hit box.
+        if self._hit_max_count:
+            return
+        best_extent = 0.0
+        best_count = 0
+        for bounds in self._hit_bounds_by_render_id.values():
+            extent = max(-bounds[0], bounds[1], -bounds[2], bounds[3])
+            if extent > best_extent:
+                best_extent = extent
+                best_count = 1
+            elif extent == best_extent:
+                best_count += 1
+        self._hit_max_extent = best_extent
+        self._hit_max_count = best_count
 
     def _hit_mark_dirty(self, render_id):
         """Queue a sprite for re-indexing on the next hit-test query.
@@ -254,10 +286,83 @@ class Game(arcade.Window):
         if render_id in self._sprites_by_render_id:
             self._hit_dirty_ids.add(render_id)
 
-    def _hit_index_dirty(self):
-        if not self._hit_dirty_ids:
+    def _hit_mark_position(self, render_id, x, y):
+        """Queue a moved sprite only when its hit box leaves its grid cells.
+
+        Moving within the same cells cannot change which pointer cell contains
+        the sprite, so a full remove/re-add round trip is wasted work.  The
+        packed geometry stores the centre range that stays inside the indexed
+        cells, so checking a moved sprite costs four comparisons instead of
+        four floor divisions and multiplications.
+        """
+
+        if render_id in self._hit_dirty_ids:
             return
+        # Large sprites are checked directly on every query, so their movement
+        # never needs to touch the grid.
+        if render_id in self._hit_large_ids:
+            return
+
+        geometry = self._hit_geometry_by_render_id.get(render_id)
+        if geometry is None:
+            self._hit_mark_dirty(render_id)
+            return
+
+        # The packed tuple already stores the range of centres for which the
+        # sprite's hit box stays inside its indexed cells.
+        if (geometry[4] <= x < geometry[5]
+                and geometry[6] <= y < geometry[7]):
+            return
+        self._hit_mark_dirty(render_id)
+
+    def _hit_index_dirty(self, point=None):
         dirty = self._hit_dirty_ids
+        moving = self._moving_render_ids
+        if moving:
+            # Position updates and interpolation only track motion.  The
+            # grid is refreshed lazily, when a pointer query actually needs
+            # it, so an idle pointer does not pay a cell check per sprite
+            # per drawn frame.
+            sprites = self._sprites_by_render_id
+            geometry_by_id = self._hit_geometry_by_render_id
+            large_ids = self._hit_large_ids
+            if point is None:
+                pointer_x = pointer_y = 0.0
+                max_extent = float("inf")
+            else:
+                pointer_x, pointer_y = point
+                max_extent = self._hit_max_extent
+            # Membership checks are only needed when those sets are non-empty.
+            # In the common case both are empty and this loop stays a tight
+            # distance test over the moving sprites.
+            check_dirty = bool(dirty)
+            check_large = bool(large_ids)
+            for render_id in moving:
+                if check_dirty and render_id in dirty:
+                    continue
+                if check_large and render_id in large_ids:
+                    continue
+                sprite = sprites.get(render_id)
+                if sprite is None:
+                    continue
+                x, y = sprite.position
+                # A sprite farther from the pointer than the largest hit
+                # half-size cannot cover it.  Its stale grid entry cannot
+                # change this query; it is refreshed once the pointer comes
+                # close, or by the next unpinned index pass.
+                if (abs(x - pointer_x) > max_extent
+                        or abs(y - pointer_y) > max_extent):
+                    continue
+                geometry = geometry_by_id.get(render_id)
+                if geometry is None:
+                    dirty.add(render_id)
+                    continue
+                if not (geometry[4] <= x < geometry[5]
+                        and geometry[6] <= y < geometry[7]):
+                    dirty.add(render_id)
+
+        if not dirty:
+            return
         self._hit_dirty_ids = set()
         cell_size = HIT_TEST_CELL_SIZE
         for render_id in dirty:
@@ -271,10 +376,32 @@ class Game(arcade.Window):
                 continue
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
-            min_cell_x = int(min(xs) // cell_size)
-            max_cell_x = int(max(xs) // cell_size)
-            min_cell_y = int(min(ys) // cell_size)
-            max_cell_y = int(max(ys) // cell_size)
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            min_cell_x = int(min_x // cell_size)
+            max_cell_x = int(max_x // cell_size)
+            min_cell_y = int(min_y // cell_size)
+            max_cell_y = int(max_y // cell_size)
+            center_x = sprite.center_x
+            center_y = sprite.center_y
+            local_left = min_x - center_x
+            local_right = max_x - center_x
+            local_bottom = min_y - center_y
+            local_top = max_y - center_y
+            self._hit_bounds_by_render_id[render_id] = (
+                local_left, local_right, local_bottom, local_top,
+            )
+            # Largest distance from a sprite centre to its hit-box edge.
+            # _hit_test() uses it to skip sprites that cannot cover the
+            # pointer before touching their full polygon.
+            extent = max(
+                -local_left, local_right, -local_bottom, local_top,
+            )
+            if extent > self._hit_max_extent:
+                self._hit_max_extent = extent
+                self._hit_max_count = 1
+            elif extent == self._hit_max_extent:
+                self._hit_max_count += 1
             if ((max_cell_x - min_cell_x + 1)
                     * (max_cell_y - min_cell_y + 1) > HIT_TEST_MAX_CELLS):
                 self._hit_large_ids.add(render_id)
@@ -285,28 +412,56 @@ class Game(arcade.Window):
                     self._hit_cells.setdefault(
                         (cell_x, cell_y), set()
                     ).add(render_id)
-            self._hit_cell_bounds[render_id] = (
-                min_cell_x, min_cell_y, max_cell_x, max_cell_y,
+            # (cell_min_x, cell_min_y, cell_max_x, cell_max_y,
+            #  centre_min_x, centre_max_x, centre_min_y, centre_max_y).
+            # The centre range is precomputed so a moving sprite only has to
+            # compare four floats instead of multiplying cell bounds by the
+            # cell size and adding its local hit-box offsets on every query.
+            self._hit_geometry_by_render_id[render_id] = (
+                min_cell_x,
+                min_cell_y,
+                max_cell_x,
+                max_cell_y,
+                min_cell_x * cell_size - local_left,
+                (max_cell_x + 1) * cell_size - local_right,
+                min_cell_y * cell_size - local_bottom,
+                (max_cell_y + 1) * cell_size - local_top,
             )
 
     def _hit_test(self, point):
         """Return the topmost visible render id under a world-space point."""
 
-        self._hit_index_dirty()
+        self._hit_index_dirty(point)
         cell_size = HIT_TEST_CELL_SIZE
         cell = (int(point[0] // cell_size), int(point[1] // cell_size))
         candidates = self._hit_cells.get(cell, ())
         best_id = None
         best_key = None
+        sprites = self._sprites_by_render_id
+        world_data = self._world_data_by_render_id
+        bounds_by_id = self._hit_bounds_by_render_id
+        pointer_x, pointer_y = point
 
         def consider(render_id):
             nonlocal best_id, best_key
-            sprite = self._sprites_by_render_id[render_id]
-            if sprite.alpha <= 0 or not sprite.collides_with_point(point):
+            sprite = sprites[render_id]
+            if sprite.alpha <= 0:
+                return
+            bounds = bounds_by_id.get(render_id)
+            if bounds is not None:
+                # Cheap AABB rejection first: one polygon test costs more
+                # than every comparison in a dense cell combined.
+                offset_x = pointer_x - sprite.center_x
+                if offset_x < bounds[0] or offset_x > bounds[1]:
+                    return
+                offset_y = pointer_y - sprite.center_y
+                if offset_y < bounds[2] or offset_y > bounds[3]:
+                    return
+            if not sprite.collides_with_point(point):
                 return
             # Same ordering as the sprite list: highest layer wins, and a
             # lower render id wins a layer tie.
-            layer = self._world_data_by_render_id[render_id]["layer"]
+            layer = world_data[render_id]["layer"]
             key = (layer, -render_id)
             if best_key is None or key > best_key:
                 best_key = key
@@ -449,21 +604,40 @@ class Game(arcade.Window):
                     self._clear(data)
 
         # Check active sprites only; scanning the full cache capacity each
-        # frame is costly.  Batch the dirty-mask reads by lock stripe so a
-        # large scene does not acquire the same locks once per sprite.
+        # frame is costly.  With stripe counters the active ids are kept
+        # pre-grouped, so a dirty frame touches only dirty stripes.
+        buckets = getattr(self, "_render_ids_by_stripe", None)
         if self._sprites_by_render_id:
-            updates = self.visual_cache.get_changed_values_many(
-                self._sprites_by_render_id
-            )
-            for render_id, entry in updates.items():
-                sprite = self._sprites_by_render_id.get(render_id)
-                if sprite is None:
-                    continue
-                try:
-                    self._apply_update(render_id, sprite, entry)
-                except Exception:
-                    self.print(f"Ошибка обновления спрайта {render_id}")
-                    traceback.print_exc()
+            counts = getattr(self.visual_cache, "dirty_counts", None)
+            if buckets is not None and counts is not None:
+                if any(counts):
+                    updates = self.visual_cache.get_changed_values_by_stripe(
+                        buckets
+                    )
+                else:
+                    updates = {}
+            else:
+                has_pending = getattr(
+                    self.visual_cache, "has_pending_changes", None
+                )
+                if has_pending is None or has_pending():
+                    updates = self.visual_cache.get_changed_values_many(
+                        self._sprites_by_render_id
+                    )
+                else:
+                    updates = {}
+            if updates:
+                sprites_by_id = self._sprites_by_render_id
+                apply_update = self._apply_update
+                for render_id, entry in updates.items():
+                    sprite = sprites_by_id.get(render_id)
+                    if sprite is None:
+                        continue
+                    try:
+                        apply_update(render_id, sprite, entry)
+                    except Exception:
+                        self.print(f"Ошибка обновления спрайта {render_id}")
+                        traceback.print_exc()
         self._sort_render_layers()
 
     def _read_camera_state(self):
@@ -478,6 +652,27 @@ class Game(arcade.Window):
         if self.tick_cache is not None:
             return float(self.tick_cache.get())
         return (time.monotonic() - self.clock_origin) / self.SIMULATION_TICK
+
+    def _append_position_sample(self, render_id, tick, x, y):
+        """Append an already-normalised sample to one position history.
+
+        This is the hot path used by ``_apply_update``: values come from the
+        visual cache or from ``world_data``, so they are already numeric and
+        do not need float/int coercions on every moving sprite.
+        """
+
+        history = self._position_history_by_render_id.get(render_id)
+        if history is None:
+            history = deque(maxlen=self.POSITION_HISTORY_SIZE)
+            self._position_history_by_render_id[render_id] = history
+        elif history:
+            last_tick = history[-1][0]
+            if tick < last_tick:
+                return
+            if tick == last_tick:
+                history[-1] = (tick, x, y)
+                return
+        history.append((tick, x, y))
 
     def _record_position(self, render_id, position, tick=None):
         """Store a position sample keyed by the simulation tick.
@@ -494,8 +689,8 @@ class Game(arcade.Window):
         if history is None:
             history = deque(maxlen=self.POSITION_HISTORY_SIZE)
             self._position_history_by_render_id[render_id] = history
-        if history:
-            last_tick, last_x, last_y = history[-1]
+        elif history:
+            last_tick = history[-1][0]
             if tick < last_tick:
                 return
             if tick == last_tick:
@@ -510,14 +705,16 @@ class Game(arcade.Window):
         if not history:
             return None
 
-        index = bisect_left(history, (query_tick,))
-        if index <= 0:
-            first = history[0]
-            return first[1], first[2]
-        if index >= len(history):
-            last = history[-1]
+        # Clamp first: most queries fall outside or near the newest sample,
+        # and the common clamp path avoids bisect plus range checks.
+        last = history[-1]
+        if query_tick >= last[0]:
             return last[1], last[2]
+        first = history[0]
+        if query_tick <= first[0]:
+            return first[1], first[2]
 
+        index = bisect_left(history, (query_tick,))
         current = history[index]
         previous = history[index - 1]
         interval = current[0] - previous[0]
@@ -569,6 +766,7 @@ class Game(arcade.Window):
         sprites = self._sprites_by_render_id
         histories = self._position_history_by_render_id
         interpolate = self._position_from_history
+        mark_position = self._hit_mark_position
         idle_before = render_tick - self.INTERPOLATION_IDLE_TICKS
         stale = None
         for render_id in moving:
@@ -582,10 +780,12 @@ class Game(arcade.Window):
             sprite = sprites.get(render_id)
             if sprite is not None:
                 position = interpolate(history, render_tick)
-                if (sprite.center_x != position[0]
-                        or sprite.center_y != position[1]):
-                    sprite.center_x, sprite.center_y = position
-                    self._hit_mark_dirty(render_id)
+                if sprite.position != position:
+                    # One position setter updates arcade's hit box and sprite
+                    # list slot once; center_x/center_y would do it twice.
+                    # Hit-grid refresh is lazy: _hit_index_dirty() checks the
+                    # current center of every moving sprite on query.
+                    sprite.position = position
 
             if history[-1][0] < idle_before:
                 if stale is None:
@@ -602,7 +802,12 @@ class Game(arcade.Window):
             world_data = world_positions.get(render_id)
             if sprite is not None and world_data is not None:
                 # Snap to the last received sample before going static.
-                sprite.center_x, sprite.center_y = world_data["position"]
+                sprite.position = world_data["position"]
+                # Interpolation is skipped for this id from now on, so the
+                # hit grid must be refreshed here instead.
+                mark_position(
+                    render_id, sprite.center_x, sprite.center_y
+                )
 
     def _track_camera_target(self, render_tick):
         # The tracked object may have been removed without a renderer update
@@ -774,19 +979,29 @@ class Game(arcade.Window):
         return texture
 
     def _clear(self, data):
+        clear_changes = getattr(self.visual_cache, "clear_changes", None)
+        if clear_changes is not None:
+            for render_id in self._sprites_by_render_id:
+                clear_changes(render_id)
         self.renders.clear()
 
         self._sprites_by_render_id.clear()
+        buckets = getattr(self, "_render_ids_by_stripe", None)
+        if buckets is not None:
+            for bucket in buckets:
+                bucket.clear()
         self._render_order_dirty = False
         self._hit_cells.clear()
-        self._hit_cell_bounds.clear()
+        self._hit_geometry_by_render_id.clear()
+        self._hit_bounds_by_render_id.clear()
+        self._hit_max_extent = 0.0
+        self._hit_max_count = 0
         self._hit_large_ids.clear()
         self._hit_dirty_ids.clear()
         self._world_data_by_render_id.clear()
         self._position_history_by_render_id.clear()
         self._moving_render_ids.clear()
         self._latest_tick_by_render_id.clear()
-        self._last_tick_update_by_render_id.clear()
         self._scripted_render_ids.clear()
         self._waiting_updates.clear()
         self._colliders_by_render_id.clear()
@@ -795,6 +1010,16 @@ class Game(arcade.Window):
         self._failed_textures.clear()
         self._camera_target_id = -1
         self.camera_target_cache.set(-1)
+
+    def _visual_bucket_add(self, render_id):
+        buckets = getattr(self, "_render_ids_by_stripe", None)
+        if buckets is not None:
+            buckets[render_id % len(buckets)].add(render_id)
+
+    def _visual_bucket_discard(self, render_id):
+        buckets = getattr(self, "_render_ids_by_stripe", None)
+        if buckets is not None:
+            buckets[render_id % len(buckets)].discard(render_id)
 
     def _add_sprite(self, data):
 
@@ -817,11 +1042,13 @@ class Game(arcade.Window):
             angle=world_data['rotation'],
         )
         sprite._engine_render_id = render_id
+        sprite._engine_sort_key = (world_data['layer'], -render_id)
 
         self.renders.append(sprite)
 
         self._sprites_by_render_id[render_id] = sprite
         self._world_data_by_render_id[render_id] = world_data
+        self._visual_bucket_add(render_id)
         if data.get('scripted'):
             self._scripted_render_ids.add(render_id)
         self._render_order_dirty = True
@@ -841,7 +1068,11 @@ class Game(arcade.Window):
     def _remove_sprite(self, data, reset_camera=True):
 
         render_id = data['render_id']
+        clear_changes = getattr(self.visual_cache, "clear_changes", None)
+        if clear_changes is not None:
+            clear_changes(render_id)
         sprite = (self._sprites_by_render_id.pop(render_id, None))
+        self._visual_bucket_discard(render_id)
 
         if sprite is not None:
             self.renders.remove(sprite)
@@ -857,7 +1088,6 @@ class Game(arcade.Window):
         self._position_history_by_render_id.pop(render_id, None)
         self._moving_render_ids.discard(render_id)
         self._latest_tick_by_render_id.pop(render_id, None)
-        self._last_tick_update_by_render_id.pop(render_id, None)
         self._scripted_render_ids.discard(render_id)
         self._waiting_updates.pop(render_id, None)
         self._colliders_by_render_id.pop(render_id, None)
@@ -867,6 +1097,80 @@ class Game(arcade.Window):
         world_data = self._world_data_by_render_id.get(id)
         if world_data is None:
             return
+
+        # Moving sprites publish exactly {'x', 'y'} or {'x', 'y', 'tick'}.
+        # Keep that case free of the nine dictionary membership tests and of
+        # the float/int coercions in _record_position.
+        key_count = len(object_data)
+
+        # Single-field updates are common for non-position changes (layer
+        # switches, alpha fades, a collider rotation).  Handle them before the
+        # generic path so they skip seven membership tests and the position
+        # bookkeeping that cannot apply to them.
+        if key_count == 1:
+            if 'tick' in object_data:
+                tick = int(object_data['tick'])
+                latest_tick = self._latest_tick_by_render_id.get(id)
+                if latest_tick is None or tick > latest_tick:
+                    self._latest_tick_by_render_id[id] = tick
+                return
+            if 'rotation' in object_data:
+                rotation = object_data['rotation']
+                if rotation != world_data['rotation']:
+                    world_data['rotation'] = rotation
+                    self._hit_mark_dirty(id)
+                sprite.angle = rotation
+                return
+            if 'scale' in object_data:
+                scale = object_data['scale']
+                if scale != world_data['scale']:
+                    world_data['scale'] = scale
+                    self._hit_mark_dirty(id)
+                sprite.scale = scale
+                return
+            if 'alpha' in object_data:
+                alpha = object_data['alpha']
+                world_data['alpha'] = alpha
+                sprite.alpha = int(alpha * 255)
+                return
+            if 'layer' in object_data:
+                layer = float(object_data['layer'])
+                world_data['layer'] = layer
+                sprite._engine_sort_key = (layer, -id)
+                self._render_order_dirty = True
+                return
+            if 'sprite' in object_data:
+                sprite.texture = self._texture_for_path(object_data['sprite'])
+                self._hit_mark_dirty(id)
+                return
+
+        if (key_count <= 3
+                and 'x' in object_data
+                and 'y' in object_data
+                and (key_count == 2 or 'tick' in object_data)):
+            tick = object_data.get('tick')
+            latest_ticks = self._latest_tick_by_render_id
+            if tick is not None:
+                tick = int(tick)
+                latest_tick = latest_ticks.get(id)
+                if latest_tick is None or tick > latest_tick:
+                    latest_ticks[id] = tick
+
+            current_x, current_y = world_data['position']
+            new_x = object_data['x']
+            new_y = object_data['y']
+            if new_x != current_x or new_y != current_y:
+                world_data['position'] = (new_x, new_y)
+                self._moving_render_ids.add(id)
+                if tick is None:
+                    tick = latest_ticks.get(id)
+                    if tick is None:
+                        tick = int(self._current_tick())
+                self._append_position_sample(id, tick, new_x, new_y)
+                # The hit grid is refreshed lazily on the next pointer query;
+                # marking here would repeat the same cell check per update.
+            return
+
         if 'sprite' in object_data:
             sprite.texture = self._texture_for_path(object_data['sprite'])
 
@@ -876,7 +1180,6 @@ class Game(arcade.Window):
             latest_tick = self._latest_tick_by_render_id.get(id)
             if latest_tick is None or tick > latest_tick:
                 self._latest_tick_by_render_id[id] = tick
-            self._last_tick_update_by_render_id[id] = time.monotonic()
 
         current_x, current_y = world_data['position']
         position_changed = False
@@ -895,17 +1198,25 @@ class Game(arcade.Window):
 
         world_data['position'] = (current_x, current_y)
 
+        geometry_changed = 'sprite' in object_data
+
         if 'scale' in object_data:
+            if object_data['scale'] != world_data['scale']:
+                geometry_changed = True
             world_data['scale'] = object_data['scale']
 
         if 'rotation' in object_data:
+            if object_data['rotation'] != world_data['rotation']:
+                geometry_changed = True
             world_data['rotation'] = object_data['rotation']
 
         if 'alpha' in object_data:
             world_data['alpha'] = object_data['alpha']
 
         if 'layer' in object_data:
-            world_data['layer'] = float(object_data['layer'])
+            layer = float(object_data['layer'])
+            world_data['layer'] = layer
+            sprite._engine_sort_key = (layer, -id)
             self._render_order_dirty = True
 
         if position_changed:
@@ -924,9 +1235,10 @@ class Game(arcade.Window):
             sprite.angle = world_data['rotation']
         if 'alpha' in object_data:
             sprite.alpha = int(world_data['alpha'] * 255)
-        if 'sprite' in object_data or 'x' in object_data or 'y' in object_data \
-                or 'scale' in object_data or 'rotation' in object_data:
+        if geometry_changed:
             self._hit_mark_dirty(id)
+        # Position-only updates are re-indexed lazily by _hit_index_dirty();
+        # see the fast path above.
 
     def _apply_world_transform(self, sprite, world_data):
         world_x, world_y = world_data['position']
@@ -1019,8 +1331,10 @@ def main():
     visual_struct =  {
         'x' : float,
         'y' : float,
+        # tick follows x/y so the hottest visual write is one contiguous
+        # span and ObjectCache.set_position() can pack it in one call.
+        'tick' : int,
         'sim_time': float,
-        'tick': int,
         'rotation' : float,
         'scale' : float,
         'alpha' : float,
@@ -1028,8 +1342,31 @@ def main():
         'layer' : float,
     }
     visual_locks = [multiprocessing.Lock() for _ in range(64)]
-    raw_visual_cache = VisualCache(1024 * 256, visual_struct, visual_locks)
-    visual_cache = [raw_visual_cache.key, visual_struct, visual_locks]
+    visual_dirty_counts = multiprocessing.Array(
+        "i", len(visual_locks), lock=False
+    )
+    visual_dirty_queue = multiprocessing.Array(
+        "i",
+        len(visual_locks) * (3 + DIRTY_RING_CAPACITY),
+        lock=False,
+    )
+    raw_visual_cache = VisualCache(
+        1024 * 1024,
+        visual_struct,
+        visual_locks,
+        visual_dirty_counts,
+        dirty_queue=visual_dirty_queue,
+        dirty_ring_size=DIRTY_RING_CAPACITY,
+    )
+    visual_cache = [
+        raw_visual_cache.key,
+        visual_struct,
+        visual_locks,
+        visual_dirty_counts,
+        raw_visual_cache.capacity,
+        visual_dirty_queue,
+        DIRTY_RING_CAPACITY,
+    ]
 
     id_struct =  {
         'name' : str,
@@ -1039,7 +1376,9 @@ def main():
     }
     id_locks = [multiprocessing.Lock() for _ in range(64)]
     raw_id_cache = IdCache(1024*256, id_struct, id_locks)
-    id_cache = [raw_id_cache.key, id_struct, id_locks]
+    id_cache = [
+        raw_id_cache.key, id_struct, id_locks, None, raw_id_cache.capacity,
+    ]
 
     proccess_status_info = manager.list()
     # All engine counters share one segment; scripts read them in one lock.
@@ -1052,6 +1391,8 @@ def main():
         raw_engine_state.key,
         ENGINE_STATE_STRUCT,
         raw_engine_state.locks,
+        None,
+        raw_engine_state.capacity,
     ]
     raw_motion_cache = ObjectCache(
         MOUSE_MOTION_BYTES,
@@ -1074,6 +1415,8 @@ def main():
         raw_motion_cache.key,
         MOUSE_MOTION_STRUCT,
         raw_motion_cache.locks,
+        None,
+        raw_motion_cache.capacity,
     ]
     raw_keyboard_events = ObjectCache(
         KEYBOARD_EVENT_BYTES,
@@ -1084,6 +1427,8 @@ def main():
         raw_keyboard_events.key,
         KEYBOARD_EVENT_STRUCT,
         raw_keyboard_events.locks,
+        None,
+        raw_keyboard_events.capacity,
     ]
     camera_target_cache = ValueCache(-1)
     camera_scale_cache = ValueCache(1.0)

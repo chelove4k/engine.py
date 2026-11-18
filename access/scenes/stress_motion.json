@@ -1,0 +1,41 @@
+[
+  {
+    "object_type": "camera",
+    "id": {
+      "name": "stress_camera",
+      "class": "CameraTarget",
+      "type": "camera"
+    },
+    "visual": {
+      "sprite": "None",
+      "layer": 0,
+      "position": [0, 0],
+      "scale": 1,
+      "rotation": 0,
+      "alpha": 1
+    }
+  },
+  {
+    "object_type": "manager",
+    "id": {
+      "name": "stress_scene",
+      "class": "StressScene",
+      "type": "manager"
+    },
+    "scripting": {
+      "scripts": ["access\\scripts\\camera.py"],
+      "network": []
+    },
+    "stress_scene": {
+      "count": 1000,
+      "columns": 36,
+      "spacing": 10.5,
+      "radius": 4.0,
+      "speed": 1.2,
+      "sprite_scale": 0.024,
+      "layer": 1.0,
+      "per_object_scripts": false,
+      "chunk_size": 100
+    }
+  }
+]

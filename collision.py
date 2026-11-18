@@ -52,6 +52,17 @@ def validate_convex_polygon(points):
     return tuple(vertices)
 
 
+def polygon_bounds(polygon):
+    """Return ``(min_x, max_x, min_y, max_y)`` for a non-empty polygon."""
+
+    return (
+        min(point[0] for point in polygon),
+        max(point[0] for point in polygon),
+        min(point[1] for point in polygon),
+        max(point[1] for point in polygon),
+    )
+
+
 def transform_polygon(vertices, position, rotation_degrees, scale):
     """Convert local polygon vertices to world-space coordinates."""
     angle = radians(float(rotation_degrees))
@@ -67,15 +78,23 @@ def transform_polygon(vertices, position, rotation_degrees, scale):
     )
 
 
-def convex_polygons_overlap(first, second):
-    """Return whether two convex polygons overlap or touch (SAT)."""
+def convex_polygons_overlap(first, second, first_bounds=None,
+                            second_bounds=None):
+    """Return whether two convex polygons overlap or touch (SAT).
+
+    ``first_bounds``/``second_bounds`` may contain previously computed
+    ``polygon_bounds()`` values.  Transform colliders cache them together with
+    their world polygon, so a pair check avoids rebuilding four min/max values
+    for each side.
+    """
+
     if not first or not second:
         return False
-    bounds = []
-    for polygon in (first, second):
-        bounds.append((min(p[0] for p in polygon), max(p[0] for p in polygon),
-                       min(p[1] for p in polygon), max(p[1] for p in polygon)))
-    a, b = bounds
+    if first_bounds is None:
+        first_bounds = polygon_bounds(first)
+    if second_bounds is None:
+        second_bounds = polygon_bounds(second)
+    a, b = first_bounds, second_bounds
     if (a[1] < b[0] - _EPSILON or b[1] < a[0] - _EPSILON
             or a[3] < b[2] - _EPSILON or b[3] < a[2] - _EPSILON):
         return False

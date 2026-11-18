@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 from multiprocessing.managers import SyncManager
 from pathlib import Path
 import queue
@@ -32,8 +33,9 @@ from memory_lib import FieldView, ObjectCache, ValueCache
 from radon.visitors import ComplexityVisitor
 
 
-# Choose the scene loaded when the engine starts.
-SCENE_FILE = "scene1.json"
+# Choose the scene loaded when the engine starts.  Override it for a single
+# run with PYENGINE_SCENE=stress_motion.json (the file lives in access/scenes).
+SCENE_FILE = os.environ.get("PYENGINE_SCENE") or "scene1.json"
 
 
 # Small identity buckets stay as plain lists: creating a manager.list costs
@@ -656,10 +658,9 @@ class Stream:
             self.objects_cache[id] = object
             render_id = object["_render_id"]
 
-            # Only objects with their own script loop publish a tick
-            # heartbeat every fixed step.  Sporadically updated visuals
-            # (for example an idle camera target) must not hold back the
-            # shared render tick.
+            # Script ownership is still published for compatibility, but the
+            # shared render tick no longer depends on per-object heartbeats.
+            # An idle object simply stops producing visual updates.
             scripting = dict_data.get("scripting") or {}
             scripted = (
                 bool(scripting.get("scripts"))

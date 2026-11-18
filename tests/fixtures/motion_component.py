@@ -2,7 +2,7 @@
 
 Each fixed step moves the object by a constant distance.  The stress runner
 then checks that the shared render tick keeps advancing smoothly and that
-every object publishes heartbeats inside the interpolation window.
+every object publishes position updates inside the interpolation window.
 """
 
 from pyengine import Component

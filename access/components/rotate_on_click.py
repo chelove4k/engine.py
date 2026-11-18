@@ -9,8 +9,8 @@ class rotate_on_click(Component):
     def on_mouse_click(self, event):
         if self.GameObject.Visual is not None:
             self.GameObject.Visual.rotation += float(self.degrees)
-
-        self.create_object(json_text=
+        for i in range(10):
+          self.create_object(json_text=
             {
     "object_type": "dynamic_object",
     "id": {

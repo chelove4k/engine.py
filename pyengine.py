@@ -12,7 +12,12 @@ import uuid
 from contextlib import nullcontext
 from typing import Any
 
-from collision import convex_polygons_overlap, transform_polygon, validate_convex_polygon
+from collision import (
+    convex_polygons_overlap,
+    polygon_bounds,
+    transform_polygon,
+    validate_convex_polygon,
+)
 from config import (
     ENGINE_STATE_LOOP_FIELDS,
     FIXED_DT,
@@ -411,9 +416,7 @@ class _Camera:
         if not self._is_valid_target(render_id):
             return False
         self.target_id = render_id
-        position = self.visual_cache.get_many(render_id, ("x", "y"))
-        self.position_x = position["x"]
-        self.position_y = position["y"]
+        self.position_x, self.position_y = self._read_position(render_id)
         self.camera_target_cache.set(render_id)
         return True
 
@@ -436,6 +439,23 @@ class _Camera:
             return float(dx[0]), float(dx[1])
         raise TypeError("move_camera expects (dx, dy) or a pair")
 
+    def _read_position(self, render_id):
+        get_position = getattr(self.visual_cache, "get_position", None)
+        if get_position is not None:
+            position = get_position(render_id)
+            return position[0], position[1]
+        position = self.visual_cache.get_many(render_id, ("x", "y"))
+        return position["x"], position["y"]
+
+    def _write_position(self, render_id, x, y, tick):
+        set_position = getattr(self.visual_cache, "set_position", None)
+        if set_position is not None:
+            set_position(render_id, x, y, tick)
+            return
+        self.visual_cache.set_many(
+            render_id, {"x": x, "y": y, "tick": int(tick)}
+        )
+
     def _current_tick(self):
         tick = self.owner.__dict__.get("_simulation_tick")
         if tick is not None:
@@ -448,15 +468,19 @@ class _Camera:
         if not self._refresh_target():
             return False
         dx, dy = self._movement_pair(dx, dy)
-        position = self.visual_cache.get_many(self.target_id, ("x", "y"))
-        self.position_x = position["x"] + dx
-        self.position_y = position["y"] + dy
-        self.visual_cache.set_many(self.target_id, {
-            "x": self.position_x,
-            "y": self.position_y,
-            "sim_time": float(self.owner.GlobalTime),
-            "tick": self._current_tick(),
-        })
+        tick = self._current_tick()
+        move_position = getattr(self.visual_cache, "move_position", None)
+        if move_position is not None:
+            self.position_x, self.position_y = move_position(
+                self.target_id, dx, dy, tick
+            )
+            return True
+        x, y = self._read_position(self.target_id)
+        self.position_x = x + dx
+        self.position_y = y + dy
+        self._write_position(
+            self.target_id, self.position_x, self.position_y, tick
+        )
         return True
 
     def moveto_camera(self, x: float, y: float):
@@ -464,12 +488,12 @@ class _Camera:
             return False
         self.position_x = float(x)
         self.position_y = float(y)
-        self.visual_cache.set_many(self.target_id, {
-            "x": self.position_x,
-            "y": self.position_y,
-            "sim_time": float(self.owner.GlobalTime),
-            "tick": self._current_tick(),
-        })
+        self._write_position(
+            self.target_id,
+            self.position_x,
+            self.position_y,
+            self._current_tick(),
+        )
         return True
 
     def scale_camera(self, scale: float):
@@ -486,18 +510,41 @@ class GameObject:
             self.render_id = render_id
             self.polygon = validate_convex_polygon(polygon)
             self._visual_cache = visual_cache
+            self._cached_pose = None
+            self._cached_polygon = ()
+            self._cached_bounds = None
 
-        def _world_polygon(self):
+        def _world_geometry(self):
             if self._visual_cache is None or self.render_id is None:
                 raise RuntimeError("Transform collider is not connected to the shared transform cache")
-            pose = self._visual_cache.get_many(self.render_id, ("x", "y", "rotation", "scale"))
-            return transform_polygon(self.polygon, (pose["x"], pose["y"]), pose["rotation"], pose["scale"])
+            pose = self._visual_cache.get_many(
+                self.render_id, ("x", "y", "rotation", "scale")
+            )
+            key = (pose["x"], pose["y"], pose["rotation"], pose["scale"])
+            if key == self._cached_pose:
+                return self._cached_polygon, self._cached_bounds
+            polygon = transform_polygon(
+                self.polygon, (key[0], key[1]), key[2], key[3]
+            )
+            self._cached_pose = key
+            self._cached_polygon = polygon
+            self._cached_bounds = (
+                polygon_bounds(polygon) if polygon else None
+            )
+            return polygon, self._cached_bounds
+
+        def _world_polygon(self):
+            return self._world_geometry()[0]
 
         def overlaps(self, other):
             other_transform = getattr(other, "Transform", other)
             if not isinstance(other_transform, self.__class__):
                 raise TypeError("Transform.overlaps expects a GameObject with a Transform collider")
-            return convex_polygons_overlap(self._world_polygon(), other_transform._world_polygon())
+            first, first_bounds = self._world_geometry()
+            second, second_bounds = other_transform._world_geometry()
+            return convex_polygons_overlap(
+                first, second, first_bounds, second_bounds
+            )
 
 
     class __Visual:
@@ -558,11 +605,64 @@ class GameObject:
                     if cache_refs and cache_refs[5] is not None and render_id is not None:
                         cache = cache_refs[5]
                         if name == "position":
+                            get_position = getattr(cache, "get_position", None)
+                            if get_position is not None:
+                                position = get_position(render_id)
+                                return Vector2(position[0], position[1])
                             position = cache.get_many(render_id, ("x", "y"))
                             return Vector2(position["x"], position["y"])
                         cache_field = "sprite" if name == "sprite" else name
                         return cache.get(render_id, cache_field)
             return object.__getattribute__(self, name)
+
+        def _current_tick(self):
+            owner = self.__dict__.get("_simulation_time_owner")
+            tick = None
+            if owner is not None:
+                tick = owner.__dict__.get("_simulation_tick")
+            if tick is None:
+                tick_cache = self.__dict__.get("_tick_cache")
+                if tick_cache is not None:
+                    tick = tick_cache.get()
+            if tick is None:
+                return None
+            return int(tick)
+
+        def move(self, dx, dy=None):
+            """Translate the object by ``dx``/``dy`` in one cache round-trip.
+
+            Accepts ``move(dx, dy)`` or ``move((dx, dy))``.  When the cache
+            supports ``move_position`` the read-modify-write happens under a
+            single stripe lock, which is cheaper than reading ``position`` and
+            assigning it back.
+            """
+
+            if dy is None:
+                if isinstance(dx, Vector2):
+                    dx, dy = dx.x, dx.y
+                elif isinstance(dx, (list, tuple)) and len(dx) == 2:
+                    dx, dy = dx[0], dx[1]
+                else:
+                    raise TypeError("move expects (dx, dy) or a pair")
+            dx, dy = float(dx), float(dy)
+
+            visual_cache = self._[5]
+            if visual_cache is None:
+                print('VisualCache не подключён')
+                return None
+
+            render_id = self.__dict__.get("id")
+            tick = self._current_tick()
+            move_position = getattr(visual_cache, "move_position", None)
+            if move_position is None:
+                position = self.position
+                position.x += dx
+                position.y += dy
+                self.position = position
+                return position
+
+            new_x, new_y = move_position(render_id, dx, dy, tick)
+            return Vector2(new_x, new_y)
 
         @staticmethod
         def _layer_index_add(objects_cache, key, object_id):
@@ -634,36 +734,18 @@ class GameObject:
             visual_cache = self._[5]
 
             if name == 'position':
-                position_data = {
-                    'x': float(value.x),
-                    'y': float(value.y),
-                }
-
-                owner = self.__dict__.get("_simulation_time_owner")
-                tick = None
-
-                if owner is not None:
-                    position_data["sim_time"] = float(owner.GlobalTime)
-                    tick = owner.__dict__.get("_simulation_tick")
+                render_id = id
+                x = float(value.x)
+                y = float(value.y)
+                tick = self._current_tick()
+                set_position = getattr(visual_cache, "set_position", None)
+                if set_position is not None:
+                    set_position(render_id, x, y, tick)
                 else:
-                    time_cache = self.__dict__.get("_simulation_time_cache")
-                    if time_cache is not None:
-                        position_data["sim_time"] = time_cache.get()
-
-                if tick is None:
-                    tick_cache = self.__dict__.get("_tick_cache")
-                    if tick_cache is not None:
-                        tick = tick_cache.get()
-                if tick is not None:
-                    tick = int(tick)
-                    position_data["tick"] = tick
-                    if owner is not None:
-                        written = owner.__dict__.setdefault(
-                            "_visual_tick_written_by_render_id", {}
-                        )
-                        written[id] = tick
-
-                visual_cache.set_many(id, position_data)
+                    position_data = {'x': x, 'y': y}
+                    if tick is not None:
+                        position_data["tick"] = tick
+                    visual_cache.set_many(render_id, position_data)
                 return
             if name == 'rotation':
                 visual_cache.set(id, 'rotation', float(value))
@@ -1344,16 +1426,6 @@ class script:
         )
         return unpack_pressed_keys(values.values())
 
-    def __write_tick_heartbeat(self, tick):
-        visual = self.GameObject.Visual
-        render_id = self.GameObject._render_id
-        if visual is None or render_id is None or self.__visual_cache is None:
-            return
-        written = self.__dict__.get("_visual_tick_written_by_render_id") or {}
-        if written.get(render_id) == tick:
-            return
-        self.__visual_cache.set(render_id, "tick", int(tick))
-
     def __init__(
         self,
         render_in_stream,
@@ -1472,10 +1544,14 @@ class script:
             last_fixed_tick = self.__current_tick()
 
             while True:
-                # One shared-memory read covers the clock, tick, input and
-                # removal counters plus the pressed-key count.  Previously
-                # each of them locked a separate ValueCache.
-                state = self.__engine_state.get_many(
+                # One lock-free read covers the clock, tick, input and
+                # removal counters plus the pressed-key count.  It used to be
+                # one shared-memory read under a process-shared lock: with a
+                # thousand scripts every worker contended on the same
+                # semaphore and the whole pipeline capped at ~25 updates/s.
+                # Every field here is a single 4-byte value, so a racing
+                # write can only make the snapshot one update stale.
+                state = self.__engine_state.get_many_lockless(
                     0, ENGINE_STATE_LOOP_FIELDS
                 )
                 now = state["time"]
@@ -1532,7 +1608,6 @@ class script:
                     self.__dict__["_simulation_tick"] = last_fixed_tick
                     self.GlobalTime = last_fixed_tick * FIXED_DT
                     self.fixed_update()
-                    self.__write_tick_heartbeat(last_fixed_tick)
                 if last_fixed_tick < current_tick:
                     # Drop excessive catch-up, but never simulate a tick twice.
                     last_fixed_tick = current_tick

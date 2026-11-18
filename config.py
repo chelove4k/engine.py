@@ -22,7 +22,7 @@ def resolve_project_path(path):
 SIMULATION_HZ = 100
 FIXED_DT = 1.0 / SIMULATION_HZ
 
-SCRIPT_UPDATE_HZ = 1000
+SCRIPT_UPDATE_HZ = 100
 SCRIPT_UPDATE_PERIOD = 1.0 / SCRIPT_UPDATE_HZ
 
 POSITION_INTERPOLATION_DELAY = 0.04
@@ -39,6 +39,13 @@ OBJECT_LIVENESS_PERIOD = 0.05
 
 MAX_CACHE_STRING_BYTES = 64
 MAX_CATCH_UP_STEPS = 5
+
+# Per-stripe ring of segment ids that became dirty since the last poll.  Its
+# purpose is to make the common "a few scripts moved" frame proportional to
+# the number of dirty sprites instead of the number of active sprites in every
+# dirty stripe.  When a stripe ring overflows, the reader falls back to a full
+# scan of that stripe and resets the ring.
+DIRTY_RING_CAPACITY = 256
 
 # Pointer snapshot shared through one ObjectCache segment.  Scripts read it
 # directly from shared memory instead of asking the Manager for an event list

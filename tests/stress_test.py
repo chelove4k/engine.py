@@ -47,6 +47,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from config import (  # noqa: E402
+    DIRTY_RING_CAPACITY,
     ENGINE_STATE_SEGMENT_BYTES,
     ENGINE_STATE_STRUCT,
     FIXED_DT,
@@ -65,8 +66,8 @@ from memory_lib import FieldView, ObjectCache, ValueCache  # noqa: E402
 VISUAL_STRUCT = {
     "x": float,
     "y": float,
-    "sim_time": float,
     "tick": int,
+    "sim_time": float,
     "rotation": float,
     "scale": float,
     "alpha": float,
@@ -274,13 +275,13 @@ def run_cache(args) -> ScenarioResult:
     return result
 
 
-def _contention_worker(cache_key, struct, locks, mode, worker_id,
+def _contention_worker(cache_key, struct, locks, capacity, mode, worker_id,
                        start_event, stop_event, ready_queue, result_queue):
     """Top-level worker so the function is picklable on Windows spawn."""
 
     cache = None
     try:
-        cache = ObjectCache(cache_key, struct, locks)
+        cache = ObjectCache(cache_key, struct, locks, capacity=capacity)
         segment = worker_id if mode == "distinct" else 0
         counter = 0
         ready_queue.put({"worker": worker_id, "ok": True})
@@ -332,7 +333,8 @@ def _run_contention_mode(cache, mode, process_count, duration):
             process = multiprocessing.Process(
                 target=_contention_worker,
                 args=(
-                    cache.key, CONTENTION_STRUCT, cache.locks, mode, worker_id,
+                    cache.key, CONTENTION_STRUCT, cache.locks, cache.capacity,
+                    mode, worker_id,
                     start_event, stop_event, ready_queue, result_queue,
                 ),
             )
@@ -536,11 +538,34 @@ def run_collision(args) -> ScenarioResult:
 
 
 class _FakeSprite:
-    __slots__ = ("center_x", "center_y")
+    __slots__ = ("_position",)
 
     def __init__(self):
-        self.center_x = 0.0
-        self.center_y = 0.0
+        self._position = (0.0, 0.0)
+
+    @property
+    def position(self):
+        return self._position
+
+    @position.setter
+    def position(self, value):
+        self._position = value
+
+    @property
+    def center_x(self):
+        return self._position[0]
+
+    @center_x.setter
+    def center_x(self, value):
+        self._position = (value, self._position[1])
+
+    @property
+    def center_y(self):
+        return self._position[1]
+
+    @center_y.setter
+    def center_y(self, value):
+        self._position = (self._position[0], value)
 
 
 def run_render(args) -> ScenarioResult:
@@ -558,6 +583,9 @@ def run_render(args) -> ScenarioResult:
     game._sprites_by_render_id = {}
     game._moving_render_ids = set()
     game._world_data_by_render_id = {}
+    game._hit_cells = {}
+    game._hit_geometry_by_render_id = {}
+    game._hit_large_ids = set()
     game._hit_dirty_ids = set()
 
     probe_id = 10 ** 9
@@ -816,13 +844,30 @@ class LiveStreamHarness:
         self.lock = self.manager.Lock()
 
         self.visual_locks = [multiprocessing.Lock() for _ in range(64)]
+        self.visual_dirty_counts = multiprocessing.Array(
+            "i", len(self.visual_locks), lock=False
+        )
+        self.visual_dirty_queue = multiprocessing.Array(
+            "i",
+            len(self.visual_locks) * (3 + DIRTY_RING_CAPACITY),
+            lock=False,
+        )
         self.raw_visual = ObjectCache(
             VISUAL_SEGMENT_LEN * self.capacity,
             VISUAL_STRUCT,
             self.visual_locks,
+            self.visual_dirty_counts,
+            dirty_queue=self.visual_dirty_queue,
+            dirty_ring_size=DIRTY_RING_CAPACITY,
         )
         self.visual_cache = [
-            self.raw_visual.key, VISUAL_STRUCT, self.visual_locks,
+            self.raw_visual.key,
+            VISUAL_STRUCT,
+            self.visual_locks,
+            self.visual_dirty_counts,
+            self.raw_visual.capacity,
+            self.visual_dirty_queue,
+            DIRTY_RING_CAPACITY,
         ]
         self.id_locks = [multiprocessing.Lock() for _ in range(64)]
         self.raw_id = ObjectCache(
@@ -830,7 +875,10 @@ class LiveStreamHarness:
             ID_STRUCT,
             self.id_locks,
         )
-        self.id_cache = [self.raw_id.key, ID_STRUCT, self.id_locks]
+        self.id_cache = [
+            self.raw_id.key, ID_STRUCT, self.id_locks, None,
+            self.raw_id.capacity,
+        ]
 
         self.engine_locks = [multiprocessing.Lock() for _ in range(4)]
         self.raw_engine_state = ObjectCache(
@@ -842,6 +890,8 @@ class LiveStreamHarness:
             self.raw_engine_state.key,
             ENGINE_STATE_STRUCT,
             self.engine_locks,
+            None,
+            self.raw_engine_state.capacity,
         ]
         self.time_view = FieldView(self.raw_engine_state, "time")
         self.tick_view = FieldView(self.raw_engine_state, "tick")
@@ -865,6 +915,8 @@ class LiveStreamHarness:
             self.raw_motion.key,
             MOUSE_MOTION_STRUCT,
             self.motion_locks,
+            None,
+            self.raw_motion.capacity,
         ]
         self.keyboard_locks = [multiprocessing.Lock() for _ in range(16)]
         self.raw_keyboard_events = ObjectCache(
@@ -876,6 +928,8 @@ class LiveStreamHarness:
             self.raw_keyboard_events.key,
             KEYBOARD_EVENT_STRUCT,
             self.keyboard_locks,
+            None,
+            self.raw_keyboard_events.capacity,
         ]
         self.camera_target = ValueCache(-1)
         self.camera_scale = ValueCache(1.0)
@@ -1217,8 +1271,8 @@ def run_motion(args) -> ScenarioResult:
     component_path = "tests/fixtures/motion_component.py"
     capacity = count + max(64, SCENE_OBJECT_COUNT * 4)
     delay_ticks = POSITION_INTERPOLATION_DELAY / FIXED_DT
-    # Heartbeats are published from fixed_update(), so the expected rate is
-    # bound by the simulation clock, not by SCRIPT_UPDATE_HZ.
+    # Position writes carry the tick of their fixed_update(), so the expected
+    # rate is bound by the simulation clock, not by SCRIPT_UPDATE_HZ.
     min_rate = max(10.0, SIMULATION_HZ * 0.3)
 
     with LiveStreamHarness(
