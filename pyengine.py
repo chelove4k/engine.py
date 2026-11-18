@@ -46,7 +46,7 @@ _REGISTRATION_STASH_PREFIX = "__engine_registration_response__"
 
 
 def push_dependencies(dependencies: dict):
-    """Install engine dependencies for the current thread/context."""
+    """Устанавливает зависимости движка для текущего потока/контекста."""
 
     return _DEPENDENCIES.set(dependencies)
 
@@ -60,7 +60,7 @@ def current_dependencies():
 
 
 def _deps_from_stack() -> dict:
-    """Compatibility fallback for code that creates GameObjects outside a script."""
+    """Резервный механизм совместимости для кода, создающего GameObject вне скрипта."""
 
     names = {
         "RenderInQueue": "render_in_stream",
@@ -90,9 +90,9 @@ class Vector2:
             return other.x, other.y
         if isinstance(other, (list, tuple)):
             if len(other) != 2:
-                raise TypeError("Vector2 operation expects a pair [x, y]")
+                raise TypeError("Операция Vector2 ожидает пару [x, y]")
             return other[0], other[1]
-        raise TypeError(f"Unsupported Vector2 operand: {other!r}")
+        raise TypeError(f"Неподдерживаемый операнд Vector2: {other!r}")
 
     def __add__(self, other):
         x, y = self._pair(other)
@@ -143,9 +143,9 @@ class Keyboard:
         else:
             events = objects_cache.get(self.EVENTS_KEY) or ()
             self._event_sequence = events[-1]["sequence"] if events else 0
-        # Queries such as was_pressed() track their own per-key cursor.  They
-        # must not use _event_sequence, because _poll_events() advances it
-        # before callbacks and update() are executed.
+        # Запросы вроде was_pressed() ведут собственный курсор для каждой
+        # клавиши. Они не должны использовать _event_sequence, потому что
+        # _poll_events() сдвигает его до выполнения колбэков и update().
         self._initial_event_sequence = self._event_sequence
         self._query_sequences = {}
 
@@ -160,7 +160,7 @@ class Keyboard:
         return frozenset(self._script_owner.get_pressed_keys())
 
     def _events_after(self, cursor):
-        """Return events newer than ``cursor`` from shared memory or Manager."""
+        """Возвращает события новее ``cursor`` из shared memory или Manager."""
 
         if self._event_ring is None or self._event_sequence_cache is None:
             events = self._objects_cache.get(self.EVENTS_KEY) or ()
@@ -178,7 +178,7 @@ class Keyboard:
                 sequence % capacity, KEYBOARD_EVENT_FIELDS
             )
             if int(values["sequence"]) != sequence:
-                # The slot was already overwritten by a newer event.
+                # Слот уже перезаписан более новым событием.
                 continue
             pending.append({
                 "sequence": sequence,
@@ -203,8 +203,8 @@ class Keyboard:
             and event["key"] == key
         ]
         if matching_sequences:
-            # Only consume events for this key. Advancing to the end of the
-            # whole event list would silently swallow presses of other keys.
+            # Забираем события только для этой клавиши. Переход в конец
+            # всего списка событий молча поглотил бы нажатия других клавиш.
             self._query_sequences[cursor_key] = max(matching_sequences)
             return True
         return False
@@ -233,8 +233,8 @@ class Mouse:
         events = objects_cache.get(self.EVENTS_KEY) or ()
         self._event_sequence = events[-1]["sequence"] if events else 0
         self._click_sequence = self._event_sequence
-        # Motion is published in shared memory.  Remember the last sequence
-        # seen by this script so the same snapshot isn't dispatched twice.
+        # Движение публикуется в shared memory. Запоминаем последнюю
+        # последовательность, увиденную скриптом, чтобы не дублировать снимок.
         self._motion_sequence = (
             int(motion_cache.get(0, "seq"))
             if motion_cache is not None else 0
@@ -250,7 +250,7 @@ class Mouse:
         return self._objects_cache.get(self.STATE_KEY) or {}
 
     def _pointer(self):
-        """Return pointer position/hover without a Manager round-trip."""
+        """Возвращает позицию указателя и наведение без запроса к Manager."""
 
         if self._motion_cache is None:
             return self._state()
@@ -296,7 +296,7 @@ class Mouse:
         return False
 
     def _poll_motion(self):
-        """Return the newest motion snapshot when it changed since last poll."""
+        """Возвращает новейший снимок движения, если он изменился с прошлого опроса."""
 
         if self._motion_cache is None:
             return None
@@ -355,13 +355,13 @@ class _Camera:
             self.switch(first_name)
 
     def _refresh_targets(self):
-        """Rebuild the name -> render_id map so dynamically spawned cameras work."""
+        """Перестраивает карту name -> render_id, чтобы работали динамически созданные камеры."""
 
         self.targets = {}
         target_ids = self.objects_cache.get((self.INDEX_PREFIX, "type", "camera"), ())
         if not isinstance(target_ids, list):
-            # manager.list supports slicing in one server-side call; iterating
-            # a proxy directly would turn one lookup into N remote calls.
+            # manager.list поддерживает срез за один серверный вызов; прямой
+            # перебор прокси превратил бы один запрос в N удалённых вызовов.
             try:
                 target_ids = target_ids[:]
             except TypeError:
@@ -389,7 +389,7 @@ class _Camera:
         return self._target_record(render_id) is not None
 
     def _refresh_target(self):
-        """Follow a switch made by another script and validate the target."""
+        """Отслеживает переключение, сделанное другим скриптом, и проверяет цель."""
 
         shared_target = self.camera_target_cache.get()
         if shared_target != self.target_id:
@@ -398,7 +398,7 @@ class _Camera:
             else:
                 self.target_id = -1
                 if shared_target not in (-1, None):
-                    # The shared target was removed; reset it for everyone.
+                    # Общая цель удалена; сбрасываем её для всех.
                     self.camera_target_cache.set(-1)
 
         if self.target_id >= 0 and not self._is_valid_target(self.target_id):
@@ -432,7 +432,7 @@ class _Camera:
             return float(dx.x), float(dx.y)
         if isinstance(dx, (list, tuple)) and len(dx) == 2:
             return float(dx[0]), float(dx[1])
-        raise TypeError("move_camera expects (dx, dy) or a pair")
+        raise TypeError("move_camera ожидает (dx, dy) или пару")
 
     def _read_position(self, render_id):
         get_position = getattr(self.visual_cache, "get_position", None)
@@ -494,7 +494,7 @@ class _Camera:
     def scale_camera(self, scale: float):
         scale = float(scale)
         if scale != scale or scale in (float("inf"), float("-inf")):
-            raise ValueError("Camera scale must be finite")
+            raise ValueError("Масштаб камеры должен быть конечным числом")
         self.scale = max(0.01, scale)
         self.camera_scale_cache.set(self.scale)
 
@@ -511,7 +511,7 @@ class GameObject:
 
         def _world_geometry(self):
             if self._visual_cache is None or self.render_id is None:
-                raise RuntimeError("Transform collider is not connected to the shared transform cache")
+                raise RuntimeError("Коллайдер Transform не подключён к общему кэшу трансформаций")
             pose = self._visual_cache.get_many(
                 self.render_id, ("x", "y", "rotation", "scale")
             )
@@ -534,7 +534,7 @@ class GameObject:
         def overlaps(self, other):
             other_transform = getattr(other, "Transform", other)
             if not isinstance(other_transform, self.__class__):
-                raise TypeError("Transform.overlaps expects a GameObject with a Transform collider")
+                raise TypeError("Transform.overlaps ожидает GameObject с коллайдером Transform")
             first, first_bounds = self._world_geometry()
             second, second_bounds = other_transform._world_geometry()
             return convex_polygons_overlap(
@@ -569,8 +569,8 @@ class GameObject:
             self.alpha = alpha
             self.layer = layer
 
-            # Index 5 is kept for backwards compatibility with the old
-            # stack-injected cache layout.
+            # Индекс 5 сохранён для обратной совместимости со старой
+            # схемой кэша, внедрявшегося через стек.
             self._ = [None, None, None, None, None, visual_cache]
             self.__dict__["_simulation_time_owner"] = time_owner
             self.__dict__["_simulation_time_cache"] = time_cache
@@ -624,12 +624,12 @@ class GameObject:
             return int(tick)
 
         def move(self, dx, dy=None):
-            """Translate the object by ``dx``/``dy`` in one cache round-trip.
+            """Смещает объект на ``dx``/``dy`` за одно обращение к кэшу.
 
-            Accepts ``move(dx, dy)`` or ``move((dx, dy))``.  When the cache
-            supports ``move_position`` the read-modify-write happens under a
-            single stripe lock, which is cheaper than reading ``position`` and
-            assigning it back.
+            Принимает ``move(dx, dy)`` или ``move((dx, dy))``. Если кэш
+            поддерживает ``move_position``, чтение-изменение-запись выполняется
+            под одной stripe-блокировкой, что дешевле чтения ``position`` и
+            обратной записи.
             """
 
             if dy is None:
@@ -638,7 +638,7 @@ class GameObject:
                 elif isinstance(dx, (list, tuple)) and len(dx) == 2:
                     dx, dy = dx[0], dx[1]
                 else:
-                    raise TypeError("move expects (dx, dy) or a pair")
+                    raise TypeError("move ожидает (dx, dy) или пару")
             dx, dy = float(dx), float(dy)
 
             visual_cache = self._[5]
@@ -671,7 +671,7 @@ class GameObject:
                 bucket.append(object_id)
                 objects_cache[key] = bucket
             else:
-                # Promoted Manager list: append in place.
+                # Список, переведённый в Manager: добавляем на месте.
                 bucket.append(object_id)
 
         @staticmethod
@@ -924,11 +924,11 @@ class GameObject:
             )
 
     def _wait_registration_response(self, request_id):
-        """Wait for the response to this exact request.
+        """Ожидает ответ именно на этот запрос.
 
-        Responses are correlated by request_id. If another thread/process wins
-        the race for a response, the payload is stashed in the shared object
-        store so its owner can pick it up without losing the response.
+        Ответы сопоставляются по request_id. Если другой поток/процесс
+        выигрывает гонку за ответ, полезная нагрузка сохраняется в общем
+        хранилище объектов, чтобы её владелец мог забрать её без потери ответа.
         """
 
         deadline = time.monotonic() + REGISTRATION_TIMEOUT
@@ -966,7 +966,7 @@ class GameObject:
                 if extra:
                     self._stash_registration_responses(extra)
                 return payload
-            # Backwards compatibility with the old response keyed by object id.
+            # Обратная совместимость со старым ответом с ключом по id объекта.
             if self._id in response:
                 payload = response[self._id]
                 extra = {
@@ -1007,9 +1007,9 @@ class GameObject:
         self.__dict__["_object_id"] = object_id
         self.__dict__["_render_id"] = render_id
 
-        # The object was constructed before Stream assigned a render id.
-        # Rebind its component proxies so subsequent Visual/Identity access
-        # reads and writes the shared caches instead of local fallback values.
+        # Объект был создан до того, как Stream назначил render id.
+        # Перепривязываем прокси компонентов, чтобы последующие обращения к
+        # Visual/Identity читали и писали общие кэши, а не локальные значения.
         if self.Visual is not None:
             self.Visual.__dict__["id"] = render_id
             self.Visual._[5] = self._visual_cache
@@ -1060,9 +1060,9 @@ class GameObject:
                 "script_data": component_script_data,
             })
 
-        # A Visual component is independent from scripting. Render it even
-        # when scripts/components are attached, instead of relying on the
-        # script to call render() manually.
+        # Компонент Visual не зависит от скриптования. Отрисовываем его даже
+        # при подключённых скриптах/компонентах, не полагаясь на то, что
+        # скрипт вызовет render() вручную.
         if self.Visual is not None:
             self.render()
 
@@ -1089,12 +1089,12 @@ class GameObject:
 
     @staticmethod
     def register_many(objects):
-        """Register many objects with a single Stream round trip.
+        """Регистрирует много объектов за одно обращение к Stream.
 
-        ``create_object(list)`` and scene loading use this path.  Stream
-        validates the whole batch before mutating shared state, then returns
-        one result per object.  Scripts and visuals are still published per
-        object after the batch response.
+        ``create_object(list)`` и загрузка сцены используют этот путь. Stream
+        проверяет весь пакет до изменения общего состояния, затем возвращает
+        по одному результату на объект. Скрипты и визуалы по-прежнему
+        публикуются для каждого объекта после ответа на пакет.
         """
 
         objects = list(objects)
@@ -1107,8 +1107,8 @@ class GameObject:
             raise RuntimeError("Отсутствует подключение GameObject с Stream")
 
         with _REGISTRATION_LOCK:
-            # Another thread could have registered part of the batch while it
-            # was being collected.
+            # Другой поток мог зарегистрировать часть пакета, пока он
+            # собирался.
             pending = [obj for obj in pending if obj._object_id is None]
             if not pending:
                 return objects
@@ -1166,14 +1166,14 @@ class GameObject:
 
 
 def create_object(json_text, deps: dict | None = None):
-    """Create and register an object from JSON text or a Python dict/list.
+    """Создаёт и регистрирует объект из JSON-текста или Python dict/list.
 
-    Examples:
+    Примеры:
         create_object('{"object_type": "static_object", ...}')
         create_object({"object_type": "manager", ...})
         create_object([{...}, {...}])
 
-    The registered ``GameObject`` (or a list of them) is returned.
+    Возвращается зарегистрированный ``GameObject`` (или список таких объектов).
     """
 
     if isinstance(json_text, (bytes, bytearray)):
@@ -1184,8 +1184,8 @@ def create_object(json_text, deps: dict | None = None):
         data = json_text
 
     if isinstance(data, list):
-        # Validate the whole batch before creating anything, so a typo in the
-        # last item does not leave a half-created scene.
+        # Проверяем весь пакет до создания чего-либо, чтобы опечатка в
+        # последнем элементе не оставила наполовину созданную сцену.
         prepared = []
         for index, item in enumerate(data):
             if not isinstance(item, dict):
@@ -1205,7 +1205,7 @@ def create_object(json_text, deps: dict | None = None):
     return GameObject(data, deps=deps).register()
 
 
-# Historical typo kept as a compatible alias.
+# Историческая опечатка, сохранённая как совместимый псевдоним.
 creat_object = create_object
 
 
@@ -1220,7 +1220,7 @@ class script:
         pass
 
     def stop(self):
-        """Called once when the script loop stops or its object is removed."""
+        """Вызывается один раз при остановке цикла скрипта или удалении его объекта."""
         pass
 
     def on_mouse_click(self, event):
@@ -1258,7 +1258,7 @@ class script:
         return self.__pressed_keys
 
     def get_mouse_clicks(self):
-        """Compatibility helper; new components should use Mouse or callbacks."""
+        """Вспомогательный метод совместимости; новым компонентам следует использовать Mouse или колбэки."""
         events = self.__objects_cache.get(Mouse.EVENTS_KEY) or ()
         new_events = [
             event for event in events
@@ -1284,7 +1284,7 @@ class script:
             self.on_mouse_move(event)
 
     def __dispatch_mouse_motion(self):
-        """Deliver the shared-memory motion snapshot when it changed."""
+        """Доставляет снимок движения из shared memory, если он изменился."""
 
         data = self.Mouse._poll_motion()
         if data is not None:
@@ -1298,7 +1298,7 @@ class script:
             is_over = data.get("render_id") == own_render_id
 
             if event_type == "mouse_move":
-                # Legacy path used when no shared motion cache is attached.
+                # Устаревший путь, используемый, когда общий кэш движения не подключён.
                 if self.__motion_cache is None:
                     self.__handle_mouse_move(data)
                 continue
@@ -1322,7 +1322,7 @@ class script:
                 self.on_key_release(event)
 
     def create_object(self, json_text):
-        """Create and register an object from JSON text (or dict/list)."""
+        """Создаёт и регистрирует объект из JSON-текста (или dict/list)."""
 
         return create_object(json_text, deps=self.__dependencies)
 
@@ -1334,11 +1334,11 @@ class script:
                      "l": "layer", "layer": "layer", "t": "type", "type": "type"}
         field = selectors.get(by)
         if field is None:
-            raise ValueError("by must be c/class, n/name, l/layer, or t/type")
+            raise ValueError("by должен быть c/class, n/name, l/layer или t/type")
 
         if field == "layer" and not self.__objects_cache.get(
                 ("__engine_index__", "layer", "__ready__")):
-            # Compatibility path for caches built without a live Stream.
+            # Путь совместимости для кэшей, созданных без работающего Stream.
             object_ids = [
                 object_id
                 for object_id, record in self.__objects_cache.items()
@@ -1350,8 +1350,8 @@ class script:
         else:
             object_ids = self.__objects_cache.get(("__engine_index__", field, data), ())
             if not isinstance(object_ids, list):
-                # The index bucket may be a manager.list; take one snapshot
-                # instead of one Manager round trip per element.
+                # Корзина индекса может быть manager.list; берём один снимок
+                # вместо одного запроса к Manager на каждый элемент.
                 try:
                     object_ids = object_ids[:]
                 except TypeError:
@@ -1409,7 +1409,7 @@ class script:
         return int(self.__rawTick.get())
 
     def __read_pressed_keys(self, count=None):
-        """Read the atomically published pressed-key snapshot."""
+        """Читает атомарно опубликованный снимок нажатых клавиш."""
 
         if count is None:
             count = int(self.__engine_state.get(0, "key_count"))
@@ -1449,17 +1449,17 @@ class script:
         self.__rawTime = FieldView(engine_state, "time")
         self.__rawTick = FieldView(engine_state, "tick")
         self.__dict__["_script__rawTick"] = self.__rawTick
-        # Shared-memory pointer snapshot; mouse motion no longer goes through
-        # the Manager event list, so a moving pointer cannot starve keyboard
-        # input or force every script to copy event lists.
+        # Снимок указателя в shared memory; движение мыши больше не идёт через
+        # список событий Manager, поэтому движущийся указатель не блокирует
+        # ввод с клавиатуры и не заставляет каждый скрипт копировать списки событий.
         self.__motion_cache = motion_cache
-        # ``None`` forces one liveness check on the first loop iteration.
-        # Without it a script that was queued before its object got removed
-        # would accept the already-bumped counter as its starting point and
-        # never notice that the object is gone.
+        # ``None`` заставляет выполнить одну проверку живости на первой
+        # итерации цикла. Без неё скрипт, поставленный в очередь до удаления
+        # его объекта, принял бы уже увеличенный счётчик за начальную точку
+        # и никогда не заметил бы, что объект исчез.
         self.__last_object_generation = None
-        # Keyboard events live in a shared-memory ring, avoiding a Manager
-        # list copy for every script on every key press.
+        # События клавиатуры живут в кольцевом буфере shared memory, что
+        # избавляет от копирования списка Manager каждым скриптом при нажатии.
         self.__keyboard_ring = keyboard_ring
         self.__keyboard_sequence = FieldView(
             engine_state, "keyboard_sequence"
@@ -1501,7 +1501,7 @@ class script:
                         or property_name.startswith("_")
                         or property_name in RESERVED_COMPONENT_PROPERTIES
                         or callable(getattr(self, property_name, None))):
-                    raise ValueError(f"Invalid or reserved component property: {property_name!r}")
+                    raise ValueError(f"Недопустимое или зарезервированное свойство компонента: {property_name!r}")
                 setattr(self, property_name, copy.deepcopy(property_value))
             if self.GameObject.Visual is not None:
                 self.GameObject.Visual.__dict__["_simulation_time_owner"] = self
@@ -1514,10 +1514,10 @@ class script:
 
             self.start()
 
-            # Polling an event list costs one Manager round-trip per script.
-            # Scripts that never define the matching callbacks should not pay
-            # for it (and should not make the Manager copy the whole list on
-            # every key press or click).
+            # Опрос списка событий стоит одного запроса к Manager на скрипт.
+            # Скрипты, не определяющие нужные колбэки, не должны за это
+            # платить (и не должны заставлять Manager копировать весь список
+            # при каждом нажатии клавиши или клике).
             def overrides(name):
                 return getattr(type(self), name) is not getattr(script, name)
 
@@ -1539,22 +1539,22 @@ class script:
             last_fixed_tick = self.__current_tick()
 
             while True:
-                # One lock-free read covers the clock, tick, input and
-                # removal counters plus the pressed-key count.  It used to be
-                # one shared-memory read under a process-shared lock: with a
-                # thousand scripts every worker contended on the same
-                # semaphore and the whole pipeline capped at ~25 updates/s.
-                # Every field here is a single 4-byte value, so a racing
-                # write can only make the snapshot one update stale.
+                # Одно чтение без блокировки охватывает часы, tick, счётчики
+                # ввода и удаления, а также количество нажатых клавиш. Раньше
+                # это было одно чтение shared memory под межпроцессной
+                # блокировкой: при тысяче скриптов все воркеры конкурировали
+                # за один семафор, и весь конвейер упирался в ~25 обновлений/с.
+                # Каждое поле здесь — одно 4-байтовое значение, поэтому гонка
+                # записи может сделать снимок устаревшим лишь на одно обновление.
                 state = self.__engine_state.get_many_lockless(
                     0, ENGINE_STATE_LOOP_FIELDS
                 )
                 now = state["time"]
                 current_tick = int(state["tick"])
 
-                # Manager calls are the expensive part of the loop.  Without
-                # the shared removal counter every script had to ask the
-                # Manager about its object every OBJECT_LIVENESS_PERIOD.
+                # Вызовы Manager — самая дорогая часть цикла. Без общего
+                # счётчика удалений каждый скрипт должен был спрашивать
+                # Manager о своём объекте каждый OBJECT_LIVENESS_PERIOD.
                 generation = state["object_generation"]
                 if generation != self.__last_object_generation:
                     self.__last_object_generation = generation
@@ -1563,8 +1563,8 @@ class script:
                         break
 
                 if state["keyboard_sequence"] != self.__last_keyboard_sequence:
-                    # Key names are published as a snapshot in shared memory,
-                    # so no Manager list proxy and no polling thread is needed.
+                    # Имена клавиш публикуются снимком в shared memory,
+                    # поэтому не нужны ни прокси списка Manager, ни поток опроса.
                     self.__last_keyboard_sequence = state["keyboard_sequence"]
                     self.__pressed_keys = self.__read_pressed_keys(
                         state["key_count"]
@@ -1573,9 +1573,9 @@ class script:
                 self.GlobalTime = now
                 self.__dict__["_simulation_tick"] = current_tick
 
-                # Pointer movement lives in shared memory, so it is checked
-                # locally every iteration.  Keyboard and click events still
-                # use the shared counter and the Manager event list.
+                # Движение указателя живёт в shared memory и проверяется
+                # локально на каждой итерации. События клавиатуры и кликов
+                # по-прежнему используют общий счётчик и список событий Manager.
                 if self.__wants_mouse_motion:
                     self.__dispatch_mouse_motion()
                 wants_mouse_actions = self.__wants_mouse_actions or (
@@ -1592,9 +1592,9 @@ class script:
 
                 self.update()
 
-                # Every script advances through the same shared tick sequence.
-                # A position written during tick N is therefore stored under
-                # exactly the same tick in every process.
+                # Каждый скрипт проходит одну и ту же общую последовательность
+                # tick. Поэтому позиция, записанная во время tick N, сохраняется
+                # под точно тем же tick в каждом процессе.
                 steps = 0
                 while (last_fixed_tick < current_tick
                        and steps < MAX_CATCH_UP_STEPS):
@@ -1604,7 +1604,8 @@ class script:
                     self.GlobalTime = last_fixed_tick * FIXED_DT
                     self.fixed_update()
                 if last_fixed_tick < current_tick:
-                    # Drop excessive catch-up, but never simulate a tick twice.
+                    # Отбрасываем избыточное догоняющее моделирование,
+                    # но никогда не моделируем tick дважды.
                     last_fixed_tick = current_tick
 
                 time.sleep(SCRIPT_UPDATE_PERIOD)
@@ -1652,5 +1653,5 @@ class script:
 
 
 class Component(script):
-    """Reusable object behavior configured by a top-level scene component."""
+    """Переиспользуемое поведение объекта, настраиваемое компонентом верхнего уровня сцены."""
     pass
