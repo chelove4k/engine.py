@@ -29,23 +29,23 @@ class ValueCache:
             try:
                 self.size = self.MEMORY_TYPES_SIZE[type(data)] + 1
             except KeyError as error:
-                raise TypeError(f"Unsupported ValueCache type: {type(data)!r}") from error
+                raise TypeError(f"Неподдерживаемый тип ValueCache: {type(data)!r}") from error
             self._set_format(data)
 
         if name is not None:
             if lock is None:
-                raise ValueError("A shared lock is required when attaching a ValueCache")
+                raise ValueError("При подключении ValueCache требуется общая блокировка")
             self.__memory = shared_memory.SharedMemory(name=name)
             self.lock = lock
             self.name = name
             self._owner = False
-            # The payload type never changes after creation.  Cache the
-            # struct format instead of re-reading the header and rebuilding
-            # the format string on every get()/set().
+            # Тип полезной нагрузки никогда не меняется после создания.
+            # Кэшируем формат struct вместо повторного чтения заголовка
+            # и пересборки строки формата при каждом get()/set().
             self._apply_raw_format(self.__memory.buf[0])
         elif name is None:
             if data is None:
-                raise ValueError("ValueCache requires an initial value or a shared memory name")
+                raise ValueError("ValueCache требует начального значения или имени shared memory")
             self.__memory = shared_memory.SharedMemory(create=True, size=self.size)
             self.lock = multiprocessing.Lock()
             self.name = [None, self.__memory.name, self.lock]
@@ -87,7 +87,7 @@ class ValueCache:
             self.fmt_char = "s"
             self._fmt = f"{MAX_CACHE_STRING_BYTES}s"
         else:
-            raise ValueError(f"Unknown ValueCache payload type: {raw_fml}")
+            raise ValueError(f"Неизвестный тип полезной нагрузки ValueCache: {raw_fml}")
         self._size = MAX_CACHE_STRING_BYTES if self.fmt_char == "s" else 4
         self._struct = struct.Struct(self._fmt)
 
@@ -99,7 +99,7 @@ class ValueCache:
             return "i"
         if raw_fml == 2:
             return f"{MAX_CACHE_STRING_BYTES}s"
-        raise ValueError(f"Unknown ValueCache payload type: {raw_fml}")
+        raise ValueError(f"Неизвестный тип полезной нагрузки ValueCache: {raw_fml}")
 
     def get_size(self):
         return MAX_CACHE_STRING_BYTES if self.get_fml().endswith("s") else 4
@@ -117,8 +117,8 @@ class ValueCache:
             encoded = data.encode("utf-8")
             if len(encoded) > MAX_CACHE_STRING_BYTES:
                 raise ValueError(
-                    f"String value is too long: {len(encoded)} bytes "
-                    f"(maximum {MAX_CACHE_STRING_BYTES})"
+                    f"Строковое значение слишком длинное: {len(encoded)} байт "
+                    f"(максимум {MAX_CACHE_STRING_BYTES})"
                 )
             data = encoded
 
@@ -139,7 +139,7 @@ class ValueCache:
                 pass
 
     def detach(self):
-        """Close this attachment without removing shared memory for other users."""
+        """Закрыть это подключение, не удаляя shared memory для других пользователей."""
         memory = self.__memory
         if memory is None:
             return
@@ -168,20 +168,20 @@ class ObjectCache:
         self._masks = None
         self._dirty_queue = None
         self._dirty_ring_size = 0
-        # Fast path for the engine's hottest write: visual position.  It is
-        # enabled only when x, y and tick occupy one contiguous span and have
-        # the expected types, so no other cache layout changes behaviour.
+        # Быстрый путь для самой частой записи движка: визуальной позиции.
+        # Он включается, только когда x, y и tick занимают один непрерывный
+        # участок и имеют ожидаемые типы, так что раскладка кэша не влияет.
         self._position_struct = None
         self._position_offset = 0
         self._position_length = 0
         self._position_mask = 0
 
         if len(data) > 31:
-            raise ValueError("ObjectCache supports at most 31 fields (32-bit dirty mask)")
+            raise ValueError("ObjectCache поддерживает не более 31 поля (32-битная dirty-маска)")
 
         for bit_index, field_name in enumerate(data):
             if field_name in self._fields:
-                raise ValueError(f"Duplicate ObjectCache field: {field_name!r}")
+                raise ValueError(f"Повторяющееся поле ObjectCache: {field_name!r}")
             size = self.MEMORY_TYPES_SIZE[data[field_name]]
             if data[field_name] is str:
                 fmt_char = f"{size}s"
@@ -192,9 +192,9 @@ class ObjectCache:
 
             self._fields[field_name] = (
                 [self._field_len, self._field_len + size],
-                # Pre-build the struct so get/set do not parse the format
-                # string on every call.  The visual hot path reads several
-                # fields per sprite per frame.
+                # Заранее собираем struct, чтобы get/set не разбирали строку
+                # формата при каждом вызове. Горячий визуальный путь читает
+                # несколько полей на спрайт за кадр.
                 struct.Struct(fmt_char),
             )
             bit_value = 1 << bit_index
@@ -228,10 +228,10 @@ class ObjectCache:
 
         if isinstance(id_or_name, str):
             if locks is None:
-                raise ValueError("A shared lock list is required when attaching an ObjectCache")
+                raise ValueError("При подключении ObjectCache требуется список общих блокировок")
             if capacity is None:
                 raise ValueError(
-                    "capacity is required when attaching an ObjectCache"
+                    "capacity обязателен при подключении ObjectCache"
                 )
             self.__memory = shared_memory.SharedMemory(name=id_or_name)
             self.key = id_or_name
@@ -242,7 +242,7 @@ class ObjectCache:
             self._owner = True
             self.__memory.buf[:] = bytes(self.__memory.size)
         else:
-            raise TypeError("ObjectCache expects a shared memory name or a size in bytes")
+            raise TypeError("ObjectCache ожидает имя shared memory или размер в байтах")
 
         if capacity is None:
             capacity = id_or_name // self.segment_len
@@ -250,14 +250,14 @@ class ObjectCache:
         if capacity < 0 or capacity * self.segment_len > self.__memory.size:
             self._abort_init()
             raise ValueError(
-                "ObjectCache capacity does not fit in shared memory"
+                "Ёмкость ObjectCache не помещается в shared memory"
             )
         self.segments_count = capacity
         self._mask_bytes = self.segments_count * 4
-        # All dirty masks live in one contiguous block at the start of the
-        # shared memory.  A typed view makes per-segment mask access cheap and
-        # lets batch readers skip clean segments without unpacking the mask
-        # from a 100-byte-stride segment.
+        # Все dirty-маски живут одним непрерывным блоком в начале shared
+        # memory. Типизированное представление удешевляет доступ к маске
+        # сегмента и позволяет пакетным читателям пропускать чистые сегменты,
+        # не распаковывая маску из сегмента с шагом в 100 байт.
         self._masks = memoryview(
             self.__memory.buf[:self._mask_bytes]
         ).cast("i")
@@ -269,49 +269,50 @@ class ObjectCache:
         else:
             self.locks = [locks]
 
-        # One counter per lock stripe.  It tracks how many segments in the
-        # stripe currently have a non-zero dirty mask, so a renderer can skip
-        # an entire clean stripe without touching every segment.  The block is
-        # created explicitly by the owner and passed to every attachment;
-        # caches without it keep the old full-scan behaviour.  A writer that
-        # has the block and a reader that does not (or vice versa) would break
-        # the counter invariant, so the block must travel with the cache
-        # descriptor.
+        # Один счётчик на stripe блокировки. Он отслеживает, сколько сегментов
+        # в stripe сейчас имеют ненулевую dirty-маску, чтобы рендерер мог
+        # пропустить целый чистый stripe, не трогая каждый сегмент. Блок
+        # создаёт явно владелец и передаёт каждому подключению; кэши без него
+        # сохраняют старое поведение с полным сканированием. Если блок есть у
+        # писателя, но не у читателя (или наоборот), инвариант счётчика
+        # нарушится, поэтому блок должен передаваться вместе с дескриптором
+        # кэша.
         if dirty_counts is not None and len(dirty_counts) != len(self.locks):
             self._abort_init()
             raise ValueError(
-                "dirty_counts must have one counter per ObjectCache lock"
+                "dirty_counts должен содержать по одному счётчику "
+                "на каждую блокировку ObjectCache"
             )
         self._dirty_counts = dirty_counts
 
-        # Optional per-stripe dirty-id ring.  Unlike the masks, it is a
-        # separate shared array so the cache layout and capacity stay exactly
-        # the same with or without it.  Writers append only on a 0 -> dirty
-        # mask transition while holding the stripe lock, so one segment has at
-        # most one pending ring entry.  A full ring sets the overflow flag and
-        # the reader falls back to scanning the whole stripe.
+        # Необязательное dirty-кольцо id на stripe. В отличие от масок, это
+        # отдельный общий массив, поэтому раскладка и ёмкость кэша остаются
+        # точно такими же с ним и без него. Писатели добавляют запись только
+        # при переходе маски 0 -> dirty, удерживая блокировку stripe, так что
+        # у сегмента не больше одной ожидающей записи в кольце. Заполненное
+        # кольцо выставляет флаг переполнения, и читатель сканирует весь stripe.
         if dirty_queue is not None:
             if dirty_ring_size <= 0:
                 self._abort_init()
                 raise ValueError(
-                    "dirty_ring_size must be positive with dirty_queue"
+                    "dirty_ring_size должен быть положительным при dirty_queue"
                 )
             expected = len(self.locks) * (3 + int(dirty_ring_size))
             if len(dirty_queue) != expected:
                 self._abort_init()
                 raise ValueError(
-                    "dirty_queue size must be locks * (3 + dirty_ring_size)"
+                    "размер dirty_queue должен быть locks * (3 + dirty_ring_size)"
                 )
         elif dirty_ring_size:
             self._abort_init()
             raise ValueError(
-                "dirty_ring_size requires a dirty_queue"
+                "dirty_ring_size требует dirty_queue"
             )
         self._dirty_queue = dirty_queue
         self._dirty_ring_size = int(dirty_ring_size)
 
     def _abort_init(self):
-        """Release everything acquired before a constructor validation error."""
+        """Освободить всё, что было захвачено до ошибки валидации в конструкторе."""
 
         masks = self._masks
         self._masks = None
@@ -348,14 +349,15 @@ class ObjectCache:
         return self._dirty_counts
 
     def has_pending_changes(self):
-        """Return whether any stripe has unread changes.
+        """Возвращает, есть ли в каком-либо stripe непрочитанные изменения.
 
-        Without counters every stripe has to be scanned, so the answer is
-        always ``True``.  With counters this is a lock-free read of one small
-        array, which lets an idle renderer skip building the per-segment
-        grouping entirely.  A writer that races the check can only delay its
-        update by one poll, never lose it: the counter is incremented while
-        holding the same stripe lock that the reader takes before scanning.
+        Без счётчиков каждый stripe приходится сканировать, поэтому ответ
+        всегда ``True``. Со счётчиками это чтение одного небольшого массива
+        без блокировки, что позволяет простаивающему рендереру не строить
+        группировку по сегментам. Писатель, гоняющийся с проверкой, может
+        лишь задержать своё обновление на один опрос, но не потерять его:
+        счётчик увеличивается под той же блокировкой stripe, которую читатель
+        берёт перед сканированием.
         """
 
         counts = self._dirty_counts
@@ -365,18 +367,18 @@ class ObjectCache:
         return self.locks[segment_id % len(self.locks)]
 
     def _mark_dirty_locked(self, lock_index):
-        """Increment one stripe counter.  The caller holds its lock."""
+        """Увеличить счётчик одного stripe. Вызывающий удерживает его блокировку."""
 
         if self._dirty_counts is not None:
             self._dirty_counts[lock_index] += 1
 
     def _enqueue_dirty_locked(self, lock_index, segment_id):
-        """Append a newly dirty segment to its stripe ring.
+        """Добавить новый dirty-сегмент в кольцо его stripe.
 
-        The caller holds the stripe lock and has just observed the mask
-        transition from zero to non-zero, so duplicates are impossible.  A
-        full ring does not advance its tail: the reader will see the overflow
-        flag and scan the whole stripe instead.
+        Вызывающий удерживает блокировку stripe и только что увидел переход
+        маски из нуля в ненулевое значение, поэтому дубликаты невозможны.
+        Заполненное кольцо не сдвигает хвост: читатель увидит флаг
+        переполнения и вместо этого просканирует весь stripe.
         """
 
         queue = self._dirty_queue
@@ -395,7 +397,7 @@ class ObjectCache:
         queue[base + 1] = tail + 1
 
     def _mark_clean_locked(self, segment_id):
-        """Decrement one stripe counter after its mask is cleared."""
+        """Уменьшить счётчик одного stripe после очистки его маски."""
 
         counts = self._dirty_counts
         if counts is None:
@@ -472,7 +474,7 @@ class ObjectCache:
 
     def get_many(self, segment_id: int, object_names):
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         object_names = tuple(object_names)
         plan = self._many_plans.get(object_names)
         if plan is None:
@@ -493,23 +495,24 @@ class ObjectCache:
             return values
 
     def get_many_lockless(self, segment_id: int, object_names):
-        """Read numeric fields without taking the segment lock.
+        """Читать числовые поля без захвата блокировки сегмента.
 
-        The per-script loop reads the engine clock and a few monotonic
-        counters on every iteration.  Acquiring one process-shared lock there
-        serialised every script in every worker on the same semaphore: with
-        1000 scripts the whole pipeline stalled at ~25 updates/s and adding
-        worker processes barely helped.
+        Цикл каждого скрипта читает часы движка и несколько монотонных
+        счётчиков на каждой итерации. Захват одной общей для процессов
+        блокировки там сериализовал все скрипты во всех воркерах на одном
+        семафоре: при 1000 скриптах весь конвейер останавливался на ~25
+        обновлениях/с и добавление воркеров почти не помогало.
 
-        Only fixed-size int/float fields are accepted, and every field is
-        written as one 4-byte value, so a concurrent reader observes either
-        the previous or the new value.  Callers must therefore tolerate a
-        value that is one writer update stale; they must not expect several
-        fields to form one atomic snapshot.
+        Принимаются только поля int/float фиксированного размера, и каждое
+        поле записывается как одно 4-байтовое значение, поэтому параллельный
+        читатель видит либо предыдущее, либо новое значение. Вызывающие
+        поэтому должны допускать значение, отстающее на одну запись
+        писателя; они не должны ожидать, что несколько полей образуют
+        единый атомарный снимок.
         """
 
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         object_names = tuple(object_names)
         plan = self._lockless_plans.get(object_names)
         if plan is None:
@@ -518,7 +521,7 @@ class ObjectCache:
                 bounds, struct_type = self._field(object_name)
                 if struct_type.format not in ("i", "f"):
                     raise TypeError(
-                        "Lock-free reads support only int/float fields: "
+                        "Чтение без блокировки поддерживает только поля int/float: "
                         f"{object_name!r}"
                     )
                 prepared.append((object_name, bounds[0], struct_type))
@@ -534,7 +537,7 @@ class ObjectCache:
 
     def set_many(self, segment_id: int, values):
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         if not values:
             return
 
@@ -545,7 +548,7 @@ class ObjectCache:
                 data = data.encode("utf-8")
                 if len(data) > MAX_CACHE_STRING_BYTES:
                     raise ValueError(
-                        f"String value exceeds {MAX_CACHE_STRING_BYTES} bytes"
+                        f"Строковое значение превышает {MAX_CACHE_STRING_BYTES} байт"
                     )
             packed_data = struct_type.pack(data)
             prepared.append((
@@ -575,15 +578,15 @@ class ObjectCache:
             self._masks[segment_id] = current_mask | changed_mask
 
     def get_position(self, segment_id: int):
-        """Return ``(x, y, tick)`` with one lock and no temporary dict.
+        """Вернуть ``(x, y, tick)`` под одной блокировкой и без временного dict.
 
-        This is the read side of the visual fast path.  It falls back to the
-        generic ``get_many`` when the cache layout does not keep the three
-        values in one contiguous span.
+        Это читающая сторона быстрого визуального пути. Она откатывается к
+        общему ``get_many``, когда раскладка кэша не держит эти три значения
+        одним непрерывным участком.
         """
 
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         if self._position_struct is None:
             values = self.get_many(segment_id, ("x", "y", "tick"))
             return values["x"], values["y"], values["tick"]
@@ -599,10 +602,10 @@ class ObjectCache:
             )
 
     def set_position(self, segment_id: int, x, y, tick):
-        """Write visual ``x``, ``y`` and ``tick`` as one packed span."""
+        """Записать визуальные ``x``, ``y`` и ``tick`` одним упакованным участком."""
 
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         if tick is None:
             self.set_many(segment_id, {"x": x, "y": y})
             return
@@ -633,16 +636,16 @@ class ObjectCache:
             self._masks[segment_id] = current_mask | self._position_mask
 
     def move_position(self, segment_id: int, dx, dy, tick=None):
-        """Add ``dx``/``dy`` and write the new position under one lock.
+        """Прибавить ``dx``/``dy`` и записать новую позицию под одной блокировкой.
 
-        Scripts frequently do ``position = visual.position; position.x += dx;
-        visual.position = position``.  Doing the read and the write through
-        separate cache calls takes two lock round-trips; this method performs
-        the whole read-modify-write while holding the stripe lock once.
+        Скрипты часто делают ``position = visual.position; position.x += dx;
+        visual.position = position``. Чтение и запись через отдельные вызовы
+        кэша требуют двух проходов блокировки; этот метод выполняет всё
+        чтение-изменение-запись, удерживая блокировку stripe один раз.
         """
 
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         if self._position_struct is None:
             x, y, current_tick = self.get_position(segment_id)
             new_x, new_y = x + dx, y + dy
@@ -686,7 +689,7 @@ class ObjectCache:
 
     def _changed_values_locked(self, segment_id: int, current_mask=None,
                                lock_index=None):
-        """Read and clear one segment.  The caller must hold its stripe lock."""
+        """Прочитать и очистить один сегмент. Вызывающий должен держать блокировку stripe."""
 
         if current_mask is None:
             current_mask = self._masks[segment_id]
@@ -695,10 +698,10 @@ class ObjectCache:
 
         buf = self.__memory.buf
         base = self._mask_bytes + segment_id * self._field_len
-        # The hottest visual update is exactly x/y/tick, written by
-        # set_position()/move_position().  Unpack the same contiguous span in
-        # one call instead of walking three dirty bits and three field
-        # lookups.  Any other mask keeps the generic bit walk below.
+        # Самое частое визуальное обновление — ровно x/y/tick, записываемое
+        # set_position()/move_position(). Распаковываем тот же непрерывный
+        # участок одним вызовом вместо обхода трёх dirty-битов и трёх поисков
+        # полей. Для любой другой маски остаётся общий обход битов ниже.
         if (
             self._position_struct is not None
             and current_mask == self._position_mask
@@ -709,9 +712,9 @@ class ObjectCache:
             values = {"x": x, "y": y, "tick": tick}
         else:
             values = {}
-            # Walk the set bits instead of every known field.  Most updates
-            # touch only x/y/tick/rotation, so this avoids 5-8 bit tests per
-            # sprite.
+            # Обходим установленные биты вместо всех известных полей. Большинство
+            # обновлений затрагивают только x/y/tick/rotation, поэтому это
+            # избавляет от 5-8 проверок битов на спрайт.
             mask = current_mask
             while mask:
                 bit_value = mask & -mask
@@ -726,8 +729,8 @@ class ObjectCache:
                 values[field_name] = raw_val
 
         self._masks[segment_id] = 0
-        # Inline the counter decrement for the batch pollers: this runs for
-        # every dirty sprite and a method call plus modulo lookup is visible.
+        # Встраиваем декремент счётчика для пакетных опросчиков: он выполняется
+        # для каждого dirty-спрайта, и вызов метода с поиском по модулю заметен.
         counts = self._dirty_counts
         if counts is not None:
             if lock_index is None:
@@ -738,25 +741,25 @@ class ObjectCache:
         return values
 
     def get_changed_values(self, segment_id: int):
-        """Return and clear the changed fields while holding one segment lock."""
+        """Вернуть и очистить изменённые поля, удерживая блокировку одного сегмента."""
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
 
         with self._lock_for(segment_id):
             return self._changed_values_locked(segment_id) or {}
 
     def get_changed_values_many(self, segment_ids):
-        """Return changed fields for several segments with one lock per stripe.
+        """Вернуть изменённые поля для нескольких сегментов с одной блокировкой на stripe.
 
-        Polling every sprite separately acquires the same striped locks over
-        and over.  Grouping segment ids by lock turns thousands of semaphore
-        operations per frame into at most ``len(self.locks)``.
+        Опрос каждого спрайта по отдельности снова и снова берёт одни и те же
+        полосатые блокировки. Группировка id сегментов по блокировке превращает
+        тысячи операций с семафорами за кадр не более чем в ``len(self.locks)``.
         """
 
         grouped = {}
         for segment_id in segment_ids:
             if segment_id < 0 or segment_id >= self.segments_count:
-                raise IndexError("segment index out of range")
+                raise IndexError("Индекс сегмента выходит за границы")
             grouped.setdefault(segment_id % len(self.locks), []).append(
                 segment_id
             )
@@ -782,14 +785,14 @@ class ObjectCache:
         return result
 
     def _scan_dirty_stripe_locked(self, lock_index, result):
-        """Scan one full stripe and reset its dirty queue.
+        """Просканировать целый stripe и сбросить его dirty-очередь.
 
-        Dense frames are faster with a sequential scan than with a ring drain:
-        a set iteration plus a Python-level ring read costs more than walking
-        the contiguous mask block.  Scanning the whole stripe also clears
-        masks for segments that are no longer in the caller's active set, so
-        the ring can be reset without losing pending ids.  The caller holds
-        the stripe lock.
+        Плотные кадры быстрее при последовательном сканировании, чем при
+        выборке из кольца: итерация по множеству плюс чтение кольца на уровне
+        Python стоят дороже обхода непрерывного блока масок. Сканирование
+        всего stripe также очищает маски сегментов, которых уже нет в активном
+        наборе вызывающего, поэтому кольцо можно сбросить без потери ожидающих
+        id. Вызывающий удерживает блокировку stripe.
         """
 
         masks = self._masks
@@ -812,12 +815,12 @@ class ObjectCache:
             queue[base + 2] = 0
 
     def _drain_dirty_queue_locked(self, lock_index, result):
-        """Move dirty ids from one stripe ring into ``result``.
+        """Перенести dirty-id из кольца одного stripe в ``result``.
 
-        The caller holds the stripe lock.  Without an overflow this visits
-        exactly the ids that became dirty since the previous poll.  On
-        overflow the whole stripe is scanned, including segments that are no
-        longer in the caller's active set, then the ring is reset.
+        Вызывающий удерживает блокировку stripe. Без переполнения обходятся
+        ровно те id, что стали dirty с прошлого опроса. При переполнении
+        сканируется весь stripe, включая сегменты, которых уже нет в активном
+        наборе вызывающего, после чего кольцо сбрасывается.
         """
 
         queue = self._dirty_queue
@@ -849,22 +852,24 @@ class ObjectCache:
         queue[base + 1] = 0
 
     def get_changed_values_by_stripe(self, groups):
-        """Read changes from segment ids that are already grouped by stripe.
+        """Читать изменения из id сегментов, уже сгруппированных по stripe.
 
-        ``groups[lock_index]`` is an iterable of segment ids.  The renderer
-        keeps its active ids grouped this way, so polling does not rebuild a
-        segment-id-to-stripe dictionary on every frame.  Clean stripes are
-        skipped without taking their lock.
+        ``groups[lock_index]`` — итерируемое по id сегментов. Рендерер хранит
+        свои активные id сгруппированными так, поэтому опрос не перестраивает
+        словарь сегмент-в-stripe на каждом кадре. Чистые stripe пропускаются
+        без захвата их блокировки.
 
-        When the cache has a dirty queue, the queue decides which ids are
-        visited and ``groups`` is only used by the overflow fallback.  The
-        queue can briefly report an id whose sprite was just removed; callers
-        must ignore unknown ids (the renderer already does).
+        Когда у кэша есть dirty-очередь, именно очередь решает, какие id
+        посещать, а ``groups`` используется только для запасного пути при
+        переполнении. Очередь может ненадолго сообщить id спрайта, который
+        только что удалили; вызывающие должны игнорировать неизвестные id
+        (рендерер уже это делает).
         """
 
         if len(groups) != len(self.locks):
             raise ValueError(
-                "groups must have one entry per ObjectCache lock"
+                "groups должен содержать по одной записи "
+                "на каждую блокировку ObjectCache"
             )
 
         result = {}
@@ -878,19 +883,19 @@ class ObjectCache:
             try:
                 active_count = len(segment_ids)
             except TypeError:
-                # Keep the density check working for one-shot iterables.
+                # Сохраняем проверку плотности для одноразовых итерируемых.
                 segment_ids = tuple(segment_ids)
                 active_count = len(segment_ids)
             with self.locks[lock_index]:
-                # Re-check under the lock: a writer may have cleared the
-                # stripe between the lock-free peek and this acquisition.
+                # Перепроверяем под блокировкой: писатель мог очистить
+                # stripe между чтением без блокировки и её захватом.
                 if counts is not None and counts[lock_index] == 0:
                     continue
                 if has_queue:
-                    # A dense stripe is cheaper to scan sequentially than to
-                    # drain through the ring one id at a time.  Sparse stripes
-                    # still use the ring, which keeps the common "a few
-                    # scripts moved" frame proportional to the dirty count.
+                    # Плотный stripe дешевле просканировать подряд, чем
+                    # вычерпывать кольцо по одному id. Разреженные stripe
+                    # используют кольцо, что сохраняет типичный кадр "сдвинулись
+                    # несколько скриптов" пропорциональным числу dirty.
                     if (counts is not None
                             and counts[lock_index] * 2 >= active_count):
                         self._scan_dirty_stripe_locked(lock_index, result)
@@ -908,10 +913,10 @@ class ObjectCache:
         return result
 
     def clear_changes(self, segment_id: int):
-        """Drop pending changes for a segment that is no longer observed."""
+        """Сбросить ожидающие изменения для сегмента, который больше не наблюдается."""
 
         if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("segment index out of range")
+            raise IndexError("Индекс сегмента выходит за границы")
         lock_index = segment_id % len(self.locks)
         with self.locks[lock_index]:
             if self._masks[segment_id] == 0:
@@ -963,7 +968,7 @@ class ObjectCache:
                 pass
 
     def detach(self):
-        """Close this attachment without removing shared memory for other users."""
+        """Закрыть это подключение, не удаляя shared memory для других пользователей."""
         memory = self.__memory
         if memory is None:
             return
@@ -973,12 +978,12 @@ class ObjectCache:
 
 
 class FieldView:
-    """Expose one ObjectCache field through the small ValueCache API.
+    """Предоставить доступ к одному полю ObjectCache через небольшой API ValueCache.
 
-    The engine clock, tick and counters now live together in a single
-    segment.  Components that previously expected a dedicated ValueCache can
-    keep calling ``get()``/``set()``; the hot script loop still reads all of
-    them with one ``ObjectCache.get_many()`` call.
+    Часы движка, tick и счётчики теперь живут вместе в одном сегменте.
+    Компоненты, которые раньше ожидали отдельный ValueCache, могут продолжать
+    вызывать ``get()``/``set()``; горячий цикл скрипта по-прежнему читает их
+    все одним вызовом ``ObjectCache.get_many()``.
     """
 
     __slots__ = ("_cache", "_segment_id", "_field")
@@ -1000,5 +1005,5 @@ class FieldView:
         return (self._cache.key, self._segment_id, self._field)
 
     def detach(self):
-        # The view does not own the shared memory; its owner closes it.
+        # Представление не владеет shared memory; его закрывает владелец.
         pass

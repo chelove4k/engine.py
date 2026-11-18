@@ -33,15 +33,15 @@ from memory_lib import FieldView, ObjectCache, ValueCache
 from radon.visitors import ComplexityVisitor
 
 
-# Choose the scene loaded when the engine starts.  Override it for a single
-# run with PYENGINE_SCENE=stress_motion.json (the file lives in access/scenes).
+# Выбор сцены, загружаемой при старте движка. Переопределить для одного
+# запуска: PYENGINE_SCENE=stress_motion.json (файл лежит в access/scenes).
 SCENE_FILE = os.environ.get("PYENGINE_SCENE") or "scene1.json"
 
 
-# Small identity buckets stay as plain lists: creating a manager.list costs
-# a fresh Manager connection (~3 ms on Windows), which is more expensive than
-# copying a short list.  Once a value is shared by enough objects the bucket
-# is promoted once and every later append is O(1).
+# Небольшие buckets идентичности остаются обычными списками: создание
+# manager.list стоит нового подключения к Manager (~3 мс в Windows), что
+# дороже копирования короткого списка. Когда значение разделяют достаточно
+# объектов, bucket один раз повышается, и каждое следующее добавление — O(1).
 INDEX_BUCKET_PROMOTE_AT = 16
 
 
@@ -50,14 +50,14 @@ class Stream:
 
     @staticmethod
     def __connect_index_manager(address, authkey):
-        """Create a Manager client for identity-index buckets.
+        """Создать клиент Manager для buckets индекса идентичности.
 
-        The Stream process receives proxies created by the renderer, but it
-        cannot create new *server-side* objects through them: a proxy created
-        in the Stream process would be owned by that process and disappear
-        when it exits.  A second client connected to the same server creates
-        ``manager.list`` buckets that live in the Manager server and stay
-        valid for every reader.
+        Процесс Stream получает прокси, созданные рендерером, но не может
+        создавать через них новые *серверные* объекты: прокси, созданный в
+        процессе Stream, был бы его собственностью и исчез бы с его выходом.
+        Второй клиент, подключённый к тому же серверу, создаёт buckets
+        ``manager.list``, которые живут в сервере Manager и остаются
+        действительными для всех читателей.
         """
 
         if address is None or authkey is None:
@@ -75,25 +75,26 @@ class Stream:
             return None
 
     def __add_index_value(self, key, object_id):
-        """Append to an identity bucket without rewriting large buckets.
+        """Добавить в bucket идентичности, не переписывая большие buckets.
 
-        Small buckets are plain lists: creating a ``manager.list`` proxy costs
-        a new Manager connection, which is slower than copying a few ids.
-        When a value becomes shared, the bucket is promoted once and every
-        later append moves only one id instead of the whole list.
+        Небольшие buckets — обычные списки: создание прокси ``manager.list``
+        стоит нового подключения к Manager, что медленнее копирования
+        нескольких id. Когда значение становится общим, bucket один раз
+        повышается, и каждое следующее добавление переносит только один id
+        вместо всего списка.
         """
 
         manager = getattr(self, "_index_manager", None)
         if manager is None:
-            # In-process fallback for unit tests and custom embedders.
+            # Запасной путь в процессе для unit-тестов и нестандартных встраиваний.
             bucket = list(self.objects_cache.get(key, ()))
             if object_id not in bucket:
                 bucket.append(object_id)
             self.objects_cache[key] = bucket
             return
 
-        # Stream is the only writer, so it can keep promoted proxies itself
-        # and skip one Manager lookup per object.
+        # Stream — единственный писатель, поэтому он может сам хранить
+        # повышенные прокси и обходиться без одного запроса к Manager на объект.
         buckets = getattr(self, "_index_buckets", None)
         if buckets is None:
             buckets = {}
@@ -110,7 +111,7 @@ class Stream:
             return
 
         if not isinstance(values, list):
-            # Already promoted, but this process lost its local cache.
+            # Уже повышено, но этот процесс потерял свой локальный кэш.
             buckets[key] = values
             values.append(object_id)
             return
@@ -119,7 +120,7 @@ class Stream:
         values.append(object_id)
         if len(values) >= INDEX_BUCKET_PROMOTE_AT:
             bucket = manager.list(values)
-            # Publish the promoted bucket before dropping the plain list.
+            # Публикуем повышенный bucket до отказа от обычного списка.
             self.objects_cache[key] = bucket
             buckets[key] = bucket
         else:
@@ -172,8 +173,8 @@ class Stream:
         render_key = (self.INDEX_PREFIX, "render_id", render_id)
         if self.objects_cache.get(render_key) == object_id:
             self.objects_cache.pop(render_key, None)
-        # Tests and compatibility clients may build a Stream without the
-        # visual cache; layer buckets only exist when it was registered.
+        # Тесты и клиенты совместимости могут собрать Stream без визуального
+        # кэша; buckets слоёв существуют, только если он был зарегистрирован.
         visual_cache = getattr(self, "visual_cache", None)
         if visual_cache is not None:
             layer = visual_cache.get(render_id, "layer")
@@ -245,9 +246,9 @@ class Stream:
                 "scroll_y": float(data.get("scroll_y", 0)),
             }
             is_motion = event_type == "mouse_move"
-            # New renderers publish the pointer snapshot directly to shared
-            # memory and mark the event, so only legacy clients pay for the
-            # extra write here.
+            # Новые рендереры публикуют снимок указателя прямо в shared
+            # memory и отмечают событие, поэтому лишнюю запись здесь делают
+            # только устаревшие клиенты.
             if not data.get("pointer_published"):
                 self.__publish_pointer(event, is_motion)
 
@@ -266,17 +267,17 @@ class Stream:
             self.objects_cache[state_key] = state
 
             if is_motion and self.motion_cache is not None:
-                # Motion is delivered through shared memory.  Keeping it out
-                # of the Manager event list means a moving pointer no longer
-                # wakes the keyboard path or makes every script copy events.
+                # Движение передаётся через shared memory; вне списка событий
+                # Manager оно не будит путь клавиатуры и не заставляет каждый
+                # скрипт копировать события.
                 return
 
             events = list(self.objects_cache.get(events_key) or ())
             sequence = events[-1]["sequence"] + 1 if events else 1
             event["sequence"] = sequence
-            # Scripts only need the newest pointer position.  Keeping every
-            # motion event made each script copy a full 128-event list from
-            # the Manager and replay stale moves that no longer matter.
+            # Скриптам нужна только новейшая позиция указателя. Хранение
+            # всех событий движения заставляло каждый скрипт копировать из
+            # Manager полный список из 128 событий и проигрывать устаревшие.
             if is_motion:
                 events = [
                     pending for pending in events
@@ -313,10 +314,11 @@ class Stream:
         self.__bump_input_sequence()
 
     def __publish_pressed_keys(self, sequence):
-        """Publish the pressed-key snapshot and its sequence atomically.
+        """Опубликовать снимок нажатых клавиш и его последовательность атомарно.
 
-        Scripts read the count and then exactly that many string fields, so
-        stale chunks from a previous snapshot never leak into the key set.
+        Скрипты читают количество, а затем ровно столько строковых полей,
+        поэтому устаревшие фрагменты прошлого снимка не попадают в набор
+        клавиш.
         """
 
         chunks = pack_pressed_keys(self._pressed_keys)
@@ -329,7 +331,7 @@ class Stream:
         self.engine_state.set_many(0, values)
 
     def __publish_keyboard_event(self, data):
-        """Append one key event to the shared-memory ring."""
+        """Добавить одно событие клавиши в кольцо shared memory."""
 
         self._keyboard_sequence += 1
         segment_id = self._keyboard_sequence % self.keyboard_ring.capacity
@@ -343,22 +345,23 @@ class Stream:
             "key": data["key"],
             "modifiers": int(data.get("modifiers", 0)),
         })
-        # Write the event into the ring before advancing the sequence that
-        # scripts poll, so a new sequence always points at a visible event.
+        # Пишем событие в кольцо до продвижения последовательности для скриптов,
+        # чтобы новая последовательность всегда указывала на видимое событие.
         self.__publish_pressed_keys(self._keyboard_sequence)
 
     def __publish_pointer(self, event, motion):
-        """Publish the latest pointer snapshot to shared memory.
+        """Опубликовать последний снимок указателя в shared memory.
 
-        ``seq`` advances only for motion, so scripts can distinguish movement
-        from clicks and wheel events without asking the Manager.
+        ``seq`` продвигается только при движении, поэтому скрипты могут
+        отличать перемещение от кликов и событий колеса, не обращаясь
+        к Manager.
         """
 
         if self.motion_cache is None:
             return
         if motion:
-            # The renderer may already have advanced the sequence through the
-            # direct path; never move it backwards for a legacy client.
+            # Рендерер мог уже продвинуть последовательность через прямой
+            # путь; никогда не двигаем её назад для устаревшего клиента.
             observed = int(self.motion_cache.get(0, "seq"))
             self._motion_sequence = max(self._motion_sequence, observed) + 1
         self.motion_cache.set_many(0, {
@@ -375,7 +378,7 @@ class Stream:
         })
 
     def __bump_input_sequence(self):
-        """Wake script loops only when a real input event arrived."""
+        """Будить циклы скриптов, только когда пришло реальное событие ввода."""
 
         self._input_sequence += 1
         try:
@@ -384,11 +387,12 @@ class Stream:
             pass
 
     def __bump_object_generation(self):
-        """Wake script loops when an object may have been removed.
+        """Будить циклы скриптов, когда объект мог быть удалён.
 
-        Liveness checks used to cost one Manager call per script every
-        ``OBJECT_LIVENESS_PERIOD``.  Now scripts only touch the Manager when
-        this shared counter changes, which happens on actual removals.
+        Проверки живости раньше стоили одного вызова Manager на скрипт каждые
+        ``OBJECT_LIVENESS_PERIOD``. Теперь скрипты обращаются к Manager, только
+        когда меняется этот общий счётчик, а происходит это при реальных
+        удалениях.
         """
 
         self._object_generation += 1
@@ -415,8 +419,8 @@ class Stream:
         if not isinstance(dict_data, dict):
             raise ValueError("Регистрация требует dict_data")
 
-        # Older clients sent a second copy of the object in ``script_data``.
-        # The record already contains the same dict, so new clients omit it.
+        # Старые клиенты присылали вторую копию объекта в ``script_data``.
+        # Запись уже содержит тот же dict, поэтому новые клиенты его опускают.
         script_data = data.get("script_data", dict_data)
         validate_object_data(script_data)
         return object_key, object
@@ -526,13 +530,14 @@ class Stream:
                     "Пакетная регистрация требует непустой список objects"
                 )
 
-            # One clock snapshot for the whole batch.  Individual reads would
-            # add thousands of shared-memory lock round trips on scene load.
+            # Один снимок часов на весь пакет. Отдельные чтения добавили бы
+            # тысячи проходов блокировки shared memory при загрузке сцены.
             state = self.engine_state.get_many(0, ("time", "tick"))
 
             with self.object_lock:
-                # Validate the whole batch before touching shared state, so a
-                # duplicate or a typo does not leave a half-registered batch.
+                # Проверяем весь пакет до изменения общего состояния, чтобы
+                # дубликат или опечатка не оставили пакет наполовину
+                # зарегистрированным.
                 prepared = []
                 seen = set()
                 for index, item in enumerate(objects):
@@ -599,7 +604,7 @@ class Stream:
             return
 
         try:
-            # Script paths in scenes are project-relative, not cwd-relative.
+            # Пути скриптов в сценах относительны проекта, а не текущего каталога.
             resolved_path = resolve_project_path(path)
             complexity = self.get_script_diff(resolved_path)
         except Exception as error:
@@ -658,9 +663,9 @@ class Stream:
             self.objects_cache[id] = object
             render_id = object["_render_id"]
 
-            # Script ownership is still published for compatibility, but the
-            # shared render tick no longer depends on per-object heartbeats.
-            # An idle object simply stops producing visual updates.
+            # Владение скриптом по-прежнему публикуется для совместимости, но
+            # общий render tick больше не зависит от heartbeat каждого объекта.
+            # Простаивающий объект просто перестаёт давать визуальные обновления.
             scripting = dict_data.get("scripting") or {}
             scripted = (
                 bool(scripting.get("scripts"))
@@ -786,7 +791,7 @@ class Stream:
                 self.print(f"Объект #{index} не загружен: {error}")
 
         try:
-            # One registration round trip instead of one per scene object.
+            # Один проход регистрации вместо одного на каждый объект сцены.
             GameObject.register_many(objects)
         except Exception as error:
             self.print(f"Пакетная регистрация не удалась: {error}")
@@ -872,8 +877,8 @@ class Stream:
             int(self.motion_cache.get(0, "seq"))
             if self.motion_cache is not None else 0
         )
-        # A reloaded Stream may attach to a segment where keys are already
-        # held.  Seed the local set from the published snapshot.
+        # Перезагруженный Stream может подключиться к сегменту, где клавиши
+        # уже удерживаются. Заполняем локальный набор из опубликованного снимка.
         self._pressed_keys = set()
         key_count = int(self.engine_state.get(0, "key_count"))
         if key_count > 0:
@@ -900,7 +905,7 @@ class Stream:
         self._index_manager = self.__connect_index_manager(
             manager_address, manager_authkey
         )
-        # Tells script-side find_object("layer") that layer buckets exist.
+        # Сообщает find_object("layer") на стороне скриптов, что buckets слоёв есть.
         self.objects_cache[(self.INDEX_PREFIX, "layer", "__ready__")] = True
 
         self.__start_scripter_runners()

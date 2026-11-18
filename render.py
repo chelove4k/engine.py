@@ -36,23 +36,23 @@ from memory_lib import FieldView, ObjectCache, ValueCache
 
 NO_SPRITE = "None"
 
-# Mouse hit-testing used to walk every render id on every motion event.  A
-# uniform grid keeps that cost proportional to the sprites near the pointer.
-# Dense scenes benefit from small cells: at 32 units a 1000-sprite grid leaves
-# only a handful of candidates per query instead of a hundred-plus.
+# Проверка попадания мыши раньше шла по всем render id на каждом событии
+# движения.  Равномерная сетка ограничивает её спрайтами возле указателя.
+# Плотным сценам выгодны мелкие ячейки: при 32 единицах сетка на 1000
+# спрайтов оставляет лишь несколько кандидатов на запрос вместо сотни.
 HIT_TEST_CELL_SIZE = 32.0
-# Huge sprites (backgrounds) would touch thousands of cells.  Keep them in a
-# separate short list that is checked on every query instead.
+# Огромные спрайты (фоны) задевали бы тысячи ячеек.  Держим их в отдельном
+# коротком списке, который проверяется при каждом запросе.
 HIT_TEST_MAX_CELLS = 32
-# The info overlay reads identity/script data from the Manager once per second
-# instead of once per sprite per frame.  Overlay data is debug output; one
-# second of staleness is harmless, while thousands of Manager reads per frame
-# were enough to sink the frame rate.
+# Информационный оверлей читает данные идентичности/скриптов из Manager раз
+# в секунду, а не раз на спрайт за кадр.  Данные оверлея — отладочный вывод;
+# секундная задержка безвредна, тогда как тысячи чтений Manager за кадр
+# обрушивали частоту кадров.
 INFO_OVERLAY_CACHE_TTL = 1.0
 
 
 def _is_no_sprite(path):
-    """Return True when the scene uses the textual no-sprite marker."""
+    """Возвращает True, если сцена использует текстовый маркер отсутствия спрайта."""
 
     return path is None or (
         isinstance(path, str) and path.strip().casefold() == NO_SPRITE.casefold()
@@ -64,7 +64,7 @@ class Game(arcade.Window):
     POSITION_HISTORY_SIZE = CONFIG_POSITION_HISTORY_SIZE
     SIMULATION_TICK = FIXED_DT
     ACTIVE_SNAPSHOT_WINDOW = SNAPSHOT_ACTIVE_WINDOW
-    # An object that has not published a position for this long is static.
+    # Объект, не публиковавший позицию дольше этого времени, считается статичным.
     INTERPOLATION_IDLE_TICKS = max(
         1, int(round(ACTIVE_SNAPSHOT_WINDOW / SIMULATION_TICK))
     )
@@ -110,9 +110,9 @@ class Game(arcade.Window):
         self.object_cache = data[2]
         self.overlay_settings = overlay_settings or console.OverlaySettings()
         self.visual_cache = ObjectCache(*data[3])
-        # When the cache exposes stripe counters, keep active render ids
-        # pre-grouped by stripe.  Polling then visits only dirty stripes and
-        # does not rebuild a 10k-entry grouping dictionary every frame.
+        # Если кэш отдаёт счётчики полос, активные render id хранятся заранее
+        # сгруппированными по полосам.  Тогда опрос обходит только грязные полосы
+        # и не перестраивает словарь группировки на 10k записей каждый кадр.
         self._render_ids_by_stripe = None
         if self.visual_cache.dirty_counts is not None:
             self._render_ids_by_stripe = [
@@ -120,9 +120,9 @@ class Game(arcade.Window):
             ]
         self.camera_target_cache = data[4]
         self.camera_scale_cache = data[5]
-        # When present, pointer snapshots are published straight to shared
-        # memory.  Sending every coalesced motion event through the Manager
-        # queue added a full IPC round-trip per rendered frame.
+        # Если он есть, снимки указателя публикуются сразу в разделяемую
+        # память.  Отправка каждого объединённого события движения через очередь
+        # Manager добавляла полный IPC-обмен на каждый отрисованный кадр.
         self.motion_cache = data[6] if len(data) > 6 else None
         self._motion_sequence = (
             int(self.motion_cache.get(0, "seq"))
@@ -222,19 +222,19 @@ class Game(arcade.Window):
         return {1: "left", 2: "middle", 4: "right"}.get(button, str(button))
 
     def _sort_render_layers(self):
-        # Rebuilds only happen on add/remove/layer changes.  Each sprite caches
-        # its (layer, -render_id) key so a re-sort does not rebuild the same
-        # tuple and dictionary lookup for every sprite on every rebuild.  A
-        # bucket sort would still have to rebuild arcade's GPU index buffer,
-        # so the small Python-side win is not worth touching SpriteList
-        # internals.
+        # Перестройка бывает только при добавлении/удалении/смене слоя.  Каждый
+        # спрайт кэширует свой ключ (layer, -render_id), чтобы сортировка не
+        # создавала заново тот же кортеж и не искала его в словаре для каждого
+        # спрайта при каждой перестройке.  Бакетная сортировка всё равно потребовала
+        # бы перестроить индексный буфер GPU в arcade, поэтому небольшой выигрыш
+        # на стороне Python не стоит вмешательства во внутренности SpriteList.
         if not self._render_order_dirty:
             return
         self.renders.sort(key=lambda sprite: sprite._engine_sort_key)
         self._render_order_dirty = False
 
     def _hit_drop_cells(self, render_id):
-        """Remove one sprite from the spatial hit-test grid."""
+        """Удаляет один спрайт из пространственной сетки проверки попаданий."""
 
         geometry = self._hit_geometry_by_render_id.pop(render_id, None)
         bounds = self._hit_bounds_by_render_id.pop(render_id, None)
@@ -259,9 +259,9 @@ class Game(arcade.Window):
     def _hit_remove(self, render_id):
         self._hit_drop_cells(render_id)
         self._hit_dirty_ids.discard(render_id)
-        # Recompute only once the last sprite at the current maximum is gone.
-        # Ties and re-indexing must not turn unloading a large scene into an
-        # O(n^2) full scan of every remaining hit box.
+        # Пересчитываем, только когда исчез последний спрайт с текущим
+        # максимумом.  Совпадения и переиндексация не должны превращать выгрузку
+        # большой сцены в полный перебор всех оставшихся hit box за O(n^2).
         if self._hit_max_count:
             return
         best_extent = 0.0
@@ -277,30 +277,30 @@ class Game(arcade.Window):
         self._hit_max_count = best_count
 
     def _hit_mark_dirty(self, render_id):
-        """Queue a sprite for re-indexing on the next hit-test query.
+        """Ставит спрайт в очередь на переиндексацию при следующем запросе hit-test.
 
-        Positions change every frame for moving sprites, so indexing eagerly
-        would add work even when the pointer never moves.  The dirty set is
-        only flushed when somebody actually asks what is under the cursor.
+        У движущихся спрайтов позиция меняется каждый кадр, поэтому индексация
+        заранее добавляла бы работу, даже когда указатель не двигается.  Набор
+        «грязных» сбрасывается, лишь когда кто-то спрашивает, что под курсором.
         """
 
         if render_id in self._sprites_by_render_id:
             self._hit_dirty_ids.add(render_id)
 
     def _hit_mark_position(self, render_id, x, y):
-        """Queue a moved sprite only when its hit box leaves its grid cells.
+        """Ставит перемещённый спрайт в очередь, только если его hit box вышел из ячеек.
 
-        Moving within the same cells cannot change which pointer cell contains
-        the sprite, so a full remove/re-add round trip is wasted work.  The
-        packed geometry stores the centre range that stays inside the indexed
-        cells, so checking a moved sprite costs four comparisons instead of
-        four floor divisions and multiplications.
+        Перемещение внутри тех же ячеек не меняет ячейку указателя, накрывающую
+        спрайт, поэтому полный цикл удаления и повторного добавления — лишняя
+        работа.  Упакованная геометрия хранит диапазон центров, остающихся внутри
+        индексированных ячеек, поэтому проверка перемещённого спрайта стоит четыре
+        сравнения вместо четырёх делений с округлением вниз и умножений.
         """
 
         if render_id in self._hit_dirty_ids:
             return
-        # Large sprites are checked directly on every query, so their movement
-        # never needs to touch the grid.
+        # Большие спрайты проверяются напрямую при каждом запросе, поэтому их
+        # перемещение вообще не должно трогать сетку.
         if render_id in self._hit_large_ids:
             return
 
@@ -309,8 +309,8 @@ class Game(arcade.Window):
             self._hit_mark_dirty(render_id)
             return
 
-        # The packed tuple already stores the range of centres for which the
-        # sprite's hit box stays inside its indexed cells.
+        # Упакованный кортеж уже хранит диапазон центров, при которых
+        # hit box спрайта остаётся внутри проиндексированных ячеек.
         if (geometry[4] <= x < geometry[5]
                 and geometry[6] <= y < geometry[7]):
             return
@@ -320,10 +320,10 @@ class Game(arcade.Window):
         dirty = self._hit_dirty_ids
         moving = self._moving_render_ids
         if moving:
-            # Position updates and interpolation only track motion.  The
-            # grid is refreshed lazily, when a pointer query actually needs
-            # it, so an idle pointer does not pay a cell check per sprite
-            # per drawn frame.
+            # Обновления позиции и интерполяция отслеживают только движение.
+            # Сетка обновляется лениво, когда она действительно нужна запросу
+            # указателя, поэтому неподвижный указатель не платит проверкой
+            # ячейки за каждый спрайт в каждом отрисованном кадре.
             sprites = self._sprites_by_render_id
             geometry_by_id = self._hit_geometry_by_render_id
             large_ids = self._hit_large_ids
@@ -333,9 +333,9 @@ class Game(arcade.Window):
             else:
                 pointer_x, pointer_y = point
                 max_extent = self._hit_max_extent
-            # Membership checks are only needed when those sets are non-empty.
-            # In the common case both are empty and this loop stays a tight
-            # distance test over the moving sprites.
+            # Проверки принадлежности нужны, только когда эти наборы непусты.
+            # В обычном случае оба пусты, и цикл остаётся быстрой проверкой
+            # расстояния по движущимся спрайтам.
             check_dirty = bool(dirty)
             check_large = bool(large_ids)
             for render_id in moving:
@@ -347,10 +347,10 @@ class Game(arcade.Window):
                 if sprite is None:
                     continue
                 x, y = sprite.position
-                # A sprite farther from the pointer than the largest hit
-                # half-size cannot cover it.  Its stale grid entry cannot
-                # change this query; it is refreshed once the pointer comes
-                # close, or by the next unpinned index pass.
+                # Спрайт, удалённый от указателя дальше максимального
+                # полуразмера hit box, не может его накрыть.  Устаревшая запись
+                # в сетке не влияет на этот запрос; она обновится, когда указатель
+                # приблизится, или при следующем проходе индексации без привязки.
                 if (abs(x - pointer_x) > max_extent
                         or abs(y - pointer_y) > max_extent):
                     continue
@@ -392,9 +392,9 @@ class Game(arcade.Window):
             self._hit_bounds_by_render_id[render_id] = (
                 local_left, local_right, local_bottom, local_top,
             )
-            # Largest distance from a sprite centre to its hit-box edge.
-            # _hit_test() uses it to skip sprites that cannot cover the
-            # pointer before touching their full polygon.
+            # Наибольшее расстояние от центра спрайта до края его hit box.
+            # _hit_test() использует его, чтобы пропускать спрайты, которые не
+            # могут накрыть указатель, не трогая их полный полигон.
             extent = max(
                 -local_left, local_right, -local_bottom, local_top,
             )
@@ -415,9 +415,9 @@ class Game(arcade.Window):
                     ).add(render_id)
             # (cell_min_x, cell_min_y, cell_max_x, cell_max_y,
             #  centre_min_x, centre_max_x, centre_min_y, centre_max_y).
-            # The centre range is precomputed so a moving sprite only has to
-            # compare four floats instead of multiplying cell bounds by the
-            # cell size and adding its local hit-box offsets on every query.
+            # Диапазон центров вычислен заранее, поэтому движущемуся спрайту нужно
+            # сравнить четыре float, а не умножать границы ячеек на размер ячейки
+            # и прибавлять локальные смещения hit box при каждом запросе.
             self._hit_geometry_by_render_id[render_id] = (
                 min_cell_x,
                 min_cell_y,
@@ -430,7 +430,7 @@ class Game(arcade.Window):
             )
 
     def _hit_test(self, point):
-        """Return the topmost visible render id under a world-space point."""
+        """Возвращает самый верхний видимый render id под точкой в мировых координатах."""
 
         self._hit_index_dirty(point)
         cell_size = HIT_TEST_CELL_SIZE
@@ -450,8 +450,8 @@ class Game(arcade.Window):
                 return
             bounds = bounds_by_id.get(render_id)
             if bounds is not None:
-                # Cheap AABB rejection first: one polygon test costs more
-                # than every comparison in a dense cell combined.
+                # Сначала дешёвое отсечение по AABB: одна проверка полигона
+                # стоит больше, чем все сравнения в плотной ячейке вместе.
                 offset_x = pointer_x - sprite.center_x
                 if offset_x < bounds[0] or offset_x > bounds[1]:
                     return
@@ -460,8 +460,8 @@ class Game(arcade.Window):
                     return
             if not sprite.collides_with_point(point):
                 return
-            # Same ordering as the sprite list: highest layer wins, and a
-            # lower render id wins a layer tie.
+            # Тот же порядок, что в списке спрайтов: побеждает старший слой,
+            # а при равных слоях — меньший render id.
             layer = world_data[render_id]["layer"]
             key = (layer, -render_id)
             if best_key is None or key > best_key:
@@ -476,11 +476,11 @@ class Game(arcade.Window):
 
     def _publish_pointer_snapshot(self, event_type, render_id, point,
                                   screen_x, screen_y, dx, dy):
-        """Write the latest pointer state to shared memory.
+        """Записывает последнее состояние указателя в разделяемую память.
 
-        Returns ``True`` when the snapshot was published.  Motion events then
-        do not need the Manager queue at all; discrete events still go there
-        for the click/keyboard event lists.
+        Возвращает ``True``, если снимок опубликован.  После этого событиям
+        движения очередь Manager вообще не нужна; дискретные события по-прежнему
+        идут туда для списков событий кликов и клавиатуры.
         """
 
         motion_cache = getattr(self, "motion_cache", None)
@@ -526,13 +526,13 @@ class Game(arcade.Window):
         })
 
     def _queue_mouse_motion(self, x, y, dx, dy):
-        """Coalesce motion events so hit-testing runs once per frame.
+        """Объединяет события движения, чтобы hit-test выполнялся раз в кадр.
 
-        A high-polling-rate mouse can produce hundreds of motion events per
-        frame.  Testing every sprite for every event made the renderer spend
-        all its time inside ``on_mouse_motion`` and dropped FPS to zero on a
-        large scene.  Keeping only the newest position and the accumulated
-        delta preserves the frame-level meaning of the event.
+        Мышь с высокой частотой опроса может порождать сотни событий движения
+        за кадр.  Проверка каждого спрайта на каждое событие заставляла рендерер
+        всё время проводить внутри ``on_mouse_motion`` и роняла FPS до нуля на
+        большой сцене.  Сохранение только новейшей позиции и накопленной дельты
+        сохраняет смысл события на уровне кадра.
         """
 
         pending = self._pending_mouse_motion
@@ -552,7 +552,7 @@ class Game(arcade.Window):
         self._send_mouse_event("mouse_move", x, y, dx=dx, dy=dy)
 
     def on_mouse_press(self, x, y, button, modifiers):
-        # Preserve enter/exit ordering before a click at the same position.
+        # Сохраняем порядок входа/выхода перед кликом в той же позиции.
         self._flush_mouse_motion()
         self._send_mouse_event("mouse_down", x, y, button)
 
@@ -593,8 +593,8 @@ class Game(arcade.Window):
                     try:
                         self._add_sprite(data)
                     except Exception:
-                        # A bad asset or malformed render command must not kill
-                        # the whole render loop.
+                        # Некорректный ресурс или неверная команда рендера не должны
+                        # обрывать весь цикл отрисовки.
                         self.print("Ошибка добавления спрайта")
                         traceback.print_exc()
 
@@ -604,9 +604,9 @@ class Game(arcade.Window):
                 case 'clear':
                     self._clear(data)
 
-        # Check active sprites only; scanning the full cache capacity each
-        # frame is costly.  With stripe counters the active ids are kept
-        # pre-grouped, so a dirty frame touches only dirty stripes.
+        # Проверяем только активные спрайты; сканирование всей ёмкости кэша
+        # каждый кадр дорого.  Со счётчиками полос активные id хранятся заранее
+        # сгруппированными, поэтому грязный кадр задевает только грязные полосы.
         buckets = getattr(self, "_render_ids_by_stripe", None)
         if self._sprites_by_render_id:
             counts = getattr(self.visual_cache, "dirty_counts", None)
@@ -648,18 +648,18 @@ class Game(arcade.Window):
             self.camera.zoom = scale
 
     def _current_tick(self):
-        """Return the current shared simulation tick as a float."""
+        """Возвращает текущий общий tick симуляции в виде float."""
 
         if self.tick_cache is not None:
             return float(self.tick_cache.get())
         return (time.monotonic() - self.clock_origin) / self.SIMULATION_TICK
 
     def _append_position_sample(self, render_id, tick, x, y):
-        """Append an already-normalised sample to one position history.
+        """Добавляет уже нормализованный отсчёт в одну историю позиций.
 
-        This is the hot path used by ``_apply_update``: values come from the
-        visual cache or from ``world_data``, so they are already numeric and
-        do not need float/int coercions on every moving sprite.
+        Это горячий путь, используемый ``_apply_update``: значения приходят из
+        visual cache или из ``world_data``, поэтому они уже числовые и не требуют
+        приведения к float/int на каждом движущемся спрайте.
         """
 
         history = self._position_history_by_render_id.get(render_id)
@@ -676,10 +676,10 @@ class Game(arcade.Window):
         history.append((tick, x, y))
 
     def _record_position(self, render_id, position, tick=None):
-        """Store a position sample keyed by the simulation tick.
+        """Сохраняет отсчёт позиции с привязкой к tick симуляции.
 
-        All entities use the same tick domain, so there are no independent
-        wall-clock timestamps that could drift apart.
+        Все сущности используют одно пространство tick, поэтому нет независимых
+        меток системного времени, которые могли бы разойтись.
         """
 
         if tick is None:
@@ -701,13 +701,13 @@ class Game(arcade.Window):
 
     @staticmethod
     def _position_from_history(history, query_tick):
-        """Interpolate one history without another dictionary lookup."""
+        """Интерполирует одну историю без дополнительного поиска в словаре."""
 
         if not history:
             return None
 
-        # Clamp first: most queries fall outside or near the newest sample,
-        # and the common clamp path avoids bisect plus range checks.
+        # Сначала ограничиваем диапазоном: большинство запросов лежат вне его или у
+        # новейшего отсчёта, и обычный путь обходится без bisect и проверок диапазона.
         last = history[-1]
         if query_tick >= last[0]:
             return last[1], last[2]
@@ -728,7 +728,7 @@ class Game(arcade.Window):
         )
 
     def _position_at_tick(self, render_id, query_tick):
-        """Return the position of an entity at one shared simulation tick."""
+        """Возвращает позицию сущности на заданном общем tick симуляции."""
 
         return self._position_from_history(
             self._position_history_by_render_id.get(render_id),
@@ -736,13 +736,13 @@ class Game(arcade.Window):
         )
 
     def _resolve_render_tick(self):
-        """Return the shared interpolation tick for this frame.
+        """Возвращает общий tick интерполяции для этого кадра.
 
-        The render clock is a smooth wall-clock timeline.  Each sprite is
-        sampled at this tick; ``_position_at_tick`` holds the newest sample
-        for an object that has not published that far yet.  A script that
-        falls behind therefore holds only its own objects instead of
-        freezing the whole frame and jumping forward later.
+        Часы рендера — это плавная шкала системного времени.  Каждый спрайт
+        отсчитывается на этом tick; ``_position_at_tick`` удерживает новейший
+        отсчёт для объекта, который ещё не успел опубликовать позицию так далеко.
+        Отставший скрипт поэтому удерживает только свои объекты, а не замораживает
+        весь кадр с последующим скачком вперёд.
         """
 
         now = time.monotonic()
@@ -753,11 +753,11 @@ class Game(arcade.Window):
         return max(0.0, render_tick)
 
     def _interpolate_sprite_positions(self, render_tick):
-        """Interpolate only sprites that published a position recently.
+        """Интерполирует только спрайты, недавно публиковавшие позицию.
 
-        Static sprites already sit at their final position, so touching every
-        sprite each frame is wasted work: a scene with thousands of walls paid
-        the same per-frame cost as a scene where everything moves.
+        Статичные спрайты уже находятся в конечной позиции, поэтому трогать
+        каждый спрайт каждый кадр — пустая работа: сцена с тысячами стен платила
+        столько же за кадр, сколько сцена, где всё движется.
         """
 
         moving = self._moving_render_ids
@@ -782,10 +782,10 @@ class Game(arcade.Window):
             if sprite is not None:
                 position = interpolate(history, render_tick)
                 if sprite.position != position:
-                    # One position setter updates arcade's hit box and sprite
-                    # list slot once; center_x/center_y would do it twice.
-                    # Hit-grid refresh is lazy: _hit_index_dirty() checks the
-                    # current center of every moving sprite on query.
+                    # Один установщик позиции обновляет hit box arcade и слот в
+                    # списке спрайтов за раз; center_x/center_y сделали бы это дважды.
+                    # Обновление сетки попаданий ленивое: _hit_index_dirty() проверяет
+                    # текущий центр каждого движущегося спрайта при запросе.
                     sprite.position = position
 
             if history[-1][0] < idle_before:
@@ -802,18 +802,18 @@ class Game(arcade.Window):
             sprite = sprites.get(render_id)
             world_data = world_positions.get(render_id)
             if sprite is not None and world_data is not None:
-                # Snap to the last received sample before going static.
+                # Фиксируем последний полученный отсчёт перед переходом в статику.
                 sprite.position = world_data["position"]
-                # Interpolation is skipped for this id from now on, so the
-                # hit grid must be refreshed here instead.
+                # Для этого id интерполяция с этого момента пропускается, поэтому
+                # сетку попаданий нужно обновить здесь.
                 mark_position(
                     render_id, sprite.center_x, sprite.center_y
                 )
 
     def _track_camera_target(self, render_tick):
-        # The tracked object may have been removed without a renderer update
-        # (for example while the render queue was being processed). Do not
-        # keep a camera on a stale render id.
+        # Отслеживаемый объект могли удалить без обновления рендерера
+        # (например, пока обрабатывалась очередь рендера). Не держим
+        # камеру на устаревшем render id.
         if (self._camera_target_id >= 0
                 and self._camera_target_id not in self._sprites_by_render_id):
             self._camera_target_id = -1
@@ -855,7 +855,7 @@ class Game(arcade.Window):
                 )
 
     def _info_static_for(self, render_id, now):
-        """Return cached identity/scripts for the info overlay."""
+        """Возвращает кэшированные идентичность/скрипты для информационного оверлея."""
 
         cached = self._info_static_cache.get(render_id)
         if cached is not None and cached[0] >= now:
@@ -954,14 +954,14 @@ class Game(arcade.Window):
         return str(asset_path.resolve())
 
     def _texture_for_path(self, path):
-        """Resolve a sprite path, or return a transparent texture for "None"."""
+        """Разрешает путь к спрайту или возвращает прозрачную текстуру для "None"."""
 
         if _is_no_sprite(path):
             return self._no_sprite_texture
         return self._load_texture(self._resolve_asset_path(path))
 
     def _load_texture(self, path):
-        """Load a texture, returning a visible placeholder on failure."""
+        """Загружает текстуру, возвращая видимую заглушку при ошибке."""
 
         texture = self._textures.get(path)
         if texture is not None:
@@ -1099,15 +1099,15 @@ class Game(arcade.Window):
         if world_data is None:
             return
 
-        # Moving sprites publish exactly {'x', 'y'} or {'x', 'y', 'tick'}.
-        # Keep that case free of the nine dictionary membership tests and of
-        # the float/int coercions in _record_position.
+        # Движущиеся спрайты публикуют ровно {'x', 'y'} или {'x', 'y', 'tick'}.
+        # Для этого случая обходимся без девяти проверок наличия в словаре и без
+        # приведения к float/int в _record_position.
         key_count = len(object_data)
 
-        # Single-field updates are common for non-position changes (layer
-        # switches, alpha fades, a collider rotation).  Handle them before the
-        # generic path so they skip seven membership tests and the position
-        # bookkeeping that cannot apply to them.
+        # Обновления одного поля часты при изменениях, не связанных с позицией
+        # (смена слоя, затухание alpha, поворот коллайдера).  Обрабатываем их до
+        # общего пути, чтобы они пропускали семь проверок наличия и учёт позиции,
+        # который к ним неприменим.
         if key_count == 1:
             if 'tick' in object_data:
                 tick = int(object_data['tick'])
@@ -1168,8 +1168,8 @@ class Game(arcade.Window):
                     if tick is None:
                         tick = int(self._current_tick())
                 self._append_position_sample(id, tick, new_x, new_y)
-                # The hit grid is refreshed lazily on the next pointer query;
-                # marking here would repeat the same cell check per update.
+                # Сетка попаданий обновляется лениво при следующем запросе указателя;
+                # отметка здесь повторяла бы одну и ту же проверку ячейки на обновление.
             return
 
         if 'sprite' in object_data:
@@ -1221,9 +1221,9 @@ class Game(arcade.Window):
             self._render_order_dirty = True
 
         if position_changed:
-            # Repeated identical positions are heartbeat noise, not motion.
-            # Sending them to history would keep a static sprite in the
-            # interpolation set forever.
+            # Повторяющиеся одинаковые позиции — шум heartbeat, а не движение.
+            # Их отправка в историю навсегда оставила бы статичный спрайт в
+            # наборе интерполяции.
             self._moving_render_ids.add(id)
             record_tick = tick
             if record_tick is None:
@@ -1238,8 +1238,8 @@ class Game(arcade.Window):
             sprite.alpha = int(world_data['alpha'] * 255)
         if geometry_changed:
             self._hit_mark_dirty(id)
-        # Position-only updates are re-indexed lazily by _hit_index_dirty();
-        # see the fast path above.
+        # Обновления только позиции переиндексируются лениво в _hit_index_dirty();
+        # см. быстрый путь выше.
 
     def _apply_world_transform(self, sprite, world_data):
         world_x, world_y = world_data['position']
@@ -1326,8 +1326,8 @@ def main():
     visual_struct =  {
         'x' : float,
         'y' : float,
-        # tick follows x/y so the hottest visual write is one contiguous
-        # span and ObjectCache.set_position() can pack it in one call.
+        # tick идёт сразу за x/y, поэтому самая горячая запись в visual — один
+        # непрерывный диапазон, и ObjectCache.set_position() упаковывает его за вызов.
         'tick' : int,
         'sim_time': float,
         'rotation' : float,
@@ -1376,7 +1376,7 @@ def main():
     ]
 
     proccess_status_info = manager.list()
-    # All engine counters share one segment; scripts read them in one lock.
+    # Счётчики движка лежат в одном сегменте; скрипты читают их под одной блокировкой.
     raw_engine_state = ObjectCache(
         ENGINE_STATE_SEGMENT_BYTES,
         ENGINE_STATE_STRUCT,
@@ -1394,8 +1394,8 @@ def main():
         MOUSE_MOTION_STRUCT,
         [multiprocessing.Lock() for _ in range(8)],
     )
-    # Zeroed shared memory would report ``hovered=0`` before the first mouse
-    # event, which looks like a hover over render_id 0 to the scripts.
+    # Обнулённая разделяемая память сообщала бы ``hovered=0`` до первого события
+    # мыши, а скриптам это выглядит как наведение на render_id 0.
     raw_motion_cache.set_many(0, {
         "seq": 0,
         "x": 0.0,
