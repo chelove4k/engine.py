@@ -30,6 +30,7 @@ from config import (
     SCRIPT_UPDATE_PERIOD,
     SNAPSHOT_ACTIVE_WINDOW,
 )
+from caches import IdCache, VisualCache
 from memory_lib import FieldView, ObjectCache, ValueCache
 
 
@@ -1295,12 +1296,6 @@ class MainOutQueue(ManagedQueue):
     pass
 
 class ProccesInQueue(ManagedQueue):
-    pass
-
-class VisualCache(ObjectCache):
-    pass
-
-class IdCache(ObjectCache):
     pass
 
 def tact_counter(start, tact_time, EngineState, stop_event):

@@ -31,7 +31,8 @@ from config import (
     SCRIPT_UPDATE_PERIOD,
     unpack_pressed_keys,
 )
-from memory_lib import FieldView, ObjectCache, ValueCache
+from caches import IdCache, VisualCache
+from memory_lib import FieldView, ValueCache
 from scene import (
     RESERVED_COMPONENT_PROPERTIES,
     component_specs_from_data,
@@ -77,12 +78,6 @@ def _deps_from_stack() -> dict:
             if dependency is not None:
                 found[dependency] = value
     return found
-
-class VisualCache(ObjectCache):
-    pass
-
-class IdCache(ObjectCache):
-    pass
 
 class Vector2:
     def __init__(self, x: float = 0.0, y: float = 0.0):

@@ -4,15 +4,9 @@ import sys
 import threading
 import traceback
 
+from caches import IdCache, VisualCache
 from config import PROJECT_DIR, resolve_project_path
 from memory_lib import FieldView, ObjectCache
-
-
-class VisualCache(ObjectCache):
-    pass
-
-class IdCache(ObjectCache):
-    pass
 
 
 class scripter_runner:
