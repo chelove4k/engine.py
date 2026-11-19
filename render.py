@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import multiprocessing
-import os
 import queue
 import threading
 import time
@@ -1316,8 +1315,10 @@ def main():
     main_in_stream = MainInQueue(manager)
     main_out_stream = MainOutQueue(manager)
 
-    cpu_count = os.cpu_count() or 1
-    worker_count = max(1, cpu_count - 3)
+    # Один процесс симуляции с кооперативным планировщиком.  Очередь и
+    # status-list пока сохранены для совместимости Stream, но воркеры больше
+    # не размножаются по числу ядер: скрипты выполняет один поток.
+    worker_count = 1
     worker_queues = [ProccesInQueue(manager) for _ in range(worker_count)]
     worker_ready = manager.list([False] * worker_count)
 

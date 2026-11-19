@@ -1,18 +1,30 @@
 import importlib.util
 import queue
 import sys
-import threading
+import time
 import traceback
 
 from caches import IdCache, VisualCache
-from config import PROJECT_DIR, resolve_project_path
+from config import PROJECT_DIR, SCRIPT_UPDATE_PERIOD, resolve_project_path
 from memory_lib import FieldView, ObjectCache
 
 
 class scripter_runner:
+    """Один процесс, который кооперативно выполняет все скрипты.
+
+    Раньше каждый скрипт получал собственный поток внутри воркера.  Теперь
+    экземпляры скриптов живут в общем списке, а цикл по очереди вызывает
+    ``step()`` у каждого.  Это убирает thread-per-script и оставляет ровно
+    один поток симуляции на процесс.
+    """
 
     def print(self, *args, **kwargs):
-        prefix = f"[CORE {self.id:02d} : {self.core_time.get():.4f}]"
+        try:
+            now = self.core_time.get()
+        except Exception:
+            now = 0.0
+        prefix = f"[CORE {self.id:02d} : {now:.4f}]"
+        kwargs.setdefault("flush", True)
         print(prefix, *args, **kwargs)
 
     def _release_status(self, complexity):
@@ -24,18 +36,6 @@ class scripter_runner:
                 self.proccess_status_info[self.id] = max(0, current - complexity)
         except (EOFError, BrokenPipeError, OSError):
             return
-
-    def wrapper(self, func, arg, complexity, data):
-        path = data.get("path", "?")
-        self.print(f"Запущен {path}")
-
-        try:
-            func(*arg)
-        except Exception:
-            traceback.print_exc()
-        finally:
-            self._release_status(complexity)
-            self.print(f"Остановлен {path}")
 
     def __init__(
         self,
@@ -67,6 +67,8 @@ class scripter_runner:
         )
         self.id = id
         self._script_modules = {}
+        self._scripts = {}
+        self._next_script_id = 0
         if str(PROJECT_DIR) not in sys.path:
             sys.path.insert(0, str(PROJECT_DIR))
         self.render_in_stream = render_in_stream
@@ -85,19 +87,9 @@ class scripter_runner:
 
         self.worker_ready[id] = True
         try:
-            while True:
-                try:
-                    data = self.worker_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                except (EOFError, BrokenPipeError, OSError):
-                    return
-                if data is None:
-                    continue
-                if data.get("proc_id") != id:
-                    continue
-                self.__start_script(data)
+            self.__loop()
         finally:
+            self.__shutdown_all()
             try:
                 self.worker_ready[id] = False
             except (EOFError, BrokenPipeError, OSError):
@@ -107,6 +99,65 @@ class scripter_runner:
                 self.motion_cache.detach()
             if self.keyboard_ring is not None:
                 self.keyboard_ring.detach()
+
+    def __loop(self):
+        while True:
+            try:
+                self.__run_once()
+            except (EOFError, BrokenPipeError, OSError):
+                # Manager или общая очередь уже закрыты: штатное завершение.
+                return
+            time.sleep(SCRIPT_UPDATE_PERIOD)
+
+    def __run_once(self):
+        """Один проход: принять команды и шагнуть каждый живой скрипт.
+
+        Ошибка одного скрипта отправляет в ``shutdown()`` только его: общий
+        поток симуляции и остальные скрипты продолжают работу.
+        """
+
+        self.__drain_commands()
+        for token, entry in list(self._scripts.items()):
+            instance = entry[0]
+            try:
+                alive = instance.step()
+            except (EOFError, BrokenPipeError, OSError):
+                raise
+            except Exception:
+                traceback.print_exc()
+                alive = False
+            if not alive:
+                self.__stop_script(token)
+
+    def __drain_commands(self):
+        while True:
+            try:
+                data = self.worker_queue.get_nowait()
+            except queue.Empty:
+                return
+            except (EOFError, BrokenPipeError, OSError):
+                return
+            if data is None:
+                continue
+            if data.get("proc_id") != self.id:
+                continue
+            self.__start_script(data)
+
+    def __stop_script(self, token):
+        entry = self._scripts.pop(token, None)
+        if entry is None:
+            return
+        instance, complexity, path = entry
+        try:
+            instance.shutdown()
+        except Exception:
+            traceback.print_exc()
+        self._release_status(complexity)
+        self.print(f"Остановлен {path}")
+
+    def __shutdown_all(self):
+        for token in list(self._scripts):
+            self.__stop_script(token)
 
     def __load_script_module(self, path):
         """Загружает скрипт по пути к файлу независимо от текущего каталога."""
@@ -137,9 +188,10 @@ class scripter_runner:
         visual_attachment = None
         id_attachment = None
         complexity = int(data.get("complexity", 0) or 0)
+        path = data.get("path", "?")
 
         try:
-            resolved_path = resolve_project_path(data["path"])
+            resolved_path = resolve_project_path(path)
             name = resolved_path.stem
             obj_data = data["script_data"]
 
@@ -149,39 +201,35 @@ class scripter_runner:
             visual_attachment = VisualCache(*self.visual_cache)
             id_attachment = IdCache(*self.id_cache)
 
-            thread = threading.Thread(
-                target=self.wrapper,
-                args=(
-                    script_class,
-                    (
-                        self.render_in_stream,
-                        self.change_in_stream,
-                        self.main_in_stream,
-                        self.main_out_stream,
-                        obj_data,
-                        self.objects_cache,
-                        self.lock,
-                        self.engine_state,
-                        self.motion_cache,
-                        self.keyboard_ring,
-                        visual_attachment,
-                        self.visual_cache,
-                        id_attachment,
-                        self.id_cache,
-                        self.object_lock,
-                        self.camera_state,
-                    ),
-                    complexity,
-                    data,
-                ),
-                daemon=True,
+            instance = script_class(
+                self.render_in_stream,
+                self.change_in_stream,
+                self.main_in_stream,
+                self.main_out_stream,
+                obj_data,
+                self.objects_cache,
+                self.lock,
+                self.engine_state,
+                self.motion_cache,
+                self.keyboard_ring,
+                visual_attachment,
+                self.visual_cache,
+                id_attachment,
+                self.id_cache,
+                self.object_lock,
+                self.camera_state,
             )
-            thread.start()
         except Exception as error:
             if visual_attachment is not None:
                 visual_attachment.detach()
             if id_attachment is not None:
                 id_attachment.detach()
             self._release_status(complexity)
-            self.print(f"Ошибка создания script потока {data.get('path', '?')}: {error}")
+            self.print(f"Ошибка создания скрипта {path}: {error}")
             traceback.print_exc()
+            return
+
+        token = self._next_script_id
+        self._next_script_id += 1
+        self._scripts[token] = (instance, complexity, str(resolved_path))
+        self.print(f"Запущен {path}")

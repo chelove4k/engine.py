@@ -8,6 +8,7 @@ import queue
 import tempfile
 import threading
 import time
+import types
 import unittest
 from collections import deque
 from unittest.mock import patch
@@ -34,6 +35,7 @@ from config import (
     ENGINE_STATE_LOOP_FIELDS,
     ENGINE_STATE_SEGMENT_BYTES,
     ENGINE_STATE_STRUCT,
+    FIXED_DT,
     KEYBOARD_EVENT_DOWN,
     KEYBOARD_EVENT_FIELDS,
     MAX_CACHE_STRING_BYTES,
@@ -445,6 +447,9 @@ class FakeEngineState:
             name: self.values.get(name, self._default(name))
             for name in fields
         }
+
+    def get_many_lockless(self, segment_id, fields):
+        return self.get_many(segment_id, fields)
 
     def set_many(self, segment_id, values):
         self.values.update(values)
@@ -3159,6 +3164,208 @@ class StopLifecycleTests(unittest.TestCase):
 
         self.assertEqual(self.Probe.stopped, 1)
         self.assertTrue(cache.detached)
+
+
+class ScriptStepTests(unittest.TestCase):
+    """Пошаговое выполнение скриптов без отдельного потока на каждый скрипт."""
+
+    class Probe(script):
+        def update(self):
+            self.updates.append(
+                (self.GlobalTime, self.__dict__["_simulation_tick"],
+                 threading.get_ident())
+            )
+
+        def fixed_update(self):
+            self.fixed.append(
+                (self.GlobalTime, self.__dict__["_simulation_tick"],
+                 threading.get_ident())
+            )
+
+        def start(self):
+            self.started += 1
+
+        def stop(self):
+            self.stopped += 1
+
+    def make_probe(self, engine_state=None, objects_cache=None,
+                   object_id="obj", generation=1, last_fixed_tick=None):
+        state = engine_state if engine_state is not None else FakeEngineState()
+        probe = self.Probe.__new__(self.Probe)
+        probe.updates = []
+        probe.fixed = []
+        probe.started = 0
+        probe.stopped = 0
+        probe.GlobalTime = 0.0
+        probe.GameObject = types.SimpleNamespace(
+            _id=object_id, _generation=generation
+        )
+        probe.__dict__.update({
+            "_script__engine_state": state,
+            "_script__objects_cache": (
+                objects_cache if objects_cache is not None else {}
+            ),
+            "_script__dependencies": {},
+            "_script__last_object_generation": state.values[
+                "object_generation"
+            ],
+            "_script__last_keyboard_sequence": state.values[
+                "keyboard_sequence"
+            ],
+            "_script__last_input_sequence": None,
+            "_script__motion_cache": None,
+            "_script__script_started": False,
+            "_script__wants_keyboard_events": False,
+            "_script__wants_mouse_actions": False,
+            "_script__wants_mouse_motion": False,
+            "_script__last_fixed_tick": (
+                last_fixed_tick if last_fixed_tick is not None
+                else int(state.values["tick"])
+            ),
+        })
+        probe.GlobalTime = state.values["time"]
+        return probe
+
+    def test_step_runs_update_and_catches_up_fixed_ticks(self):
+        state = FakeEngineState(time=1.5, tick=2)
+        probe = self.make_probe(state, last_fixed_tick=0)
+
+        self.assertTrue(probe.step())
+        self.assertEqual([entry[1] for entry in probe.updates], [2])
+        self.assertEqual([entry[1] for entry in probe.fixed], [1, 2])
+        self.assertEqual(probe.fixed[-1][0], 2 * FIXED_DT)
+        self.assertEqual(probe.GlobalTime, 2 * FIXED_DT)
+
+        # Повторный шаг без нового tick не должен повторять фиксированное
+        # обновление и не должен заново вызывать update поверх старого времени.
+        self.assertTrue(probe.step())
+        self.assertEqual(len(probe.fixed), 2)
+
+    def test_step_stops_when_object_is_removed_or_slot_is_reused(self):
+        state = FakeEngineState(object_generation=0)
+        objects = {"obj": {"_generation": 1}}
+        probe = self.make_probe(state, objects)
+        probe.__dict__["_script__last_object_generation"] = None
+
+        self.assertTrue(probe.step())
+        self.assertEqual(len(probe.updates), 1)
+
+        # Объект удалён: следующий шаг должен завершить цикл скрипта.
+        objects.pop("obj")
+        state.values["object_generation"] = 1
+        self.assertFalse(probe.step())
+        self.assertEqual(len(probe.updates), 1)
+
+        # Слот переиспользован объектом нового поколения: старый скрипт
+        # не должен продолжать работу с чужими данными.
+        objects["obj"] = {"_generation": 2}
+        state.values["object_generation"] = 2
+        stale = self.make_probe(state, objects)
+        stale.__dict__["_script__last_object_generation"] = None
+        self.assertFalse(stale.step())
+        self.assertEqual(stale.updates, [])
+
+    def test_start_and_stop_run_once_per_script(self):
+        probe = self.make_probe()
+
+        probe._script__activate()
+        probe._script__activate()
+        self.assertEqual(probe.started, 1)
+
+        self.assertTrue(probe.step())
+        self.assertEqual(probe.started, 1)
+
+        probe.shutdown()
+        probe.shutdown()
+        self.assertEqual(probe.stopped, 1)
+        self.assertFalse(probe.step())
+        self.assertEqual(probe.started, 1)
+
+
+class CooperativeSchedulerTests(unittest.TestCase):
+    """Один проход планировщика: шаги скриптов и изоляция ошибок."""
+
+    class FakeTime:
+        def get(self):
+            return 0.0
+
+    class FakeScript:
+        def __init__(self, name, updates, shutdowns, fail=False):
+            self.name = name
+            self.updates = updates
+            self.shutdowns = shutdowns
+            self.fail = fail
+
+        def step(self):
+            self.updates.append((self.name, threading.get_ident()))
+            if self.fail:
+                raise RuntimeError(f"сбой скрипта {self.name}")
+            return True
+
+        def shutdown(self):
+            self.shutdowns.append((self.name, threading.get_ident()))
+
+    def make_runner(self, scripts=None):
+        from scripter_runner import scripter_runner as Runner
+
+        runner = Runner.__new__(Runner)
+        runner.id = 0
+        runner.core_time = self.FakeTime()
+        runner.worker_queue = queue.Queue()
+        runner.proccess_status_info = [0]
+        runner.lock = threading.Lock()
+        runner._scripts = dict(scripts or {})
+        runner._next_script_id = len(runner._scripts)
+        return runner
+
+    def test_error_in_one_script_does_not_stop_others(self):
+        updates = []
+        shutdowns = []
+        first = self.FakeScript("first", updates, shutdowns)
+        broken = self.FakeScript("broken", updates, shutdowns, fail=True)
+        last = self.FakeScript("last", updates, shutdowns)
+        runner = self.make_runner({
+            0: (first, 0, "first.py"),
+            1: (broken, 0, "broken.py"),
+            2: (last, 0, "last.py"),
+        })
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            runner._scripter_runner__run_once()
+
+        self.assertEqual(
+            [name for name, _ in updates], ["first", "broken", "last"]
+        )
+        self.assertEqual([name for name, _ in shutdowns], ["broken"])
+        self.assertEqual(
+            {ident for _, ident in updates}, {threading.get_ident()}
+        )
+        self.assertNotIn(1, runner._scripts)
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            runner._scripter_runner__run_once()
+
+        self.assertEqual(
+            [name for name, _ in updates],
+            ["first", "broken", "last", "first", "last"],
+        )
+        self.assertEqual([name for name, _ in shutdowns], ["broken"])
+
+    def test_drain_commands_accepts_only_own_worker(self):
+        received = []
+        runner = self.make_runner()
+        runner._scripter_runner__start_script = received.append
+        runner.worker_queue.put({"proc_id": 1, "path": "other.py"})
+        runner.worker_queue.put({"proc_id": 0, "path": "mine.py"})
+        runner.worker_queue.put(None)
+
+        runner._scripter_runner__drain_commands()
+
+        self.assertEqual(
+            [message["path"] for message in received], ["mine.py"]
+        )
 
 
 if __name__ == "__main__":

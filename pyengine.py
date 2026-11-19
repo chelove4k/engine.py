@@ -1514,7 +1514,8 @@ class script:
             "time_owner": self,
             "tick_cache": self.__rawTick,
         }
-        self.__dependencies_token = push_dependencies(self.__dependencies)
+        self.__last_fixed_tick = self.__current_tick()
+        self.__script_started = False
 
         try:
             self.GameObject = GameObject(game_object, deps=self.__dependencies)
@@ -1543,7 +1544,7 @@ class script:
                 self.__camera_scale_cache,
             )
 
-            self.start()
+            self.__activate()
 
             # Опрос списка событий стоит одного запроса к Manager на скрипт.
             # Скрипты, не определяющие нужные колбэки, не должны за это
@@ -1567,87 +1568,128 @@ class script:
                 )
             )
 
-            last_fixed_tick = self.__current_tick()
+        except Exception:
+            traceback.print_exc()
+            self.__shutdown()
+            raise
 
-            while True:
-                # Одно чтение без блокировки охватывает часы, tick, счётчики
-                # ввода и удаления, а также количество нажатых клавиш. Раньше
-                # это было одно чтение shared memory под межпроцессной
-                # блокировкой: при тысяче скриптов все воркеры конкурировали
-                # за один семафор, и весь конвейер упирался в ~25 обновлений/с.
-                # Каждое поле здесь — одно 4-байтовое значение, поэтому гонка
-                # записи может сделать снимок устаревшим лишь на одно обновление.
-                state = self.__engine_state.get_many_lockless(
-                    0, ENGINE_STATE_LOOP_FIELDS
+    def __activate(self):
+        """Выполняет ``start()`` в контексте зависимостей скрипта."""
+
+        if self.__script_started or self.__dict__.get("_script__stopped"):
+            return
+        self.__script_started = True
+        token = push_dependencies(self.__dependencies)
+        try:
+            self.start()
+        finally:
+            pop_dependencies(token)
+
+    def step(self) -> bool:
+        """Выполняет одну итерацию скрипта.
+
+        Возвращает ``False``, когда объект удалён или скрипт остановлен.
+        Планировщик вызывает метод из одного потока, поэтому отдельный поток
+        на каждый скрипт больше не нужен.
+        """
+
+        if self.__dict__.get("_script__stopped"):
+            return False
+
+        token = push_dependencies(self.__dependencies)
+        try:
+            # Одно чтение без блокировки охватывает часы, tick, счётчики
+            # ввода и удаления, а также количество нажатых клавиш. Раньше
+            # это было одно чтение shared memory под межпроцессной
+            # блокировкой: при тысяче скриптов все воркеры конкурировали
+            # за один семафор, и весь конвейер упирался в ~25 обновлений/с.
+            # Каждое поле здесь — одно 4-байтовое значение, поэтому гонка
+            # записи может сделать снимок устаревшим лишь на одно обновление.
+            state = self.__engine_state.get_many_lockless(
+                0, ENGINE_STATE_LOOP_FIELDS
+            )
+            now = state["time"]
+            current_tick = int(state["tick"])
+
+            # Вызовы Manager — самая дорогая часть цикла. Без общего
+            # счётчика удалений каждый скрипт должен был спрашивать
+            # Manager о своём объекте каждый OBJECT_LIVENESS_PERIOD.
+            generation = state["object_generation"]
+            if generation != self.__last_object_generation:
+                self.__last_object_generation = generation
+                record = None
+                if self.__objects_cache is not None:
+                    record = self.__objects_cache.get(self.GameObject._id)
+                if (not isinstance(record, dict)
+                        or record.get("_generation")
+                        != self.GameObject._generation):
+                    return False
+
+            if state["keyboard_sequence"] != self.__last_keyboard_sequence:
+                # Имена клавиш публикуются снимком в shared memory,
+                # поэтому не нужны ни прокси списка Manager, ни поток опроса.
+                self.__last_keyboard_sequence = state["keyboard_sequence"]
+                self.__pressed_keys = self.__read_pressed_keys(
+                    state["key_count"]
                 )
-                now = state["time"]
-                current_tick = int(state["tick"])
 
-                # Вызовы Manager — самая дорогая часть цикла. Без общего
-                # счётчика удалений каждый скрипт должен был спрашивать
-                # Manager о своём объекте каждый OBJECT_LIVENESS_PERIOD.
-                generation = state["object_generation"]
-                if generation != self.__last_object_generation:
-                    self.__last_object_generation = generation
-                    record = None
-                    if self.__objects_cache is not None:
-                        record = self.__objects_cache.get(self.GameObject._id)
-                    if (not isinstance(record, dict)
-                            or record.get("_generation")
-                            != self.GameObject._generation):
-                        break
+            self.GlobalTime = now
+            self.__dict__["_simulation_tick"] = current_tick
 
-                if state["keyboard_sequence"] != self.__last_keyboard_sequence:
-                    # Имена клавиш публикуются снимком в shared memory,
-                    # поэтому не нужны ни прокси списка Manager, ни поток опроса.
-                    self.__last_keyboard_sequence = state["keyboard_sequence"]
-                    self.__pressed_keys = self.__read_pressed_keys(
-                        state["key_count"]
-                    )
+            # Движение указателя живёт в shared memory и проверяется
+            # локально на каждой итерации. События клавиатуры и кликов
+            # по-прежнему используют общий счётчик и список событий Manager.
+            if self.__wants_mouse_motion:
+                self.__dispatch_mouse_motion()
+            wants_mouse_actions = self.__wants_mouse_actions or (
+                self.__motion_cache is None and self.__wants_mouse_motion
+            )
+            if wants_mouse_actions or self.__wants_keyboard_events:
+                input_sequence = state["input_sequence"]
+                if input_sequence != self.__last_input_sequence:
+                    self.__last_input_sequence = input_sequence
+                    if wants_mouse_actions:
+                        self.__dispatch_mouse_events()
+                    if self.__wants_keyboard_events:
+                        self.__dispatch_keyboard_events()
 
-                self.GlobalTime = now
-                self.__dict__["_simulation_tick"] = current_tick
+            self.update()
 
-                # Движение указателя живёт в shared memory и проверяется
-                # локально на каждой итерации. События клавиатуры и кликов
-                # по-прежнему используют общий счётчик и список событий Manager.
-                if self.__wants_mouse_motion:
-                    self.__dispatch_mouse_motion()
-                wants_mouse_actions = self.__wants_mouse_actions or (
-                    self.__motion_cache is None and self.__wants_mouse_motion
-                )
-                if wants_mouse_actions or self.__wants_keyboard_events:
-                    input_sequence = state["input_sequence"]
-                    if input_sequence != self.__last_input_sequence:
-                        self.__last_input_sequence = input_sequence
-                        if wants_mouse_actions:
-                            self.__dispatch_mouse_events()
-                        if self.__wants_keyboard_events:
-                            self.__dispatch_keyboard_events()
+            # Каждый скрипт проходит одну и ту же общую последовательность
+            # tick. Поэтому позиция, записанная во время tick N, сохраняется
+            # под точно тем же tick в каждом процессе.
+            steps = 0
+            while (self.__last_fixed_tick < current_tick
+                   and steps < MAX_CATCH_UP_STEPS):
+                self.__last_fixed_tick += 1
+                steps += 1
+                self.__dict__["_simulation_tick"] = self.__last_fixed_tick
+                self.GlobalTime = self.__last_fixed_tick * FIXED_DT
+                self.fixed_update()
+            if self.__last_fixed_tick < current_tick:
+                # Отбрасываем избыточное догоняющее моделирование,
+                # но никогда не моделируем tick дважды.
+                self.__last_fixed_tick = current_tick
 
-                self.update()
+            return True
+        finally:
+            pop_dependencies(token)
 
-                # Каждый скрипт проходит одну и ту же общую последовательность
-                # tick. Поэтому позиция, записанная во время tick N, сохраняется
-                # под точно тем же tick в каждом процессе.
-                steps = 0
-                while (last_fixed_tick < current_tick
-                       and steps < MAX_CATCH_UP_STEPS):
-                    last_fixed_tick += 1
-                    steps += 1
-                    self.__dict__["_simulation_tick"] = last_fixed_tick
-                    self.GlobalTime = last_fixed_tick * FIXED_DT
-                    self.fixed_update()
-                if last_fixed_tick < current_tick:
-                    # Отбрасываем избыточное догоняющее моделирование,
-                    # но никогда не моделируем tick дважды.
-                    last_fixed_tick = current_tick
+    def run_forever(self):
+        """Автономный цикл для запуска скрипта без планировщика."""
 
+        try:
+            while self.step():
                 time.sleep(SCRIPT_UPDATE_PERIOD)
         except Exception:
             traceback.print_exc()
         finally:
             self.__shutdown()
+
+    def shutdown(self):
+        """Останавливает скрипт и освобождает подключённые кэши."""
+
+        self.__shutdown()
 
     def __shutdown(self):
         if self.__dict__.get("_script__stopped"):
@@ -1658,13 +1700,6 @@ class script:
             self.stop()
         except Exception:
             traceback.print_exc()
-
-        token = self.__dict__.pop("_script__dependencies_token", None)
-        if token is not None:
-            try:
-                pop_dependencies(token)
-            except (ValueError, RuntimeError):
-                pass
 
         for attribute in (
             "_script__rawTime",
