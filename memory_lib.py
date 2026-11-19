@@ -101,9 +101,6 @@ class ValueCache:
             return f"{MAX_CACHE_STRING_BYTES}s"
         raise ValueError(f"Неизвестный тип полезной нагрузки ValueCache: {raw_fml}")
 
-    def get_size(self):
-        return MAX_CACHE_STRING_BYTES if self.get_fml().endswith("s") else 4
-
     def get(self):
         with self.lock:
             raw_val = self._struct.unpack_from(self.__memory.buf, 1)[0]
@@ -412,11 +409,6 @@ class ObjectCache:
             return self._fields[object_name]
         except KeyError as error:
             raise TypeError(f"Запрошен незаданый обьект: {object_name!r}") from error
-
-    def get_frame(self, segment_id, object_name):
-        start = self._mask_bytes + segment_id * self._field_len
-        bounds = self._field(object_name)[0]
-        return [bounds[0] + start, bounds[1] + start]
 
     def get(self, segment_id: int, object_name: str):
         try:
@@ -924,26 +916,6 @@ class ObjectCache:
             self._masks[segment_id] = 0
             self._mark_clean_locked(segment_id)
             return True
-
-    def get_changes(self, segment_id: int) -> list:
-        if segment_id < 0 or segment_id >= self.segments_count:
-            raise IndexError("Индекс сегмента выходит за границы")
-
-        changed_fields = []
-
-        with self._lock_for(segment_id):
-            current_mask = self._masks[segment_id]
-            if current_mask == 0:
-                return changed_fields
-
-            for field_name, bit_value in self.field_bit_mapping.items():
-                if current_mask & bit_value:
-                    changed_fields.append(field_name)
-
-            self._masks[segment_id] = 0
-            self._mark_clean_locked(segment_id)
-
-        return changed_fields
 
     def _release_views(self):
         masks = self._masks
