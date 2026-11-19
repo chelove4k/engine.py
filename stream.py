@@ -759,10 +759,14 @@ class Stream:
 
     def __start_scripter_runners(self):
         worker_count = len(self.worker_queues)
-        while len(self.proccess_status_info) < worker_count:
-            self.proccess_status_info.append(0)
-        while len(self.worker_ready) < worker_count:
-            self.worker_ready.append(False)
+        # В приложении статусы — fixed-size Array.  В тестах и нестандартных
+        # встраиваниях может прийти список, который нужно дополнить.
+        if hasattr(self.proccess_status_info, "append"):
+            while len(self.proccess_status_info) < worker_count:
+                self.proccess_status_info.append(0)
+        if hasattr(self.worker_ready, "append"):
+            while len(self.worker_ready) < worker_count:
+                self.worker_ready.append(False)
 
         workers = []
         for worker_id, worker_queue in enumerate(self.worker_queues):

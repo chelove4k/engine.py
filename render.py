@@ -1266,9 +1266,16 @@ class Game(arcade.Window):
 
 
 class ManagedQueue:
+    """Очередь команд на обычном ``multiprocessing.Queue``.
 
-    def __init__(self, manager, maxsize=1024):
-        self._queue = manager.Queue(maxsize=maxsize)
+    Manager-очередь добавляла два запроса к серверу Manager на каждое
+    сообщение (``put`` и ``get``).  Для команд движка достаточно штатной
+    межпроцессной очереди: она уже потокобезопасна и поддерживает несколько
+    производителей.
+    """
+
+    def __init__(self, maxsize=1024):
+        self._queue = multiprocessing.Queue(maxsize=maxsize)
 
     def put(self, item, *args, **kwargs):
         return self._queue.put(item, *args, **kwargs)
@@ -1280,6 +1287,8 @@ class ManagedQueue:
         return self._queue.empty()
     def qsize(self):
         return self._queue.qsize()
+    def close(self):
+        return self._queue.close()
 
 
 class RenderInQueue(ManagedQueue):
@@ -1308,22 +1317,24 @@ def tact_counter(start, tact_time, EngineState, stop_event):
 
 def main():
 
+    # Manager остаётся только для реестра объектов; очереди команд, блокировки
+    # и статусы воркеров больше не ходят через его сервер.
     manager = multiprocessing.Manager()
 
-    render_in_stream = RenderInQueue(manager)
-    render_out_stream = RenderOutQueue(manager)
-    main_in_stream = MainInQueue(manager)
-    main_out_stream = MainOutQueue(manager)
+    render_in_stream = RenderInQueue()
+    render_out_stream = RenderOutQueue()
+    main_in_stream = MainInQueue()
+    main_out_stream = MainOutQueue()
 
     # Один процесс симуляции с кооперативным планировщиком.  Очередь и
     # status-list пока сохранены для совместимости Stream, но воркеры больше
     # не размножаются по числу ядер: скрипты выполняет один поток.
     worker_count = 1
-    worker_queues = [ProccesInQueue(manager) for _ in range(worker_count)]
-    worker_ready = manager.list([False] * worker_count)
+    worker_queues = [ProccesInQueue() for _ in range(worker_count)]
+    worker_ready = multiprocessing.Array("b", worker_count, lock=False)
 
     objects_cache = manager.dict()
-    object_lock = manager.Lock()
+    object_lock = multiprocessing.Lock()
     visual_struct =  {
         'x' : float,
         'y' : float,
@@ -1376,7 +1387,9 @@ def main():
         raw_id_cache.key, id_struct, id_locks, None, raw_id_cache.capacity,
     ]
 
-    proccess_status_info = manager.list()
+    proccess_status_info = multiprocessing.Array(
+        "i", worker_count, lock=False
+    )
     # Счётчики движка лежат в одном сегменте; скрипты читают их под одной блокировкой.
     raw_engine_state = ObjectCache(
         ENGINE_STATE_SEGMENT_BYTES,
@@ -1430,7 +1443,7 @@ def main():
     camera_scale_cache = ValueCache(1.0)
     camera_state = [camera_target_cache.name, camera_scale_cache.name]
     overlay_settings = console.OverlaySettings()
-    lock = manager.Lock()
+    lock = multiprocessing.Lock()
 
     logic_process = multiprocessing.Process(
         target=stream.Stream,
