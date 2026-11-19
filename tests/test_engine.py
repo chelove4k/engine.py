@@ -79,10 +79,11 @@ class FakeResponseQueue:
 
 
 class FakeRequestQueue:
-    def __init__(self, responses, render_id=0, object_id=0):
+    def __init__(self, responses, render_id=0, object_id=0, generation=1):
         self.responses = responses
         self.render_id = render_id
         self.object_id = object_id
+        self.generation = generation
         self.messages = []
 
     def put(self, message):
@@ -92,6 +93,7 @@ class FakeRequestQueue:
                 message["request_id"]: {
                     "object_id": self.object_id,
                     "render_id": self.render_id,
+                    "generation": self.generation,
                 }
             })
         elif message["command"] == "register_many":
@@ -99,6 +101,7 @@ class FakeRequestQueue:
                 {
                     "object_id": self.object_id + offset,
                     "render_id": self.render_id + offset,
+                    "generation": self.generation + offset,
                 }
                 for offset, _item in enumerate(message["objects"])
             ]
@@ -858,6 +861,19 @@ class ValidationTests(unittest.TestCase):
             "object_type": "static_object",
             "id": {"name": "wall", "class": "Wall"},
         })
+
+    def test_engine_owned_fields_are_rejected(self):
+        for field_name in (
+            "_id", "object_id", "render_id", "_object_id", "_render_id",
+            "_generation",
+        ):
+            with self.subTest(field=field_name):
+                with self.assertRaises(ValueError):
+                    validate_object_data({
+                        "object_type": "static_object",
+                        "id": {"name": "wall", "class": "Wall"},
+                        field_name: 1,
+                    })
 
     def test_no_sprite_marker_is_valid(self):
         validate_object_data({
@@ -2532,6 +2548,44 @@ class CreateObjectTests(CacheTestCase):
                 "id": {"name": "wall", "class": "Wall"},
             }, deps=deps)
 
+    def test_register_is_idempotent_only_for_live_generation(self):
+        visual, identity = self.make_caches()
+        deps, requests, _ = self.make_deps(visual, identity)
+
+        game_object = create_object({
+            "object_type": "static_object",
+            "id": {"name": "wall", "class": "Wall"},
+        }, deps=deps)
+        self.assertEqual(game_object._generation, 1)
+        # Служебные поля не попадают в пользовательский dict_data, иначе
+        # повторная регистрация не прошла бы валидацию сцены.
+        self.assertNotIn("_generation", game_object.dict_data)
+        self.assertNotIn("object_id", game_object.dict_data)
+        self.assertNotIn("render_id", game_object.dict_data)
+
+        def register_count():
+            return sum(
+                message["command"] == "register"
+                for message in requests.messages
+            )
+
+        deps["objects_cache"][game_object._id] = {
+            "_generation": game_object._generation,
+        }
+        game_object.register()
+        self.assertEqual(register_count(), 1)
+
+        # После удаления запись исчезает, и старые идентификаторы нельзя
+        # считать живыми: слот мог достаться другому объекту.
+        deps["objects_cache"].pop(game_object._id)
+        requests.generation = 2
+        requests.render_id = 5
+        game_object.register()
+
+        self.assertEqual(register_count(), 2)
+        self.assertEqual(game_object._render_id, 5)
+        self.assertEqual(game_object._generation, 2)
+
     def test_duplicate_and_invalid_stream_registration(self):
         visual, identity = self.make_caches()
         responses = FakeResponseQueue()
@@ -2662,6 +2716,136 @@ class CreateObjectTests(CacheTestCase):
         # Повторная установка того же слоя не должна дублировать объект.
         game_object.Visual.layer = 4.5
         self.assertEqual(deps["objects_cache"][new_key], [game_object._id])
+
+
+class RenderSlotLifecycleTests(CacheTestCase):
+    """Переиспользование render_id и защита от команд старого поколения."""
+
+    def make_stream(self):
+        visual, identity = self.make_caches()
+        responses = FakeResponseQueue()
+        renders = FakeRequestQueue(responses)
+        stream_object = Stream.__new__(Stream)
+        stream_object.main_out_stream = responses
+        stream_object.render_in_stream = renders
+        stream_object.object_lock = threading.Lock()
+        stream_object.objects_cache = {}
+        stream_object.visual_cache = visual
+        stream_object.id_cache = identity
+        stream_object.engine_state = FakeEngineState()
+        stream_object.camera_target_cache = ValueCache(-1)
+        self.addCleanup(stream_object.camera_target_cache.close)
+        stream_object._next_object_id = 0
+        stream_object._next_render_id = 0
+        stream_object._object_generation = 0
+        return stream_object, responses, renders
+
+    @staticmethod
+    def make_game(name):
+        return GameObject({
+            "object_type": "static_object",
+            "id": {"name": name, "class": "Wall"},
+            "visual": {
+                "sprite": "img.png",
+                "position": [0, 0],
+                "scale": 1,
+                "rotation": 0,
+                "alpha": 1,
+            },
+        })
+
+    @staticmethod
+    def register(stream_object, responses, game_object, request_id):
+        stream_object._Stream__register({
+            "id": game_object._id,
+            "request_id": request_id,
+            "obj": game_object._GameObject__cache_record(),
+            "script_data": game_object.dict_data,
+        })
+        return responses.items[-1][request_id]
+
+    def test_removed_render_slot_is_reused_with_new_generation(self):
+        stream_object, responses, renders = self.make_stream()
+        first = self.make_game("first")
+        first_payload = self.register(stream_object, responses, first, "first")
+        self.assertEqual(first_payload["render_id"], 0)
+        self.assertEqual(first_payload["generation"], 1)
+
+        stream_object._Stream__remove({"id": first._id, "generation": 1})
+        self.assertNotIn(first._id, stream_object.objects_cache)
+        self.assertEqual(list(stream_object._free_render_ids), [0])
+        self.assertEqual(
+            renders.messages[-1],
+            {"command": "remove", "render_id": 0},
+        )
+
+        second = self.make_game("second")
+        second_payload = self.register(stream_object, responses, second, "second")
+        self.assertEqual(second_payload["render_id"], 0)
+        self.assertEqual(second_payload["generation"], 2)
+        self.assertEqual(list(stream_object._free_render_ids), [])
+
+    def test_free_list_prevents_slot_exhaustion(self):
+        stream_object, responses, _ = self.make_stream()
+        capacity = min(
+            stream_object.visual_cache.capacity,
+            stream_object.id_cache.capacity,
+        )
+        stream_object._next_render_id = capacity - 1
+
+        # Много циклов create/remove на последнем слоте: без free-list
+        # следующая регистрация упёрлась бы в границу capacity.
+        for index in range(50):
+            game_object = self.make_game(f"unit_{index}")
+            payload = self.register(
+                stream_object, responses, game_object, f"request_{index}"
+            )
+            self.assertEqual(payload["render_id"], capacity - 1)
+            stream_object._Stream__remove({
+                "id": game_object._id,
+                "generation": payload["generation"],
+            })
+
+        self.assertEqual(list(stream_object._free_render_ids), [capacity - 1])
+
+    def test_stale_remove_and_render_are_ignored(self):
+        stream_object, responses, renders = self.make_stream()
+        first = self.make_game("first")
+        self.register(stream_object, responses, first, "first")
+        stream_object._Stream__remove({"id": first._id, "generation": 1})
+
+        second = self.make_game("second")
+        second_payload = self.register(stream_object, responses, second, "second")
+        generation = second_payload["generation"]
+        renders.messages.clear()
+
+        # Команды старого поколения не должны трогать занятый слот.
+        stream_object._Stream__remove({
+            "id": second._id,
+            "generation": generation - 1,
+        })
+        self.assertIn(second._id, stream_object.objects_cache)
+
+        stream_object._Stream__render({
+            "id": second._id,
+            "generation": generation - 1,
+        })
+        self.assertEqual(renders.messages, [])
+
+        stream_object._Stream__render({
+            "id": second._id,
+            "generation": generation,
+        })
+        self.assertEqual(len(renders.messages), 1)
+        self.assertEqual(renders.messages[0]["command"], "add")
+        self.assertEqual(renders.messages[0]["render_id"], 0)
+
+        stream_object._Stream__remove({
+            "id": second._id,
+            "generation": generation,
+        })
+        self.assertNotIn(second._id, stream_object.objects_cache)
+        self.assertEqual(list(stream_object._free_render_ids), [0])
 
 
 class IdentityIndexTests(CacheTestCase):
@@ -2915,6 +3099,7 @@ class FindObjectComponentTests(CacheTestCase):
             "object-id": {
                 "_object_id": 7,
                 "_render_id": 0,
+                "_generation": 3,
                 "dict_data": {
                     "object_type": "static_object",
                     "_components": ["id", "visual", "rotate_on_click"],
@@ -2938,6 +3123,7 @@ class FindObjectComponentTests(CacheTestCase):
         found = script.find_object(probe, "name", "tilt_trigger")
         self.assertIsNotNone(found)
         self.assertEqual(found._object_id, 7)
+        self.assertEqual(found._generation, 3)
         self.assertEqual(found.component_specs, [{
             "name": "rotate_on_click",
             "path": "access/components/rotate_on_click.py",

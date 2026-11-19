@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+from collections import deque
 from multiprocessing.managers import SyncManager
 from pathlib import Path
 import queue
@@ -425,6 +426,37 @@ class Stream:
         validate_object_data(script_data)
         return object_key, object
 
+    def __ensure_id_state(self):
+        """Лениво создаёт состояние free-list для тестовых Stream без __init__."""
+
+        if not hasattr(self, "_free_render_ids"):
+            self._free_render_ids = deque()
+        if not hasattr(self, "_render_generations"):
+            self._render_generations = {}
+
+    def __available_render_slots(self, capacity):
+        self.__ensure_id_state()
+        return len(self._free_render_ids) + max(
+            0, capacity - self._next_render_id
+        )
+
+    def __allocate_render_id(self, capacity):
+        self.__ensure_id_state()
+        if self._free_render_ids:
+            render_id = self._free_render_ids.popleft()
+        else:
+            if self._next_render_id >= capacity:
+                raise ValueError(
+                    "Закончились слоты VisualCache/IdCache. "
+                    "Увеличьте размер общего кэша или уменьшите число объектов."
+                )
+            render_id = self._next_render_id
+            self._next_render_id += 1
+
+        generation = self._render_generations.get(render_id, 0) + 1
+        self._render_generations[render_id] = generation
+        return render_id, generation
+
     def __register_one(self, object_key, object, check_duplicate=True, state=None):
         dict_data = object["dict_data"]
 
@@ -433,26 +465,22 @@ class Stream:
                 f"Объект с id {object_key!r} уже зарегистрирован"
             )
         capacity = min(self.visual_cache.capacity, self.id_cache.capacity)
-        if self._next_render_id >= capacity:
-            raise ValueError(
-                "Закончились слоты VisualCache/IdCache. "
-                "Увеличьте размер общего кэша или уменьшите число объектов."
-            )
+        render_id, generation = self.__allocate_render_id(capacity)
 
         numeric_object_id = self._next_object_id
-        render_id = self._next_render_id
         self._next_object_id += 1
-        self._next_render_id += 1
 
         object["_id"] = object_key
         object["_object_id"] = numeric_object_id
         object["_render_id"] = render_id
+        object["_generation"] = generation
         object["_is_render"] = False
         object["_is_changed"] = False
         object["changes"] = []
         object["dict_data"].update({
             "object_id": numeric_object_id,
             "render_id": render_id,
+            "_generation": generation,
         })
         object["dict_data"]["_id"] = object_key
         object["dict_data"]["_components"] = [
@@ -501,6 +529,7 @@ class Stream:
         return {
             "object_id": numeric_object_id,
             "render_id": render_id,
+            "generation": generation,
         }
 
     def __register(self, data):
@@ -565,7 +594,7 @@ class Stream:
                     prepared.append((object_key, cached_object))
 
                 capacity = min(self.visual_cache.capacity, self.id_cache.capacity)
-                if self._next_render_id + len(prepared) > capacity:
+                if len(prepared) > self.__available_render_slots(capacity):
                     raise ValueError(
                         "Закончились слоты VisualCache/IdCache. "
                         "Увеличьте размер общего кэша или уменьшите число объектов."
@@ -648,10 +677,14 @@ class Stream:
 
     def __render(self, data):
         id = data["id"]
+        generation = data.get("generation")
 
         with self.object_lock:
             object = self.objects_cache.get(id)
             if object is None:
+                return
+            if (generation is not None
+                    and object.get("_generation") != generation):
                 return
 
             dict_data = object.get("dict_data", {})
@@ -695,8 +728,17 @@ class Stream:
 
     def __remove(self, data):
         id = data["id"]
+        generation = data.get("generation")
 
         with self.object_lock:
+            object = self.objects_cache.get(id)
+            if object is None:
+                return
+            # Команда от старого скрипта не должна удалять новый объект,
+            # занявший тот же слот после переиспользования render_id.
+            if (generation is not None
+                    and object.get("_generation") != generation):
+                return
             object = self.objects_cache.pop(id, None)
             render_id = None
             if object is not None:
@@ -711,6 +753,9 @@ class Stream:
                 "command": "remove",
                 "render_id": render_id,
             })
+            if render_id is not None:
+                self.__ensure_id_state()
+                self._free_render_ids.append(render_id)
 
     def __start_scripter_runners(self):
         worker_count = len(self.worker_queues)
@@ -900,6 +945,11 @@ class Stream:
 
         self._next_object_id = 0
         self._next_render_id = 0
+        # Свободные render_id переиспользуются, а не выдаются монотонно.
+        # Поколение на слот защищает от stale-скриптов, которые пережили
+        # удаление своего объекта.
+        self._free_render_ids = deque()
+        self._render_generations = {}
 
         self._script_complexity_cache = {}
         self._index_manager = self.__connect_index_manager(

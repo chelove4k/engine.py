@@ -832,6 +832,7 @@ class GameObject:
         self._id = source.get("_id") or uuid.uuid4().hex
         self._object_id = source.get("object_id")
         self._render_id = source.get("render_id")
+        self._generation = int(source.get("_generation", 0) or 0)
 
         self.Visual = None
         self.Transform = None
@@ -899,6 +900,7 @@ class GameObject:
             "_id": self._id,
             "_object_id": self._object_id,
             "_render_id": self._render_id,
+            "_generation": self._generation,
             "_is_render": self._is_render,
         }
 
@@ -992,20 +994,25 @@ class GameObject:
                     f"Stream отклонил объект {object_key!r}: {response['error']}"
                 )
             try:
-                return response["object_id"], response["render_id"]
+                return (
+                    response["object_id"],
+                    response["render_id"],
+                    int(response.get("generation", 0) or 0),
+                )
             except KeyError as error:
                 raise RuntimeError(
                     f"Некорректный ответ Stream при регистрации: {response!r}"
                 ) from error
         if isinstance(response, (list, tuple)) and len(response) == 2:
-            return response
+            return response[0], response[1], 0
         raise RuntimeError(
             f"Некорректный ответ Stream при регистрации: {response!r}"
         )
 
-    def _apply_registration(self, object_id, render_id):
+    def _apply_registration(self, object_id, render_id, generation=0):
         self.__dict__["_object_id"] = object_id
         self.__dict__["_render_id"] = render_id
+        self.__dict__["_generation"] = int(generation or 0)
 
         # Объект был создан до того, как Stream назначил render id.
         # Перепривязываем прокси компонентов, чтобы последующие обращения к
@@ -1032,6 +1039,7 @@ class GameObject:
         script_data["_id"] = self._id
         script_data["object_id"] = object_id
         script_data["render_id"] = render_id
+        script_data["_generation"] = self._generation
 
         if self.Scripting is not None:
             for path in self.Scripting.scripts:
@@ -1047,6 +1055,7 @@ class GameObject:
         component_data["_id"] = self._id
         component_data["object_id"] = object_id
         component_data["render_id"] = render_id
+        component_data["_generation"] = self._generation
         for component_spec in self.component_specs:
             component_script_data = copy.deepcopy(component_data)
             component_script_data["_component_config"] = copy.deepcopy(
@@ -1072,7 +1081,18 @@ class GameObject:
 
         with _REGISTRATION_LOCK:
             if self._object_id is not None:
-                return self
+                # Повторный register() идемпотентен только для живого объекта.
+                # Если объект уже удалён, его слот мог быть переиспользован,
+                # поэтому старые идентификаторы нужно сбросить и запросить новые.
+                record = None
+                if self._objects_cache is not None:
+                    record = self._objects_cache.get(self._id)
+                if (isinstance(record, dict)
+                        and record.get("_generation") == self._generation):
+                    return self
+                self.__dict__["_object_id"] = None
+                self.__dict__["_render_id"] = None
+                self.__dict__["_generation"] = 0
 
             request_id = uuid.uuid4().hex
             self._main_in_stream.put({
@@ -1082,8 +1102,10 @@ class GameObject:
             })
             response = self._wait_registration_response(request_id)
 
-        object_id, render_id = self._parse_registration_response(response, self._id)
-        self._apply_registration(object_id, render_id)
+        object_id, render_id, generation = self._parse_registration_response(
+            response, self._id
+        )
+        self._apply_registration(object_id, render_id, generation)
         self._publish_registration()
         return self
 
@@ -1141,10 +1163,10 @@ class GameObject:
             if isinstance(result, dict) and "error" in result:
                 failures.append(f"{game_object._id}: {result['error']}")
                 continue
-            object_id, render_id = game_object._parse_registration_response(
-                result, game_object._id
+            object_id, render_id, generation = (
+                game_object._parse_registration_response(result, game_object._id)
             )
-            game_object._apply_registration(object_id, render_id)
+            game_object._apply_registration(object_id, render_id, generation)
             registered.append(game_object)
 
         for game_object in registered:
@@ -1158,11 +1180,19 @@ class GameObject:
 
     def remove(self):
         if self._main_in_stream is not None and self._id is not None:
-            self._main_in_stream.put({"command": "remove", "id": self._id})
+            self._main_in_stream.put({
+                "command": "remove",
+                "id": self._id,
+                "generation": self._generation,
+            })
 
     def render(self):
         if self.Visual is not None and self._main_in_stream is not None:
-            self._main_in_stream.put({"command": "render", "id": self._id})
+            self._main_in_stream.put({
+                "command": "render",
+                "id": self._id,
+                "generation": self._generation,
+            })
 
 
 def create_object(json_text, deps: dict | None = None):
@@ -1374,6 +1404,7 @@ class script:
                 "_id": identity["id"],
                 "object_id": record["_object_id"],
                 "render_id": render_id,
+                "_generation": record.get("_generation", 0),
                 "id": {key: identity[key] for key in ("name", "class", "type")},
             }
             components = record.get("dict_data", {})
@@ -1558,8 +1589,12 @@ class script:
                 generation = state["object_generation"]
                 if generation != self.__last_object_generation:
                     self.__last_object_generation = generation
-                    if (self.__objects_cache is not None
-                            and self.GameObject._id not in self.__objects_cache):
+                    record = None
+                    if self.__objects_cache is not None:
+                        record = self.__objects_cache.get(self.GameObject._id)
+                    if (not isinstance(record, dict)
+                            or record.get("_generation")
+                            != self.GameObject._generation):
                         break
 
                 if state["keyboard_sequence"] != self.__last_keyboard_sequence:

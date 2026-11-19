@@ -1,0 +1,143 @@
+{
+  "generated_at": "2026-11-19T13:41:54",
+  "config": {
+    "scenario": "registration,batch",
+    "duration": 2.0,
+    "objects": 500,
+    "pairs": 100000,
+    "frames": 60,
+    "cache_ops": 100000,
+    "processes": 4,
+    "workers": 2,
+    "scripts": 1,
+    "motion_objects": 16,
+    "iterations": 100,
+    "timeout": 60.0,
+    "list": false
+  },
+  "ok": true,
+  "results": [
+    {
+      "name": "registration",
+      "ok": true,
+      "duration_s": 3.5272312999586575,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "registration",
+          "name": "registration.objects",
+          "value": 329.6961908983687,
+          "unit": "objects/s",
+          "note": "500 объектов, 2 рабочих"
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p50",
+          "value": 2.9619999695569277,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p95",
+          "value": 3.5472000017762184,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p99",
+          "value": 4.113500006496906,
+          "unit": "ms/object",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "all objects created",
+          "ok": true,
+          "detail": "500/500"
+        },
+        {
+          "name": "object ids unique",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "registered in objects_cache",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "visual cache updated",
+          "ok": true,
+          "detail": "x=99.0, y=4.0"
+        },
+        {
+          "name": "identity cache updated",
+          "ok": true,
+          "detail": "'stress_reg_499'"
+        },
+        {
+          "name": "render add commands",
+          "ok": true,
+          "detail": "500/500"
+        }
+      ]
+    },
+    {
+      "name": "batch",
+      "ok": true,
+      "duration_s": 0.07235910004237667,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "batch",
+          "name": "batch.objects",
+          "value": 7747.541702083078,
+          "unit": "objects/s",
+          "note": "один вызов create_object(list)"
+        },
+        {
+          "scenario": "batch",
+          "name": "batch.per_object",
+          "value": 0.1290732000488788,
+          "unit": "ms/object",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "batch returned every object",
+          "ok": true,
+          "detail": "500/500"
+        },
+        {
+          "name": "all objects registered",
+          "ok": true,
+          "detail": "objects_cache=500"
+        },
+        {
+          "name": "render ids unique",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "first visual cache entry",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "last identity cache entry",
+          "ok": true,
+          "detail": "'stress_batch_499'"
+        },
+        {
+          "name": "registration commands emitted",
+          "ok": true,
+          "detail": "register_many=1, render=500"
+        }
+      ]
+    }
+  ]
+}

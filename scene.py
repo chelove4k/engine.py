@@ -182,6 +182,19 @@ def validate_object_data(data: dict) -> None:
     if not isinstance(data, dict):
         raise TypeError("Описание объекта должно быть JSON-объектом")
 
+    # Идентификаторы слотов принадлежат движку.  Пользовательская сцена не
+    # должна задавать их напрямую: иначе можно обойти регистрацию, занять
+    # чужой слот или подделать поколение объекта.
+    for field_name in (
+        "_id", "object_id", "render_id", "_object_id", "_render_id",
+        "_generation",
+    ):
+        if field_name in data:
+            raise ValueError(
+                f"Поле {field_name!r} назначается движком и не может быть "
+                f"задано в сцене"
+            )
+
     identity = data.get("id")
     object_type = data.get("object_type")
     if not isinstance(object_type, str) or not object_type:
