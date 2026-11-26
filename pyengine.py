@@ -4,6 +4,7 @@ import contextvars
 import copy
 import inspect
 import json
+import os
 import queue
 import threading
 import time
@@ -42,7 +43,37 @@ from scene import (
 
 _DEPENDENCIES = contextvars.ContextVar("pyengine_dependencies", default=None)
 _REGISTRATION_LOCK = threading.Lock()
-_REGISTRATION_STASH_PREFIX = "__engine_registration_response__"
+REGISTRATION_STASH_PREFIX = "__engine_registration_response__"
+# Старое приватное имя оставлено для совместимости с существующим кодом.
+_REGISTRATION_STASH_PREFIX = REGISTRATION_STASH_PREFIX
+
+
+def stash_stream_responses(objects_cache, lock, response):
+    """Сохранить чужие ответы Stream, чтобы их не потерял другой читатель.
+
+    ``main_out_stream`` общий: ответ на регистрацию, ``find_object`` или
+    ``camera_targets`` может первым прочитать не тот процесс, который ждёт.
+    Такой читатель обязан вернуть ответ в общий кэш по ``request_id``, иначе
+    ожидающий процесс дождётся таймаута. Функция используется и движком, и
+    диагностическими клиентами вроде стресс-теста.
+    """
+
+    if objects_cache is None or not isinstance(response, dict):
+        return
+    context = lock if lock is not None else nullcontext()
+    for key, value in response.items():
+        with context:
+            objects_cache[(REGISTRATION_STASH_PREFIX, key)] = value
+
+
+def take_stashed_stream_response(objects_cache, lock, request_id):
+    """Забрать ранее сохранённый ответ на ``request_id`` из общего кэша."""
+
+    if objects_cache is None:
+        return None
+    context = lock if lock is not None else nullcontext()
+    with context:
+        return objects_cache.pop((REGISTRATION_STASH_PREFIX, request_id), None)
 
 
 def push_dependencies(dependencies: dict):
@@ -132,12 +163,14 @@ class Keyboard:
     EVENTS_KEY = ("__engine_keyboard__", "events")
 
     def __init__(
-        self, script_owner, objects_cache, event_ring=None, event_sequence=None
+        self, script_owner, objects_cache, event_ring=None, event_sequence=None,
+        input_source=None,
     ):
         self._script_owner = script_owner
         self._objects_cache = objects_cache
         self._event_ring = event_ring
         self._event_sequence_cache = event_sequence
+        self._input_source = input_source
         if event_ring is not None and event_sequence is not None:
             self._event_sequence = int(event_sequence.get())
         else:
@@ -148,6 +181,9 @@ class Keyboard:
         # _poll_events() сдвигает его до выполнения колбэков и update().
         self._initial_event_sequence = self._event_sequence
         self._query_sequences = {}
+
+    def set_input_source(self, input_source):
+        self._input_source = input_source
 
     @staticmethod
     def _normalize_key(key):
@@ -210,12 +246,20 @@ class Keyboard:
         return False
 
     def was_pressed(self, key):
+        if self._input_source is not None:
+            return self._normalize_key(key) in self._input_source.current.pressed_down
         return self._was_event(key, "key_down")
 
     def was_released(self, key):
+        if self._input_source is not None:
+            return self._normalize_key(key) in self._input_source.current.pressed_up
         return self._was_event(key, "key_up")
 
     def _poll_events(self):
+        if self._input_source is not None:
+            # Сетевые события клавиш раздаёт script.step: у каждого скрипта
+            # собственные колбэки, а источник ввода общий на игрока.
+            return []
         pending = self._events_after(self._event_sequence)
         if pending:
             self._event_sequence = pending[-1]["sequence"]
@@ -226,10 +270,11 @@ class Mouse:
     STATE_KEY = ("__engine_mouse__", "state")
     EVENTS_KEY = ("__engine_mouse__", "events")
 
-    def __init__(self, game_object, objects_cache, motion_cache=None):
+    def __init__(self, game_object, objects_cache, motion_cache=None, input_source=None):
         self._game_object = game_object
         self._objects_cache = objects_cache
         self._motion_cache = motion_cache
+        self._input_source = input_source
         events = objects_cache.get(self.EVENTS_KEY) or ()
         self._event_sequence = events[-1]["sequence"] if events else 0
         self._click_sequence = self._event_sequence
@@ -239,6 +284,9 @@ class Mouse:
             int(motion_cache.get(0, "seq"))
             if motion_cache is not None else 0
         )
+
+    def set_input_source(self, input_source):
+        self._input_source = input_source
 
     @staticmethod
     def _normalize_button(button):
@@ -264,23 +312,46 @@ class Mouse:
 
     @property
     def position(self):
+        if self._input_source is not None:
+            snapshot = self._input_source.current
+            return Vector2(snapshot.mouse_x, snapshot.mouse_y)
         position = self._pointer().get("position", (0.0, 0.0))
         return Vector2(position[0], position[1])
 
     @property
     def screen_position(self):
+        if self._input_source is not None:
+            snapshot = self._input_source.current
+            return Vector2(snapshot.mouse_x, snapshot.mouse_y)
         position = self._pointer().get("screen_position", (0.0, 0.0))
         return Vector2(position[0], position[1])
 
     def is_over(self, game_object=None):
+        if self._input_source is not None:
+            # В сетевом кадре нет hovered_render_id: клиент не присылает
+            # результат подбора, чтобы не доверять ему выбор объектов.
+            return False
         target = game_object if game_object is not None else self._game_object
         return self._pointer().get("hovered_render_id") == getattr(target, "_render_id", None)
 
     def is_pressed(self, button="left"):
+        if self._input_source is not None:
+            return self._input_source.current.button_pressed(button)
         pressed = self._state().get("buttons", ())
         return self._normalize_button(button) in pressed
 
     def was_clicked(self, button="left"):
+        if self._input_source is not None:
+            own_render_id = getattr(self._game_object, "_render_id", None)
+            wanted = self._normalize_button(button)
+            for render_id, pressed_button in self._input_source.current.clicks:
+                if render_id not in (0, None, own_render_id):
+                    continue
+                if {1: "left", 2: "middle", 4: "right"}.get(
+                    pressed_button, str(pressed_button)
+                ) == wanted:
+                    return True
+            return False
         events = self._objects_cache.get(self.EVENTS_KEY) or ()
         matching_sequences = [
             event["sequence"]
@@ -332,7 +403,8 @@ class Mouse:
 class _Camera:
     INDEX_PREFIX = "__engine_index__"
 
-    def __init__(self, script_owner, camera_target_cache, camera_scale_cache):
+    def __init__(self, script_owner, camera_target_cache, camera_scale_cache,
+                 request_stream=None):
         self.owner = script_owner
         self.id_cache = script_owner.__dict__["_script__id_cache"]
         self.objects_cache = script_owner.__dict__["_script__objects_cache"]
@@ -340,6 +412,10 @@ class _Camera:
         self.tick_cache = script_owner.__dict__.get("_script__rawTick")
         self.camera_target_cache = camera_target_cache
         self.camera_scale_cache = camera_scale_cache
+        # В режиме Stream список камер запрашивается командой, а живость
+        # цели проверяется по поколению слота в IdCache.
+        self._request_stream = request_stream
+        self._target_generations = {}
         self.targets = {}
         self.target_id = -1
         self.scale = self.camera_scale_cache.get()
@@ -356,6 +432,23 @@ class _Camera:
 
     def _refresh_targets(self):
         """Перестраивает карту name -> render_id, чтобы работали динамически созданные камеры."""
+
+        if self._request_stream is not None:
+            payload = self._request_stream("camera_targets", {})
+            if not isinstance(payload, dict) or "error" in payload:
+                return
+            self.targets = {}
+            self._target_generations = {}
+            for entry in payload.get("targets", ()):
+                name = entry.get("name")
+                render_id = entry.get("render_id")
+                if not name or render_id is None:
+                    continue
+                self.targets.setdefault(name, render_id)
+                self._target_generations[render_id] = entry.get(
+                    "generation", 0
+                )
+            return
 
         self.targets = {}
         target_ids = self.objects_cache.get((self.INDEX_PREFIX, "type", "camera"), ())
@@ -386,6 +479,17 @@ class _Camera:
         return self.objects_cache.get(object_id)
 
     def _is_valid_target(self, render_id):
+        if render_id is None or render_id < 0:
+            return False
+        if self._request_stream is not None:
+            generation = (
+                self.id_cache.get(int(render_id), "generation")
+                if self.id_cache is not None else 0
+            )
+            if not generation:
+                return False
+            known = self._target_generations.get(render_id)
+            return known is None or known == generation
         return self._target_record(render_id) is not None
 
     def _refresh_target(self):
@@ -555,9 +659,6 @@ class GameObject:
                      time_owner=None,
                      time_cache=None,
                      tick_cache=None,
-                     object_id=None,
-                     objects_cache=None,
-                     object_lock=None,
                     ):
             self.__dict__["_initialized"] = False
 
@@ -575,26 +676,46 @@ class GameObject:
             self.__dict__["_simulation_time_owner"] = time_owner
             self.__dict__["_simulation_time_cache"] = time_cache
             self.__dict__["_tick_cache"] = tick_cache
-            self.__dict__["_layer_index_object_id"] = object_id
-            self.__dict__["_layer_index_objects_cache"] = objects_cache
-            self.__dict__["_layer_index_lock"] = object_lock
 
             self.__dict__["_initialized"] = True
+            # Внутренние вызовы не должны проходить через перегруженный
+            # __getattribute__: на каждом визуальном обновлении это заметно.
+            self.__dict__["_changed"] = self.__visual_changed
 
         def __setattr__(self, name: str, value: Any):
-            self.__dict__[name] = value
-            if not self.__dict__["_initialized"]:
+            values = object.__getattribute__(self, "__dict__")
+            values[name] = value
+            if not values["_initialized"]:
                 return
             if name == "position" and isinstance(value, (list, tuple)) and not isinstance(value, Vector2):
-                self.__dict__[name] = Vector2(value[0], value[1])
+                values[name] = Vector2(value[0], value[1])
 
             if name[0] != '_':
-                self.__visual_changed(name)
+                values["_changed"](name)
 
         def __getattribute__(self, name: str):
             if name in {"position", "rotation", "scale", "alpha", "sprite", "layer"}:
                 values = object.__getattribute__(self, "__dict__")
                 if values.get("_initialized"):
+                    # Готовые представления полей убирают поиск по словарю и
+                    # захват блокировки на каждое чтение визуального поля.
+                    views = values.get("_field_views")
+                    if views is None:
+                        views = object.__getattribute__(
+                            self, "_build_field_views"
+                        )()
+                    if views is not None:
+                        view = views.get(name)
+                        if view is not None:
+                            if name == "position":
+                                x, y, _tick = view.get_lockless()
+                                return Vector2(x, y)
+                            if name == "sprite":
+                                # Строка читается под блокировкой: 64 байта
+                                # нельзя безопасно читать во время записи.
+                                return view.get()
+                            return view.get_lockless()
+
                     cache_refs = values.get("_")
                     render_id = values.get("id")
                     if cache_refs and cache_refs[5] is not None and render_id is not None:
@@ -610,13 +731,30 @@ class GameObject:
                         return cache.get(render_id, cache_field)
             return object.__getattribute__(self, name)
 
+        def _build_field_views(self):
+            """Собрать представления полей после назначения render id."""
+
+            values = object.__getattribute__(self, "__dict__")
+            cache = values["_"][5]
+            render_id = values.get("id")
+            if cache is None or render_id is None:
+                return None
+
+            views = {}
+            for name in ("rotation", "scale", "alpha", "layer", "sprite"):
+                views[name] = cache.field_view(name, int(render_id))
+            views["position"] = cache.position_view(int(render_id))
+            values["_field_views"] = views
+            return views
+
         def _current_tick(self):
-            owner = self.__dict__.get("_simulation_time_owner")
+            values = object.__getattribute__(self, "__dict__")
+            owner = values.get("_simulation_time_owner")
             tick = None
             if owner is not None:
                 tick = owner.__dict__.get("_simulation_tick")
             if tick is None:
-                tick_cache = self.__dict__.get("_tick_cache")
+                tick_cache = values.get("_tick_cache")
                 if tick_cache is not None:
                     tick = tick_cache.get()
             if tick is None:
@@ -659,74 +797,33 @@ class GameObject:
             new_x, new_y = move_position(render_id, dx, dy, tick)
             return Vector2(new_x, new_y)
 
-        @staticmethod
-        def _layer_index_add(objects_cache, key, object_id):
-            bucket = objects_cache.get(key)
-            if bucket is None:
-                objects_cache[key] = [object_id]
-            elif isinstance(bucket, list):
-                if object_id in bucket:
-                    return
-                bucket = list(bucket)
-                bucket.append(object_id)
-                objects_cache[key] = bucket
-            else:
-                # Список, переведённый в Manager: добавляем на месте.
-                bucket.append(object_id)
-
-        @staticmethod
-        def _layer_index_remove(objects_cache, key, object_id):
-            bucket = objects_cache.get(key)
-            if bucket is None:
-                return
-            if isinstance(bucket, list):
-                if object_id not in bucket:
-                    return
-                bucket = list(bucket)
-                bucket.remove(object_id)
-                if bucket:
-                    objects_cache[key] = bucket
-                else:
-                    objects_cache.pop(key, None)
-                return
-            try:
-                bucket.remove(object_id)
-            except ValueError:
-                return
-            if not bucket:
-                objects_cache.pop(key, None)
-
-        def __update_layer_index(self, old_layer, new_layer):
-            if old_layer == new_layer:
-                return
-            objects_cache = self.__dict__.get("_layer_index_objects_cache")
-            object_id = self.__dict__.get("_layer_index_object_id")
-            if objects_cache is None or object_id is None:
-                return
-
-            lock = self.__dict__.get("_layer_index_lock")
-            with (lock if lock is not None else nullcontext()):
-                if old_layer is not None:
-                    self._layer_index_remove(
-                        objects_cache,
-                        ("__engine_index__", "layer", float(old_layer)),
-                        object_id,
-                    )
-                self._layer_index_add(
-                    objects_cache,
-                    ("__engine_index__", "layer", float(new_layer)),
-                    object_id,
-                )
-
         def __visual_changed(self, name):
-            id = self.__dict__.get("id")
-            value = self.__dict__[name]
-
-            if self._[5] is None:
+            values = object.__getattribute__(self, "__dict__")
+            id = values.get("id")
+            value = values[name]
+            visual_cache = values["_"][5]
+            if visual_cache is None:
                 print('VisualCache не найден')
                 return
 
-            visual_cache = self._[5]
+            # Если render id уже назначен, пишем через готовое представление:
+            # это убирает повторный поиск поля и вычисление смещения.
+            views = values.get("_field_views")
+            if views is None and id is not None:
+                views = self._build_field_views()
+            view = (
+                views.get("sprite" if name == "path" else name)
+                if views else None
+            )
+            if view is not None:
+                if name == 'position':
+                    view.set(value.x, value.y, self._current_tick())
+                    return
+                if name in {'path', 'sprite'}:
+                    view.set(str(value))
+                    return
+                view.set(value)
+                return
 
             if name == 'position':
                 render_id = id
@@ -752,10 +849,7 @@ class GameObject:
                 visual_cache.set(id, 'alpha', float(value))
                 return
             if name == 'layer':
-                new_layer = float(value)
-                old_layer = visual_cache.get(id, 'layer')
-                visual_cache.set(id, 'layer', new_layer)
-                self.__update_layer_index(old_layer, new_layer)
+                visual_cache.set(id, 'layer', float(value))
                 return
             if name in {'path', 'sprite'}:
                 visual_cache.set(id, 'sprite', str(value))
@@ -856,9 +950,6 @@ class GameObject:
                 time_owner=deps.get("time_owner"),
                 time_cache=deps.get("time_cache"),
                 tick_cache=deps.get("tick_cache"),
-                object_id=self._id,
-                objects_cache=deps.get("objects_cache"),
-                object_lock=deps.get("lock"),
             )
             self.components.append('visual')
 
@@ -909,28 +1000,19 @@ class GameObject:
         return (_REGISTRATION_STASH_PREFIX, request_id)
 
     def _stash_registration_responses(self, response):
-        if self._objects_cache is None or not isinstance(response, dict):
-            return
-        context = self._lock if self._lock is not None else nullcontext()
-        for key, value in response.items():
-            with context:
-                self._objects_cache[self._registration_stash_key(key)] = value
+        stash_stream_responses(self._objects_cache, self._lock, response)
 
     def _take_registration_response(self, request_id):
-        if self._objects_cache is None:
-            return None
-        context = self._lock if self._lock is not None else nullcontext()
-        with context:
-            return self._objects_cache.pop(
-                self._registration_stash_key(request_id), None
-            )
+        return take_stashed_stream_response(
+            self._objects_cache, self._lock, request_id
+        )
 
-    def _wait_registration_response(self, request_id):
-        """Ожидает ответ именно на этот запрос.
+    def _wait_stream_response(self, request_id, description, legacy_key=None):
+        """Ожидает ответ Stream на запрос с указанным ``request_id``.
 
         Ответы сопоставляются по request_id. Если другой поток/процесс
         выигрывает гонку за ответ, полезная нагрузка сохраняется в общем
-        хранилище объектов, чтобы её владелец мог забрать её без потери ответа.
+        хранилище, чтобы её владелец мог забрать её без потери ответа.
         """
 
         deadline = time.monotonic() + REGISTRATION_TIMEOUT
@@ -942,7 +1024,7 @@ class GameObject:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(
-                    f"Stream не ответил на регистрацию объекта {self._id!r} "
+                    f"Stream не ответил на {description} "
                     f"за {REGISTRATION_TIMEOUT:.1f} с"
                 )
 
@@ -954,7 +1036,7 @@ class GameObject:
                 continue
             except (EOFError, BrokenPipeError, OSError) as error:
                 raise RuntimeError(
-                    "Соединение со Stream закрылось во время регистрации"
+                    "Соединение со Stream закрылось во время ожидания ответа"
                 ) from error
 
             if not isinstance(response, dict):
@@ -969,16 +1051,23 @@ class GameObject:
                     self._stash_registration_responses(extra)
                 return payload
             # Обратная совместимость со старым ответом с ключом по id объекта.
-            if self._id in response:
-                payload = response[self._id]
+            if legacy_key is not None and legacy_key in response:
+                payload = response[legacy_key]
                 extra = {
                     key: value for key, value in response.items()
-                    if key != self._id
+                    if key != legacy_key
                 }
                 if extra:
                     self._stash_registration_responses(extra)
                 return payload
             self._stash_registration_responses(response)
+
+    def _wait_registration_response(self, request_id):
+        return self._wait_stream_response(
+            request_id,
+            f"регистрацию объекта {self._id!r}",
+            legacy_key=self._id,
+        )
 
     def _registration_record(self):
         return {
@@ -1018,6 +1107,9 @@ class GameObject:
         # Перепривязываем прокси компонентов, чтобы последующие обращения к
         # Visual/Identity читали и писали общие кэши, а не локальные значения.
         if self.Visual is not None:
+            # Новый слот или кэш делает старые представления полей
+            # недействительными: смещения считаются от render id.
+            self.Visual.__dict__.pop("_field_views", None)
             self.Visual.__dict__["id"] = render_id
             self.Visual._[5] = self._visual_cache
         if self.Identity is not None:
@@ -1082,13 +1174,16 @@ class GameObject:
         with _REGISTRATION_LOCK:
             if self._object_id is not None:
                 # Повторный register() идемпотентен только для живого объекта.
-                # Если объект уже удалён, его слот мог быть переиспользован,
-                # поэтому старые идентификаторы нужно сбросить и запросить новые.
-                record = None
-                if self._objects_cache is not None:
-                    record = self._objects_cache.get(self._id)
-                if (isinstance(record, dict)
-                        and record.get("_generation") == self._generation):
+                # Живость проверяется по поколению слота в IdCache: общий реестр
+                # объектов принадлежит Stream и клиентам недоступен.
+                live = (
+                    self._id_cache is not None
+                    and self._render_id is not None
+                    and self._id_cache.get(
+                        int(self._render_id), "generation"
+                    ) == self._generation
+                )
+                if live:
                     return self
                 self.__dict__["_object_id"] = None
                 self.__dict__["_render_id"] = None
@@ -1282,13 +1377,35 @@ class script:
 
     def is_pressed(self, button: str) -> bool:
         normalized = str(button).upper().replace("_", "")
+        source = self.__dict__.get("_script__input_source")
+        if source is not None:
+            return normalized in source.current.pressed
         return normalized in self.__pressed_keys
 
     def get_pressed_keys(self):
+        source = self.__dict__.get("_script__input_source")
+        if source is not None:
+            return source.current.pressed
         return self.__pressed_keys
 
     def get_mouse_clicks(self):
         """Вспомогательный метод совместимости; новым компонентам следует использовать Mouse или колбэки."""
+        source = self.__dict__.get("_script__input_source")
+        if source is not None:
+            own_render_id = self.GameObject._render_id
+            return [
+                {
+                    "type": "mouse_down",
+                    "render_id": own_render_id,
+                    "button": {1: "left", 2: "middle", 4: "right"}.get(
+                        button, str(button)
+                    ),
+                    "x": source.current.mouse_x,
+                    "y": source.current.mouse_y,
+                }
+                for render_id, button in source.current.clicks
+                if render_id in (0, own_render_id)
+            ]
         events = self.__objects_cache.get(Mouse.EVENTS_KEY) or ()
         new_events = [
             event for event in events
@@ -1299,6 +1416,68 @@ class script:
         if events:
             self.__last_mouse_event_sequence = events[-1]["sequence"]
         return new_events
+
+    def bind_input(self, input_source):
+        """Привязывает источник ввода игрока (серверный режим).
+
+        ``None`` возвращает скрипт к локальному вводу из ``engine_state``.
+        Вызывается планировщиком один раз при назначении объекта игроку.
+        """
+
+        self.__dict__["_script__input_source"] = input_source
+        self.Mouse.set_input_source(input_source)
+        self.Keyboard.set_input_source(input_source)
+        if input_source is not None:
+            self.__dict__["_script__pressed_keys"] = input_source.current.pressed
+
+    def set_strict_tick(self, enabled=True):
+        """Строгий тик: ровно один ``fixed_update`` за проход (сервер)."""
+
+        self.__dict__["_script__strict_tick"] = bool(enabled)
+
+    def __network_button_event(self, snapshot, button_bit):
+        return MouseEvent(
+            {
+                "x": snapshot.mouse_x,
+                "y": snapshot.mouse_y,
+                "screen_x": snapshot.mouse_x,
+                "screen_y": snapshot.mouse_y,
+                "render_id": self.GameObject._render_id,
+                "button": {1: "left", 2: "middle", 4: "right"}.get(
+                    button_bit, "left"
+                ),
+            }
+        )
+
+    def __dispatch_network_input(self, snapshot):
+        """Раздаёт сетевой снимок ввода ровно один раз на тик."""
+
+        if self.__wants_keyboard_events:
+            for key in snapshot.pressed_down:
+                self.on_key_press(KeyboardEvent({"key": key, "modifiers": 0}))
+            for key in snapshot.pressed_up:
+                self.on_key_release(KeyboardEvent({"key": key, "modifiers": 0}))
+
+        if not self.__wants_mouse_actions:
+            return
+        if snapshot.buttons_down:
+            for bit in (1, 2, 4):
+                if snapshot.buttons_down & bit:
+                    self.on_mouse_press(self.__network_button_event(snapshot, bit))
+        if snapshot.buttons_up:
+            for bit in (1, 2, 4):
+                if snapshot.buttons_up & bit:
+                    self.on_mouse_release(
+                        self.__network_button_event(snapshot, bit)
+                    )
+        if snapshot.clicks:
+            own_render_id = self.GameObject._render_id
+            for render_id, button in snapshot.clicks:
+                if render_id not in (0, own_render_id):
+                    continue
+                self.on_mouse_click(
+                    self.__network_button_event(snapshot, int(button))
+                )
 
     def __handle_mouse_move(self, data):
         own_render_id = self.GameObject._render_id
@@ -1359,6 +1538,18 @@ class script:
     def creat_object(self, json_text):
         return self.create_object(json_text)
 
+    def __request_stream(self, command, payload):
+        """Отправить команду Stream и дождаться ответа по request_id."""
+
+        request_id = f"{os.getpid()}:{self.__stream_request_id}"
+        self.__stream_request_id += 1
+        message = {"command": command, "request_id": request_id}
+        message.update(payload)
+        self.__main_in_stream.put(message)
+        return self.GameObject._wait_stream_response(
+            request_id, f"команду {command}"
+        )
+
     def find_object(self, by, data):
         selectors = {"c": "class", "class": "class", "n": "name", "name": "name",
                      "l": "layer", "layer": "layer", "t": "type", "type": "type"}
@@ -1366,9 +1557,25 @@ class script:
         if field is None:
             raise ValueError("by должен быть c/class, n/name, l/layer или t/type")
 
-        if field == "layer" and not self.__objects_cache.get(
-                ("__engine_index__", "layer", "__ready__")):
-            # Путь совместимости для кэшей, созданных без работающего Stream.
+        if getattr(self, "_script__find_object_via_stream", False):
+            payload = self.__request_stream(
+                "find_object", {"field": field, "value": data}
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"Некорректный ответ Stream на find_object: {payload!r}"
+                )
+            if "error" in payload:
+                raise ValueError(payload["error"])
+            source = payload.get("source")
+            if source is None:
+                return None
+            found = GameObject(source, deps=self.__dependencies)
+            if found.Visual is not None:
+                found.Visual.__dict__["_simulation_time_owner"] = self
+            return found
+
+        if field == "layer":
             object_ids = [
                 object_id
                 for object_id, record in self.__objects_cache.items()
@@ -1470,6 +1677,7 @@ class script:
         id_cache,
         object_lock,
         camera_state,
+        find_object_via_stream=False,
     ):
         self.__engine_state = engine_state
         self.__objects_cache = objects_cache
@@ -1514,6 +1722,9 @@ class script:
             "time_owner": self,
             "tick_cache": self.__rawTick,
         }
+        self.__main_in_stream = main_in_stream
+        self.__find_object_via_stream = bool(find_object_via_stream)
+        self.__stream_request_id = 0
         self.__last_fixed_tick = self.__current_tick()
         self.__script_started = False
 
@@ -1542,6 +1753,7 @@ class script:
                 self,
                 self.__camera_target_cache,
                 self.__camera_scale_cache,
+                self.__request_stream if self.__find_object_via_stream else None,
             )
 
             self.__activate()
@@ -1585,8 +1797,23 @@ class script:
         finally:
             pop_dependencies(token)
 
-    def step(self) -> bool:
+    def __is_alive(self):
+        """Проверяет, что слот всё ещё принадлежит этому поколению объекта."""
+
+        render_id = self.GameObject._render_id
+        if render_id is None or self.__id_cache is None:
+            return False
+        return (
+            self.__id_cache.get(int(render_id), "generation")
+            == self.GameObject._generation
+        )
+
+    def step(self, state=None) -> bool:
         """Выполняет одну итерацию скрипта.
+
+        ``state`` — общий снимок часов, tick и счётчиков ввода на проход
+        планировщика. Если он не передан, скрипт читает снимок сам: так
+        работают автономный ``run_forever()`` и юнит-тесты.
 
         Возвращает ``False``, когда объект удалён или скрипт остановлен.
         Планировщик вызывает метод из одного потока, поэтому отдельный поток
@@ -1598,18 +1825,16 @@ class script:
 
         token = push_dependencies(self.__dependencies)
         try:
-            # Одно чтение без блокировки охватывает часы, tick, счётчики
-            # ввода и удаления, а также количество нажатых клавиш. Раньше
-            # это было одно чтение shared memory под межпроцессной
-            # блокировкой: при тысяче скриптов все воркеры конкурировали
-            # за один семафор, и весь конвейер упирался в ~25 обновлений/с.
-            # Каждое поле здесь — одно 4-байтовое значение, поэтому гонка
-            # записи может сделать снимок устаревшим лишь на одно обновление.
-            state = self.__engine_state.get_many_lockless(
-                0, ENGINE_STATE_LOOP_FIELDS
-            )
+            if state is None:
+                # Одно чтение без блокировки охватывает часы, tick, счётчики
+                # ввода и удаления, а также количество нажатых клавиш.
+                state = self.__engine_state.get_many_lockless(
+                    0, ENGINE_STATE_LOOP_FIELDS
+                )
             now = state["time"]
             current_tick = int(state["tick"])
+            input_source = self.__dict__.get("_script__input_source")
+            strict_tick = self.__dict__.get("_script__strict_tick", False)
 
             # Вызовы Manager — самая дорогая часть цикла. Без общего
             # счётчика удалений каждый скрипт должен был спрашивать
@@ -1617,15 +1842,13 @@ class script:
             generation = state["object_generation"]
             if generation != self.__last_object_generation:
                 self.__last_object_generation = generation
-                record = None
-                if self.__objects_cache is not None:
-                    record = self.__objects_cache.get(self.GameObject._id)
-                if (not isinstance(record, dict)
-                        or record.get("_generation")
-                        != self.GameObject._generation):
+                if not self.__is_alive():
                     return False
 
-            if state["keyboard_sequence"] != self.__last_keyboard_sequence:
+            if input_source is not None:
+                # Сетевой ввод игрока уже разложен по тикам планировщиком.
+                self.__pressed_keys = input_source.current.pressed
+            elif state["keyboard_sequence"] != self.__last_keyboard_sequence:
                 # Имена клавиш публикуются снимком в shared memory,
                 # поэтому не нужны ни прокси списка Manager, ни поток опроса.
                 self.__last_keyboard_sequence = state["keyboard_sequence"]
@@ -1636,24 +1859,37 @@ class script:
             self.GlobalTime = now
             self.__dict__["_simulation_tick"] = current_tick
 
-            # Движение указателя живёт в shared memory и проверяется
-            # локально на каждой итерации. События клавиатуры и кликов
-            # по-прежнему используют общий счётчик и список событий Manager.
-            if self.__wants_mouse_motion:
-                self.__dispatch_mouse_motion()
-            wants_mouse_actions = self.__wants_mouse_actions or (
-                self.__motion_cache is None and self.__wants_mouse_motion
-            )
-            if wants_mouse_actions or self.__wants_keyboard_events:
-                input_sequence = state["input_sequence"]
-                if input_sequence != self.__last_input_sequence:
-                    self.__last_input_sequence = input_sequence
-                    if wants_mouse_actions:
-                        self.__dispatch_mouse_events()
-                    if self.__wants_keyboard_events:
-                        self.__dispatch_keyboard_events()
+            if input_source is not None:
+                self.__dispatch_network_input(input_source.current)
+            else:
+                # Движение указателя живёт в shared memory и проверяется
+                # локально на каждой итерации. События клавиатуры и кликов
+                # по-прежнему используют общий счётчик и список событий Manager.
+                if self.__wants_mouse_motion:
+                    self.__dispatch_mouse_motion()
+                wants_mouse_actions = self.__wants_mouse_actions or (
+                    self.__motion_cache is None and self.__wants_mouse_motion
+                )
+                if wants_mouse_actions or self.__wants_keyboard_events:
+                    input_sequence = state["input_sequence"]
+                    if input_sequence != self.__last_input_sequence:
+                        self.__last_input_sequence = input_sequence
+                        if wants_mouse_actions:
+                            self.__dispatch_mouse_events()
+                        if self.__wants_keyboard_events:
+                            self.__dispatch_keyboard_events()
 
             self.update()
+
+            if strict_tick:
+                # Сервер: ровно один шаг на тик. Пропущенные тики не
+                # догоняются, иначе один проход моделировал бы мир дважды.
+                if self.__last_fixed_tick != current_tick:
+                    self.__last_fixed_tick = current_tick
+                    self.__dict__["_simulation_tick"] = current_tick
+                    self.GlobalTime = current_tick * FIXED_DT
+                    self.fixed_update()
+                return True
 
             # Каждый скрипт проходит одну и ту же общую последовательность
             # tick. Поэтому позиция, записанная во время tick N, сохраняется

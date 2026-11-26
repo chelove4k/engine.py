@@ -1,0 +1,166 @@
+{
+  "generated_at": "2026-11-20T12:07:09",
+  "config": {
+    "scenario": "registration,scripts",
+    "duration": 2.0,
+    "objects": 1000,
+    "pairs": 100000,
+    "frames": 60,
+    "cache_ops": 100000,
+    "processes": 4,
+    "workers": 1,
+    "scripts": 1,
+    "motion_objects": 16,
+    "iterations": 100,
+    "timeout": 20.0,
+    "list": false
+  },
+  "ok": true,
+  "results": [
+    {
+      "name": "registration",
+      "ok": true,
+      "duration_s": 2.4934746000217274,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "registration",
+          "name": "registration.objects",
+          "value": 1197.8739175563587,
+          "unit": "objects/s",
+          "note": "1000 объектов, 1 рабочих"
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p50",
+          "value": 0.8190000080503523,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p95",
+          "value": 0.936599972192198,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p99",
+          "value": 1.058399968314916,
+          "unit": "ms/object",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "all objects created",
+          "ok": true,
+          "detail": "1000/1000"
+        },
+        {
+          "name": "object ids unique",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "registered generation published",
+          "ok": true,
+          "detail": "generation=1"
+        },
+        {
+          "name": "stream registry contains objects",
+          "ok": true,
+          "detail": "{'objects': 1005, 'rendered': 1004}"
+        },
+        {
+          "name": "visual cache updated",
+          "ok": true,
+          "detail": "x=99.0, y=9.0"
+        },
+        {
+          "name": "identity cache updated",
+          "ok": true,
+          "detail": "'stress_reg_999'"
+        },
+        {
+          "name": "render add commands",
+          "ok": true,
+          "detail": "1000/1000"
+        }
+      ]
+    },
+    {
+      "name": "scripts",
+      "ok": true,
+      "duration_s": 3.0852618000353687,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "scripts",
+          "name": "scripts.updates",
+          "value": 99.9846023732967,
+          "unit": "updates/s",
+          "note": "среднее по 1, 100 итераций/обновление"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.target",
+          "value": 100.0,
+          "unit": "updates/s",
+          "note": "SCRIPT_UPDATE_HZ"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.efficiency",
+          "value": 99.9846023732967,
+          "unit": "% от цели",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.min_updates",
+          "value": 99.9846023732967,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.max_updates",
+          "value": 99.9846023732967,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.update_period",
+          "value": 10.00153999979375,
+          "unit": "ms/update",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "component loops started",
+          "ok": true,
+          "detail": "rotations=[5.0]"
+        },
+        {
+          "name": "updates observed",
+          "ok": true,
+          "detail": "rates=[100.0]"
+        },
+        {
+          "name": "rotation advanced",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "keyboard callback delivered",
+          "ok": true,
+          "detail": "scales=[2.0]"
+        }
+      ]
+    }
+  ]
+}

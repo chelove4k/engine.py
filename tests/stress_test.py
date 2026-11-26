@@ -75,7 +75,9 @@ VISUAL_STRUCT = {
     "sprite": str,
     "layer": float,
 }
-ID_STRUCT = {"name": str, "type": str, "class": str, "id": str}
+ID_STRUCT = {
+    "name": str, "type": str, "class": str, "id": str, "generation": int,
+}
 CONTENTION_STRUCT = {"value": float, "counter": int}
 
 
@@ -831,18 +833,23 @@ class LiveStreamHarness:
         import stream
 
         self.manager = multiprocessing.Manager()
-        self.render_in_stream = self.manager.Queue()
-        self.render_out_stream = self.manager.Queue()
-        self.main_in_stream = self.manager.Queue()
-        self.main_out_stream = self.manager.Queue()
-        self.objects_cache = self.manager.dict()
-        self.object_lock = self.manager.Lock()
-        self.status = self.manager.list()
-        self.worker_ready = self.manager.list([False] * self.workers)
+        self.render_in_stream = multiprocessing.Queue()
+        self.render_out_stream = multiprocessing.Queue()
+        self.main_in_stream = multiprocessing.Queue()
+        self.main_out_stream = multiprocessing.Queue()
+        self.console_out_stream = multiprocessing.Queue()
+        # Реестр объектов живёт внутри Stream.  Общий словарь нужен только
+        # для событий ввода, которые читают скрипты.
+        self.input_cache = self.manager.dict()
+        self.object_lock = multiprocessing.Lock()
+        self.status = multiprocessing.Array("i", self.workers, lock=False)
+        self.worker_ready = multiprocessing.Array(
+            "b", self.workers, lock=False
+        )
         self.worker_queues = [
-            self.manager.Queue() for _ in range(self.workers)
+            multiprocessing.Queue() for _ in range(self.workers)
         ]
-        self.lock = self.manager.Lock()
+        self.lock = multiprocessing.Lock()
 
         self.visual_locks = [multiprocessing.Lock() for _ in range(64)]
         self.visual_dirty_counts = multiprocessing.Array(
@@ -960,7 +967,7 @@ class LiveStreamHarness:
                 self.render_out_stream,
                 self.main_in_stream,
                 self.main_out_stream,
-                self.objects_cache,
+                self.input_cache,
                 self.status,
                 self.worker_queues,
                 self.worker_ready,
@@ -971,8 +978,7 @@ class LiveStreamHarness:
                 self.camera_state,
                 self.motion_cache,
                 self.keyboard_ring_data,
-                self.manager.address,
-                self.manager._authkey,
+                self.console_out_stream,
             ),
         )
         self.process.start()
@@ -984,7 +990,7 @@ class LiveStreamHarness:
             self.deps = {
                 "main_in_stream": self.main_in_stream,
                 "main_out_stream": self.main_out_stream,
-                "objects_cache": self.objects_cache,
+                "objects_cache": self.input_cache,
                 "lock": self.object_lock,
                 "visual_cache": self.client_visual,
                 "id_cache": self.client_id,
@@ -996,12 +1002,52 @@ class LiveStreamHarness:
             raise
         return self
 
-    def _scene_object_count(self):
-        return sum(
-            1
-            for record in self.objects_cache.values()
-            if isinstance(record, dict) and "_render_id" in record
+    def _request_stats(self, timeout=0.5):
+        """Запрашивает статистику локального реестра у процесса Stream.
+
+        ``main_out_stream`` читают и клиенты регистрации, и скрипты. Чужой
+        ответ нельзя выбрасывать: его нужно вернуть в общий кэш, иначе
+        ожидающий процесс получит таймаут. Свой ответ, наоборот, может лежать
+        в кэше, если его успел прочитать другой участник.
+        """
+
+        from pyengine import (
+            stash_stream_responses,
+            take_stashed_stream_response,
         )
+
+        request_id = f"stress:stats:{time.monotonic_ns()}"
+        self.main_in_stream.put({
+            "command": "stats",
+            "request_id": request_id,
+        })
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            stashed = take_stashed_stream_response(
+                self.input_cache, self.object_lock, request_id
+            )
+            if stashed is not None:
+                return stashed
+            try:
+                response = self.main_out_stream.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if not isinstance(response, dict):
+                continue
+            if request_id in response:
+                extra = {
+                    key: value for key, value in response.items()
+                    if key != request_id
+                }
+                if extra:
+                    stash_stream_responses(
+                        self.input_cache, self.object_lock, extra
+                    )
+                return response[request_id]
+            stash_stream_responses(
+                self.input_cache, self.object_lock, response
+            )
+        return None
 
     def _drain_render_queue(self):
         while True:
@@ -1012,20 +1058,22 @@ class LiveStreamHarness:
 
     def _wait_ready(self):
         deadline = time.monotonic() + self.timeout
+        stats = None
         while time.monotonic() < deadline:
             if not self.process.is_alive():
                 raise RuntimeError(
                     "Процесс Stream завершился при запуске; смотрите его traceback"
                 )
-            if (all(self.worker_ready)
-                    and self._scene_object_count() >= SCENE_OBJECT_COUNT):
-                self._drain_render_queue()
-                return
+            if all(self.worker_ready):
+                stats = self._request_stats()
+                if (stats is not None
+                        and stats.get("objects", 0) >= SCENE_OBJECT_COUNT):
+                    self._drain_render_queue()
+                    return
             time.sleep(0.05)
         raise RuntimeError(
             f"Stream не стал готов за {self.timeout:.1f}с "
-            f"(workers={list(self.worker_ready)}, "
-            f"scene_objects={self._scene_object_count()})"
+            f"(workers={list(self.worker_ready)}, stats={stats})"
         )
 
     def close(self):
@@ -1110,8 +1158,16 @@ def run_registration(args) -> ScenarioResult:
         expected_x = float((count - 1) % 100)
         expected_y = float((count - 1) // 100)
         result.check(
-            "registered in objects_cache",
-            harness.objects_cache.get(last._id) is not None,
+            "registered generation published",
+            harness.client_id.get(last._render_id, "generation")
+            == last._generation,
+            f"generation={harness.client_id.get(last._render_id, 'generation')}",
+        )
+        stats = harness._request_stats()
+        result.check(
+            "stream registry contains objects",
+            stats is not None and stats.get("objects", 0) >= count,
+            repr(stats),
         )
         result.check(
             "visual cache updated",

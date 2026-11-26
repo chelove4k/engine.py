@@ -1,0 +1,193 @@
+{
+  "generated_at": "2026-11-19T13:53:06",
+  "config": {
+    "scenario": "scripts,motion",
+    "duration": 2.0,
+    "objects": 1000,
+    "pairs": 100000,
+    "frames": 60,
+    "cache_ops": 100000,
+    "processes": 4,
+    "workers": 1,
+    "scripts": 3,
+    "motion_objects": 8,
+    "iterations": 100,
+    "timeout": 20.0,
+    "list": false
+  },
+  "ok": true,
+  "results": [
+    {
+      "name": "scripts",
+      "ok": true,
+      "duration_s": 3.871689099993091,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "scripts",
+          "name": "scripts.updates",
+          "value": 93.47859807524098,
+          "unit": "updates/s",
+          "note": "среднее по 3, 100 итераций/обновление"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.target",
+          "value": 100.0,
+          "unit": "updates/s",
+          "note": "SCRIPT_UPDATE_HZ"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.efficiency",
+          "value": 93.47859807524098,
+          "unit": "% от цели",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.min_updates",
+          "value": 93.47859807524097,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.max_updates",
+          "value": 93.47859807524097,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.update_period",
+          "value": 10.697635828846078,
+          "unit": "ms/update",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "component loops started",
+          "ok": true,
+          "detail": "rotations=[4.0, 4.0, 4.0]"
+        },
+        {
+          "name": "updates observed",
+          "ok": true,
+          "detail": "rates=[93.5, 93.5, 93.5]"
+        },
+        {
+          "name": "rotation advanced",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "keyboard callback delivered",
+          "ok": true,
+          "detail": "scales=[2.0, 2.0, 2.0]"
+        }
+      ]
+    },
+    {
+      "name": "motion",
+      "ok": true,
+      "duration_s": 4.985673199989833,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "motion",
+          "name": "motion.objects",
+          "value": 8.0,
+          "unit": "objects",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.frames",
+          "value": 99.98367766546085,
+          "unit": "frames/s",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.updates_mean",
+          "value": 99.48375927713354,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.updates_min",
+          "value": 99.48375927713354,
+          "unit": "updates/s",
+          "note": "цель 100"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.gap_p95",
+          "value": 29.607999953441322,
+          "unit": "ms",
+          "note": "8 объектов"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.gap_max",
+          "value": 30.523499997798353,
+          "unit": "ms",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_step_std",
+          "value": 0.02889090728409222,
+          "unit": "ticks",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_frozen",
+          "value": 0.0,
+          "unit": "% от кадров",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_big_jumps",
+          "value": 0.0,
+          "unit": "frames",
+          "note": "шаг > 2 тиков"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_max_step",
+          "value": 1.1315400013700128,
+          "unit": "ticks",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "moving objects advance",
+          "ok": true,
+          "detail": "min=99.5/s, target>=30.0/s"
+        },
+        {
+          "name": "shared render tick stays smooth",
+          "ok": true,
+          "detail": "frozen=0/199, backward=0"
+        },
+        {
+          "name": "no multi-tick render jumps",
+          "ok": true,
+          "detail": "max_step=1.13 ticks (delay=4.0)"
+        },
+        {
+          "name": "heartbeats stay inside interpolation window",
+          "ok": true,
+          "detail": "p95=29.6ms, delay=40.0ms"
+        }
+      ]
+    }
+  ]
+}

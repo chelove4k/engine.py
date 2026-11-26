@@ -1,7 +1,11 @@
 ﻿from __future__ import annotations
 
+import argparse
 import multiprocessing
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -35,6 +39,13 @@ from memory_lib import FieldView, ObjectCache, ValueCache
 
 NO_SPRITE = "None"
 
+# Сетевой клиент живёт в процессе рендера: сокет неблокирующий, поэтому
+# приём снапшотов и отправка ввода укладываются в обычный on_update.
+NET_INPUT_HZ = 100
+NET_INPUT_PERIOD = 1.0 / NET_INPUT_HZ
+NET_PING_PERIOD = 1.0
+NET_CONNECT_TIMEOUT = 15.0
+
 # Проверка попадания мыши раньше шла по всем render id на каждом событии
 # движения.  Равномерная сетка ограничивает её спрайтами возле указателя.
 # Плотным сценам выгодны мелкие ячейки: при 32 единицах сетка на 1000
@@ -43,11 +54,6 @@ HIT_TEST_CELL_SIZE = 32.0
 # Огромные спрайты (фоны) задевали бы тысячи ячеек.  Держим их в отдельном
 # коротком списке, который проверяется при каждом запросе.
 HIT_TEST_MAX_CELLS = 32
-# Информационный оверлей читает данные идентичности/скриптов из Manager раз
-# в секунду, а не раз на спрайт за кадр.  Данные оверлея — отладочный вывод;
-# секундная задержка безвредна, тогда как тысячи чтений Manager за кадр
-# обрушивали частоту кадров.
-INFO_OVERLAY_CACHE_TTL = 1.0
 
 
 def _is_no_sprite(path):
@@ -82,6 +88,8 @@ class Game(arcade.Window):
         clock_origin=None,
         tick_cache=None,
         overlay_settings=None,
+        net_client=None,
+        net_owner_render_id=0,
     ):
         super().__init__(
             width,
@@ -106,7 +114,8 @@ class Game(arcade.Window):
 
         self.render_in_stream = data[0]
         self.main_in_stream = data[1]
-        self.object_cache = data[2]
+        # data[2] — общий input_cache; рендереру он не нужен, статическая
+        # информация приходит вместе с командой add.
         self.overlay_settings = overlay_settings or console.OverlaySettings()
         self.visual_cache = ObjectCache(*data[3])
         # Если кэш отдаёт счётчики полос, активные render id хранятся заранее
@@ -159,6 +168,43 @@ class Game(arcade.Window):
         self._fps_elapsed = 0.0
         self._pending_mouse_motion = None
 
+        # -- сетевой режим --------------------------------------------------
+        # None — одиночная игра.  В join/host клиент получает снапшоты,
+        # подтверждает их и отправляет ввод с заявками на проверку.
+        self.net_client = net_client
+        self._net_owner_render_id = int(net_owner_render_id or 0)
+        self._net_authoritative_ids = set()
+        self._net_pending_render_state = {}
+        self._net_applied_tick = 0
+        self._net_pressed_keys = set()
+        self._net_buttons = 0
+        self._net_mouse_world = (0.0, 0.0)
+        self._net_hovered_render_id = 0
+        self._net_pending_clicks = []
+        self._net_input_accumulator = 0.0
+        # Тик локальной симуляции, для которого уже ушёл кадр ввода. Повторно
+        # слать тот же тик нельзя: сервер потребит два кадра на разных тиках,
+        # и сверка приращений даст ложный desync (0 движения против 1 тика).
+        self._net_last_input_tick = -1
+        self._net_last_ping = 0.0
+        self._net_disconnect_reported = False
+        self._net_sprite_paths = {}
+        self._net_last_sample_tick = 0
+        if net_client is not None:
+            from net.reconcile import CorrectionBuffer
+
+            self._net_corrections = CorrectionBuffer()
+        else:
+            self._net_corrections = None
+
+        self.net_text = arcade.Text(
+            text='',
+            x=10,
+            y=height - 45,
+            color=arcade.color.YELLOW,
+            font_size=12,
+        )
+
         self.fps_text = arcade.Text(
             text='FPS: 0',
             x=10,
@@ -186,6 +232,7 @@ class Game(arcade.Window):
         self._render_queue()
         self._read_camera_state()
         self._flush_mouse_motion()
+        self._net_update(delta_time)
 
 
 
@@ -195,6 +242,7 @@ class Game(arcade.Window):
         except ValueError:
             key_name = str(key)
 
+        self._net_pressed().add(key_name)
         self.main_in_stream.put({
             'command': 'input',
             'type': 'key_down',
@@ -209,6 +257,7 @@ class Game(arcade.Window):
         except ValueError:
             key_name = str(key)
 
+        self._net_pressed().discard(key_name)
         self.main_in_stream.put({
             'command': 'input',
             'type': 'key_up',
@@ -219,6 +268,15 @@ class Game(arcade.Window):
     @staticmethod
     def _mouse_button_name(button):
         return {1: "left", 2: "middle", 4: "right"}.get(button, str(button))
+
+    def _net_pressed(self):
+        """Набор нажатых клавиш; у объектов из тестов его может не быть."""
+
+        pressed = getattr(self, "_net_pressed_keys", None)
+        if pressed is None:
+            pressed = set()
+            self._net_pressed_keys = pressed
+        return pressed
 
     def _sort_render_layers(self):
         # Перестройка бывает только при добавлении/удалении/смене слоя.  Каждый
@@ -503,6 +561,10 @@ class Game(arcade.Window):
         world_position = self.camera.unproject((x, y))
         point = (world_position.x, world_position.y)
         target_render_id = self._hit_test(point)
+        # Сетевой кадр описывает указатель в мировых координатах: сервер не
+        # доверяет клиентскому hit-test и передаёт render_id клика отдельно.
+        self._net_mouse_world = point
+        self._net_hovered_render_id = int(target_render_id or 0)
         published = self._publish_pointer_snapshot(
             event_type, target_render_id, point, x, y, dx, dy
         )
@@ -554,10 +616,20 @@ class Game(arcade.Window):
         # Сохраняем порядок входа/выхода перед кликом в той же позиции.
         self._flush_mouse_motion()
         self._send_mouse_event("mouse_down", x, y, button)
+        if getattr(self, "net_client", None) is not None:
+            bit = int(button) & 0xFF
+            self._net_buttons |= bit
+            self._net_pending_clicks.append(
+                (self._net_hovered_render_id, bit)
+            )
+            if len(self._net_pending_clicks) > 8:
+                del self._net_pending_clicks[:-8]
 
     def on_mouse_release(self, x, y, button, modifiers):
         self._flush_mouse_motion()
         self._send_mouse_event("mouse_up", x, y, button)
+        if getattr(self, "net_client", None) is not None:
+            self._net_buttons &= ~(int(button) & 0xFF)
 
     def on_mouse_motion(self, x, y, dx, dy):
         self._queue_mouse_motion(x, y, dx, dy)
@@ -629,7 +701,12 @@ class Game(arcade.Window):
             if updates:
                 sprites_by_id = self._sprites_by_render_id
                 apply_update = self._apply_update
+                authoritative = getattr(self, "_net_authoritative_ids", None)
                 for render_id, entry in updates.items():
+                    if authoritative and render_id in authoritative:
+                        # Удалённые объекты движет только сервер: локальные
+                        # скрипты этого клиента не знают чужой ввод.
+                        continue
                     sprite = sprites_by_id.get(render_id)
                     if sprite is None:
                         continue
@@ -767,6 +844,8 @@ class Game(arcade.Window):
         histories = self._position_history_by_render_id
         interpolate = self._position_from_history
         mark_position = self._hit_mark_position
+        corrections = getattr(self, "_net_corrections", None)
+        owner_id = getattr(self, "_net_owner_render_id", 0)
         idle_before = render_tick - self.INTERPOLATION_IDLE_TICKS
         stale = None
         for render_id in moving:
@@ -780,6 +859,10 @@ class Game(arcade.Window):
             sprite = sprites.get(render_id)
             if sprite is not None:
                 position = interpolate(history, render_tick)
+                if corrections is not None and render_id == owner_id:
+                    dx, dy, _drot = corrections.sample(render_id)
+                    if dx or dy:
+                        position = (position[0] + dx, position[1] + dy)
                 if sprite.position != position:
                     # Один установщик позиции обновляет hit box arcade и слот в
                     # списке спрайтов за раз; center_x/center_y сделали бы это дважды.
@@ -823,16 +906,8 @@ class Game(arcade.Window):
             if position is not None:
                 self.camera.position = position
 
-    def _get_collider_polygon(self, render_id):
-        record = self.object_cache.get((stream.Stream.INDEX_PREFIX, "render_id", render_id))
-        if record is not None:
-            record = self.object_cache.get(record)
-        if record is None:
-            return None
-        transform = record.get("dict_data", {}).get("transform")
-        if transform is None:
-            return None
-        return validate_convex_polygon(transform["polygon"])
+    def _get_collider_polygon(self, data):
+        return validate_convex_polygon(data)
 
     def _draw_collision_overlay(self, render_tick):
         settings = self.overlay_settings.get("collision")
@@ -853,33 +928,10 @@ class Game(arcade.Window):
                     world_polygon, settings["color"], line_width=settings["width"]
                 )
 
-    def _info_static_for(self, render_id, now):
-        """Возвращает кэшированные идентичность/скрипты для информационного оверлея."""
+    def _info_static_for(self, render_id, now=None):
+        """Возвращает статическую идентичность и скрипты из команды add."""
 
-        cached = self._info_static_cache.get(render_id)
-        if cached is not None and cached[0] >= now:
-            return cached[1]
-
-        index_key = (stream.Stream.INDEX_PREFIX, "render_id", render_id)
-        record_id = self.object_cache.get(index_key)
-        record = self.object_cache.get(record_id) if record_id is not None else None
-        if record is None:
-            return None
-
-        data = record.get("dict_data", {})
-        identity = data.get("_identity", {})
-        scripts = data.get("scripting", {}).get("scripts", [])
-        payload = {
-            "object_id": record.get("_id", "?"),
-            "name": identity.get("name", "-"),
-            "class": identity.get("class", "-"),
-            "type": identity.get("type", data.get("object_type", "-")),
-            "scripts": ", ".join(Path(path).name for path in scripts) or "-",
-        }
-        self._info_static_cache[render_id] = (
-            now + INFO_OVERLAY_CACHE_TTL, payload,
-        )
-        return payload
+        return self._info_static_cache.get(render_id)
 
     def _draw_info_categories(self, render_tick):
         categories = ("id", "name", "coords", "scripts", "transform")
@@ -892,11 +944,10 @@ class Game(arcade.Window):
         if not any(enabled.values()):
             return
 
-        now = time.monotonic()
         for render_id, sprite in self._sprites_by_render_id.items():
             if sprite.alpha <= 0:
                 continue
-            static = self._info_static_for(render_id, now)
+            static = self._info_static_for(render_id)
             if static is None:
                 continue
             world = self._world_data_by_render_id.get(render_id, {})
@@ -1008,6 +1059,15 @@ class Game(arcade.Window):
         self._info_text_by_render_id.clear()
         self._info_static_cache.clear()
         self._failed_textures.clear()
+        authoritative = getattr(self, "_net_authoritative_ids", None)
+        if authoritative is not None:
+            authoritative.clear()
+        pending_net = getattr(self, "_net_pending_render_state", None)
+        if pending_net is not None:
+            pending_net.clear()
+        paths = getattr(self, "_net_sprite_paths", None)
+        if paths is not None:
+            paths.clear()
         self._camera_target_id = -1
         self.camera_target_cache.set(-1)
 
@@ -1021,6 +1081,19 @@ class Game(arcade.Window):
         if buckets is not None:
             buckets[render_id % len(buckets)].discard(render_id)
 
+    def _store_static_info(self, render_id, data):
+        """Сохраняет идентичность и скрипты из команды add для оверлея."""
+
+        identity = data.get('identity') or {}
+        scripts = data.get('scripts') or ()
+        self._info_static_cache[render_id] = {
+            "object_id": data.get('object_id', "?"),
+            "name": identity.get("name", "-"),
+            "class": identity.get("class", "-"),
+            "type": identity.get("type") or data.get('object_type') or "-",
+            "scripts": ", ".join(Path(path).name for path in scripts) or "-",
+        }
+
     def _add_sprite(self, data):
 
         render_id = data['render_id']
@@ -1033,6 +1106,25 @@ class Game(arcade.Window):
             'alpha':    data.get('alpha', 1.0),
             'layer':    float(data.get('layer', 0.0)),
         }
+
+        # Снапшот мог прийти раньше, чем Stream прислал команду add.  Тогда
+        # спрайт создаётся сразу в серверной позиции, а не в локальной.
+        pending_net = getattr(self, "_net_pending_render_state", None)
+        network_state = (
+            pending_net.pop(render_id, None) if pending_net else None
+        )
+        if network_state is not None and render_id != getattr(
+            self, "_net_owner_render_id", 0
+        ):
+            self._net_authoritative_ids.add(render_id)
+            self._net_sprite_paths[render_id] = network_state.sprite
+            world_data.update({
+                'position': (network_state.x, network_state.y),
+                'scale': network_state.scale,
+                'rotation': network_state.rotation,
+                'alpha': network_state.alpha,
+                'layer': network_state.layer,
+            })
 
         image_path = data.get('path')
         texture = self._texture_for_path(image_path)
@@ -1052,14 +1144,27 @@ class Game(arcade.Window):
         if data.get('scripted'):
             self._scripted_render_ids.add(render_id)
         self._render_order_dirty = True
-        collider_polygon = self._get_collider_polygon(render_id)
-        if collider_polygon is not None:
-            self._colliders_by_render_id[render_id] = collider_polygon
+
+        self._store_static_info(render_id, data)
+        collider = data.get('collider')
+        if collider is not None:
+            try:
+                self._colliders_by_render_id[render_id] = (
+                    self._get_collider_polygon(collider)
+                )
+            except (TypeError, ValueError) as error:
+                self.print(
+                    f"Некорректный коллайдер render_id {render_id}: {error}"
+                )
+        record_tick = data.get('tick', round(
+            float(data.get('sim_time', self.Time.get())) / self.SIMULATION_TICK
+        ))
+        if network_state is not None and self._net_last_sample_tick:
+            record_tick = self._net_last_sample_tick
         self._record_position(
             render_id,
             world_data['position'],
-            data.get('tick', round(float(data.get('sim_time', self.Time.get()))
-                                   / self.SIMULATION_TICK)),
+            record_tick,
         )
 
         self._apply_world_transform(sprite, world_data)
@@ -1092,6 +1197,15 @@ class Game(arcade.Window):
         self._waiting_updates.pop(render_id, None)
         self._colliders_by_render_id.pop(render_id, None)
         self._info_text_by_render_id.pop(render_id, None)
+        authoritative = getattr(self, "_net_authoritative_ids", None)
+        if authoritative is not None:
+            authoritative.discard(render_id)
+        pending_net = getattr(self, "_net_pending_render_state", None)
+        if pending_net is not None:
+            pending_net.pop(render_id, None)
+        paths = getattr(self, "_net_sprite_paths", None)
+        if paths is not None:
+            paths.pop(render_id, None)
 
     def _apply_update(self, id, sprite, object_data):
         world_data = self._world_data_by_render_id.get(id)
@@ -1254,6 +1368,7 @@ class Game(arcade.Window):
 
         render_tick = self._resolve_render_tick()
         self._interpolate_sprite_positions(render_tick)
+        self._apply_net_rotation_offsets()
         self._track_camera_target(render_tick)
 
         self.camera.use()
@@ -1263,6 +1378,234 @@ class Game(arcade.Window):
         self.gui_camera.use()
         self._draw_info_categories(render_tick)
         self.fps_text.draw()
+        if getattr(self, "net_client", None) is not None:
+            self.net_text.draw()
+
+    # -- сетевой клиент ---------------------------------------------------
+
+    def _apply_net_rotation_offsets(self):
+        """Дорисовывает затухающий поворот после CORRECTION."""
+
+        corrections = getattr(self, "_net_corrections", None)
+        if corrections is None:
+            return
+        sprites = self._sprites_by_render_id
+        world_data = self._world_data_by_render_id
+        for render_id, (_dx, _dy, drot) in corrections.sample_all().items():
+            sprite = sprites.get(render_id)
+            world = world_data.get(render_id)
+            if sprite is not None and world is not None and drot:
+                sprite.angle = world['rotation'] + drot
+
+    def _net_update(self, delta_time):
+        """Принимает снапшоты/коррекции и отправляет ввод с заявками."""
+
+        client = getattr(self, "net_client", None)
+        if client is None:
+            return
+
+        client.pump(0.0)
+        if not client.connected:
+            if not self._net_disconnect_reported:
+                self._net_disconnect_reported = True
+                self.print("соединение с сервером потеряно")
+            self.net_text.text = "NET: disconnected"
+            return
+
+        self._apply_net_snapshots()
+        self._apply_net_corrections()
+        self._update_net_status_text(client)
+
+        now = time.monotonic()
+        if now - self._net_last_ping >= NET_PING_PERIOD:
+            self._net_last_ping = now
+            client.ping()
+
+        # Arcade вызывает on_update ~100 раз в секунду, но темп не гарантирован.
+        # Считаем по времени и шлём не больше двух кадров за проход, чтобы не
+        # копить очередь на сервере.
+        self._net_input_accumulator += max(0.0, float(delta_time))
+        sent = 0
+        tick = int(self._current_tick())
+        last_tick = getattr(self, "_net_last_input_tick", -1)
+        while (
+            self._net_input_accumulator >= NET_INPUT_PERIOD
+            and sent < 2
+        ):
+            self._net_input_accumulator -= NET_INPUT_PERIOD
+            # Один кадр на тик симуляции. Если тик не сменился, кадр был бы
+            # дублем: сервер применил бы его на следующем тике, а заявка
+            # клиента не изменилась бы.
+            if tick == last_tick:
+                continue
+            last_tick = tick
+            self._net_last_input_tick = tick
+            self._send_net_input(client)
+            sent += 1
+        if self._net_input_accumulator > NET_INPUT_PERIOD * 3:
+            self._net_input_accumulator = NET_INPUT_PERIOD * 3
+
+    def _update_net_status_text(self, client):
+        welcome = getattr(client, "welcome", None)
+        players = welcome.max_players if welcome is not None else 0
+        role = (
+            f"owner={self._net_owner_render_id}"
+            if self._net_owner_render_id
+            else "observer"
+        )
+        self.net_text.text = (
+            f"NET: {client.name} id={client.client_id} {role} "
+            f"rtt={client.rtt_us // 1000}ms/{players}p"
+        )
+
+    def _send_net_input(self, client):
+        from net.keys import pack_keys
+        from net.protocol import make_input_frame, state_crc
+
+        keys = tuple(self._net_pressed_keys)
+        mouse_x, mouse_y = self._net_mouse_world
+        claims = ()
+        owner_id = self._net_owner_render_id
+        if owner_id:
+            world = self._world_data_by_render_id.get(owner_id)
+            if world is not None:
+                x, y = world['position']
+                rotation = world['rotation']
+                claims = ((
+                    owner_id,
+                    float(x),
+                    float(y),
+                    float(rotation),
+                    state_crc(x, y, rotation),
+                ),)
+        clicks = self._net_pending_clicks
+        self._net_pending_clicks = []
+        frame = make_input_frame(
+            0,
+            0,
+            keys,
+            mouse_x=mouse_x,
+            mouse_y=mouse_y,
+            buttons=self._net_buttons,
+            clicks=clicks,
+            claims=claims,
+        )
+        client.send_input(frame)
+
+    def _apply_net_corrections(self):
+        corrections = getattr(self, "_net_corrections", None)
+        if corrections is None:
+            return
+        owner_id = self._net_owner_render_id
+        if not owner_id:
+            return
+        for correction in self.net_client.drain_corrections():
+            if int(correction.render_id) != owner_id:
+                continue
+            world = self._world_data_by_render_id.get(owner_id)
+            if world is None:
+                continue
+            dx = float(correction.x) - world['position'][0]
+            dy = float(correction.y) - world['position'][1]
+            drot = (
+                float(correction.rotation) - world['rotation'] + 180.0
+            ) % 360.0 - 180.0
+            # Симуляцию не перезапускаем: клиент не может откатить чужие
+            # скрипты.  Визуально гасим расхождение за CORRECTION_DECAY.
+            corrections.add(owner_id, dx, dy, drot)
+            self.print(
+                f"коррекция {owner_id}: dx={dx:.3f} dy={dy:.3f} "
+                f"drot={drot:.2f}"
+            )
+
+    def _apply_net_snapshots(self):
+        client = self.net_client
+        snapshot = client.last_snapshot
+        if snapshot is None:
+            return
+        tick = int(snapshot.tick)
+        if tick == self._net_applied_tick:
+            return
+        self._net_applied_tick = tick
+
+        state = client.state
+        owner_id = self._net_owner_render_id
+        # Переводим серверный тик в локальную шкалу рендера: снапшот уже
+        # устарел на несколько тиков, и интерполяция должна это учитывать.
+        age = max(0, int(client.next_tick()) - tick)
+        sample_tick = int(round(self._current_tick() - age))
+        self._net_last_sample_tick = sample_tick
+
+        sprites = self._sprites_by_render_id
+        for render_id, object_state in state.objects.items():
+            if render_id == owner_id:
+                continue
+            if render_id not in self._net_authoritative_ids:
+                self._net_authoritative_ids.add(render_id)
+                # Локальная история могла уйти вперёд; серверная правда
+                # начинает новую ветку.
+                history = self._position_history_by_render_id.get(render_id)
+                if history is not None:
+                    history.clear()
+            sprite = sprites.get(render_id)
+            if sprite is None:
+                self._net_pending_render_state[render_id] = object_state
+                continue
+            self._apply_net_object_state(
+                render_id, sprite, object_state, sample_tick
+            )
+
+        # Объект исчез из снапшота — сервер его удалил.  Список копируем,
+        # потому что _remove_sprite чистит то же множество.
+        missing = [
+            render_id
+            for render_id in tuple(self._net_authoritative_ids)
+            if render_id not in state.objects
+        ]
+        for render_id in missing:
+            self._remove_sprite({"render_id": render_id})
+
+    def _apply_net_object_state(self, render_id, sprite, object_state, tick):
+        world_data = self._world_data_by_render_id.get(render_id)
+        if world_data is None:
+            return
+
+        old_x, old_y = world_data['position']
+        x = float(object_state.x)
+        y = float(object_state.y)
+        rotation = float(object_state.rotation)
+        scale = float(object_state.scale)
+        alpha = float(object_state.alpha)
+        layer = float(object_state.layer)
+
+        old_path = self._net_sprite_paths.get(render_id)
+        if object_state.sprite and object_state.sprite != old_path:
+            self._net_sprite_paths[render_id] = object_state.sprite
+            sprite.texture = self._texture_for_path(object_state.sprite)
+
+        geometry_changed = (
+            rotation != world_data['rotation']
+            or scale != world_data['scale']
+        )
+        world_data['position'] = (x, y)
+        world_data['rotation'] = rotation
+        world_data['scale'] = scale
+        world_data['alpha'] = alpha
+        if layer != world_data['layer']:
+            world_data['layer'] = layer
+            sprite._engine_sort_key = (layer, -render_id)
+            self._render_order_dirty = True
+
+        sprite.position = (x, y)
+        sprite.angle = rotation
+        sprite.scale = scale
+        sprite.alpha = int(alpha * 255)
+        if geometry_changed:
+            self._hit_mark_dirty(render_id)
+
+        if x != old_x or y != old_y:
+            self._moving_render_ids.add(render_id)
+            self._record_position(render_id, (x, y), tick)
 
 
 class ManagedQueue:
@@ -1315,16 +1658,94 @@ def tact_counter(start, tact_time, EngineState, stop_event):
             "tick": int(elapsed / tact_time),
         })
 
-def main():
+def _connect_net_client(args, scene_arg):
+    """Подключается к серверу с повторами: host-сервер стартует не мгновенно."""
 
-    # Manager остаётся только для реестра объектов; очереди команд, блокировки
-    # и статусы воркеров больше не ходят через его сервер.
+    from net.client import NetClient
+    from net.hashes import compute_hashes
+
+    scene_hash, scripts_hash = compute_hashes(scene_arg)
+    client = NetClient(
+        args.host,
+        args.port,
+        name=args.name,
+        scene_hash=scene_hash,
+        scripts_hash=scripts_hash,
+        token=args.token,
+    )
+    deadline = time.monotonic() + NET_CONNECT_TIMEOUT
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            welcome = client.connect(timeout=2.0)
+            return client, welcome
+        except (ConnectionRefusedError, TimeoutError, OSError) as error:
+            last_error = error
+            time.sleep(0.25)
+        except ConnectionError:
+            # Сервер ответил и отклонил вход (хэши, токен, лимит игроков).
+            # Повторять бессмысленно.
+            client.close()
+            raise
+    client.close()
+    raise SystemExit(
+        f"не удалось подключиться к {args.host}:{args.port}: {last_error}"
+    )
+
+
+def _start_host_server(args, scene_arg):
+    """Запускает headless-сервер отдельным процессом для режима host."""
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("server_main.py")),
+        "--port", str(args.port),
+        "--max-players", str(args.max_players),
+        "--anticheat", args.anticheat,
+        "--no-console",
+    ]
+    if scene_arg:
+        command.append(scene_arg)
+    if args.token:
+        command.extend(["--token", args.token])
+    env = os.environ.copy()
+    if scene_arg:
+        env["PYENGINE_SCENE"] = scene_arg
+    return subprocess.Popen(
+        command,
+        cwd=str(Path(__file__).resolve().parent),
+        env=env,
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Клиент pyengine: одиночная игра или мультиплеер"
+    )
+    parser.add_argument(
+        "--mode", choices=("solo", "join", "host"), default="solo",
+        help="solo — без сети; join — подключиться; host — поднять сервер и войти",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--name", default="player")
+    parser.add_argument("--token", default="")
+    parser.add_argument("--scene", default=None,
+                        help="файл сцены (по умолчанию PYENGINE_SCENE)")
+    parser.add_argument("--max-players", type=int, default=8)
+    parser.add_argument("--anticheat", choices=("log", "kick"), default="log")
+    args = parser.parse_args(argv)
+
+    # Manager остаётся только для событий ввода, которые читают скрипты.
+    # Очереди команд, блокировки, статусы воркеров и реестр объектов больше
+    # не ходят через его сервер.
     manager = multiprocessing.Manager()
 
     render_in_stream = RenderInQueue()
     render_out_stream = RenderOutQueue()
     main_in_stream = MainInQueue()
     main_out_stream = MainOutQueue()
+    console_out_stream = MainOutQueue()
 
     # Один процесс симуляции с кооперативным планировщиком.  Очередь и
     # status-list пока сохранены для совместимости Stream, но воркеры больше
@@ -1333,7 +1754,9 @@ def main():
     worker_queues = [ProccesInQueue() for _ in range(worker_count)]
     worker_ready = multiprocessing.Array("b", worker_count, lock=False)
 
-    objects_cache = manager.dict()
+    # Реестр объектов теперь принадлежит процессу Stream.  Общий словарь
+    # остаётся только для событий мыши/клавиатуры, которые читают скрипты.
+    input_cache = manager.dict()
     object_lock = multiprocessing.Lock()
     visual_struct =  {
         'x' : float,
@@ -1380,6 +1803,7 @@ def main():
         'type' : str,
         'class' : str,
         'id' : str,
+        'generation' : int,
     }
     id_locks = [multiprocessing.Lock() for _ in range(64)]
     raw_id_cache = IdCache(1024*256, id_struct, id_locks)
@@ -1453,7 +1877,7 @@ def main():
             render_out_stream,
             main_in_stream,
             main_out_stream,
-            objects_cache,
+            input_cache,
             proccess_status_info,
             worker_queues,
             worker_ready,
@@ -1464,23 +1888,46 @@ def main():
             camera_state,
             motion_cache_data,
             keyboard_ring_data,
-            manager.address,
-            manager._authkey,
+            console_out_stream,
         ),
+        kwargs={"scene_file": args.scene},
         daemon=False,
     )
     logic_process.start()
+
+    net_client = None
+    host_process = None
+    net_owner_render_id = 0
+    if args.mode != "solo":
+        try:
+            if args.mode == "host":
+                host_process = _start_host_server(args, args.scene)
+            net_client, welcome = _connect_net_client(args, args.scene)
+            net_owner_render_id = int(
+                getattr(welcome, "owner_render_id", 0) or 0
+            )
+            print(
+                f"[NET] клиент {welcome.client_id}, "
+                f"owner_render_id={net_owner_render_id}, "
+                f"max_players={welcome.max_players}",
+                flush=True,
+            )
+        except Exception:
+            if host_process is not None:
+                host_process.terminate()
+            raise
 
     threading.Thread(
         target=console.console,
         args=(
             render_in_stream,
-            objects_cache,
+            input_cache,
             proccess_status_info,
             visual_cache,
             id_cache,
             overlay_settings,
             main_in_stream,
+            console_out_stream,
         ),
         daemon=True,
     ).start()
@@ -1504,7 +1951,7 @@ def main():
         Game([
             render_in_stream,
             main_in_stream,
-            objects_cache,
+            input_cache,
             visual_cache,
             camera_target_cache,
             camera_scale_cache,
@@ -1512,12 +1959,26 @@ def main():
         ], FieldView(raw_engine_state, "time"),
             width=400, height=400, clock_origin=game_clock_origin,
             tick_cache=FieldView(raw_engine_state, "tick"),
-            overlay_settings=overlay_settings)
+            overlay_settings=overlay_settings,
+            net_client=net_client,
+            net_owner_render_id=net_owner_render_id)
         arcade.run()
 
     finally:
         tact_stop_event.set()
         tact_thread.join()
+
+        if net_client is not None:
+            try:
+                net_client.close()
+            except Exception:
+                traceback.print_exc()
+        if host_process is not None:
+            host_process.terminate()
+            try:
+                host_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_process.kill()
 
         if logic_process.is_alive():
             logic_process.terminate()

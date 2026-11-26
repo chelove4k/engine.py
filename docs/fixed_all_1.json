@@ -1,0 +1,571 @@
+{
+  "generated_at": "2026-11-21T22:12:56",
+  "config": {
+    "scenario": "all",
+    "duration": 2.0,
+    "objects": 1000,
+    "pairs": 100000,
+    "frames": 60,
+    "cache_ops": 100000,
+    "processes": 4,
+    "workers": 1,
+    "scripts": 1,
+    "motion_objects": 16,
+    "iterations": 100,
+    "timeout": 20.0,
+    "list": false
+  },
+  "ok": true,
+  "results": [
+    {
+      "name": "cache",
+      "ok": true,
+      "duration_s": 2.986213200027123,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "cache",
+          "name": "object_cache.set",
+          "value": 293102.99349035404,
+          "unit": "ops/s",
+          "note": "655 сегментов"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.get",
+          "value": 383096.70080139267,
+          "unit": "ops/s",
+          "note": ""
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.set_many",
+          "value": 83555.96821498324,
+          "unit": "ops/s",
+          "note": "9 полей"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.get_many",
+          "value": 167403.66128466793,
+          "unit": "ops/s",
+          "note": "9 полей"
+        },
+        {
+          "scenario": "cache",
+          "name": "object_cache.dirty_cycle",
+          "value": 106678.27321870203,
+          "unit": "ops/s",
+          "note": "set_many + get_changed_values"
+        },
+        {
+          "scenario": "cache",
+          "name": "value_cache.set+get",
+          "value": 205693.42953752622,
+          "unit": "ops/s",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "cache roundtrip",
+          "ok": true,
+          "detail": "{'x': 12.5, 'tick': 7, 'sprite': 'probe_sprite'}"
+        },
+        {
+          "name": "dirty mask fields",
+          "ok": true,
+          "detail": "['sprite', 'tick', 'x']"
+        },
+        {
+          "name": "dirty mask cleared",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "value cache roundtrip",
+          "ok": true,
+          "detail": "42.5"
+        }
+      ]
+    },
+    {
+      "name": "contention",
+      "ok": true,
+      "duration_s": 4.787160099949688,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "contention",
+          "name": "contention.distinct.throughput",
+          "value": 751203.3365318497,
+          "unit": "ops/s",
+          "note": "4 процессов"
+        },
+        {
+          "scenario": "contention",
+          "name": "contention.distinct.latency",
+          "value": 1.3311974952305097,
+          "unit": "us/op",
+          "note": "суммарное реальное время"
+        },
+        {
+          "scenario": "contention",
+          "name": "contention.distinct.per_process",
+          "value": 187800.83413296242,
+          "unit": "ops/s",
+          "note": ""
+        },
+        {
+          "scenario": "contention",
+          "name": "contention.shared.throughput",
+          "value": 45046.01555066535,
+          "unit": "ops/s",
+          "note": "4 процессов"
+        },
+        {
+          "scenario": "contention",
+          "name": "contention.shared.latency",
+          "value": 22.199521706315036,
+          "unit": "us/op",
+          "note": "суммарное реальное время"
+        }
+      ],
+      "checks": [
+        {
+          "name": "distinct mode executed",
+          "ok": true,
+          "detail": "iterations=1502720, wall=2.000s"
+        },
+        {
+          "name": "shared mode executed",
+          "ok": true,
+          "detail": "iterations=90112, wall=2.000s"
+        },
+        {
+          "name": "worker segments updated",
+          "ok": true,
+          "detail": "[22528, 381952, 369664, 375808]"
+        },
+        {
+          "name": "cache readable after contention",
+          "ok": true,
+          "detail": ""
+        }
+      ]
+    },
+    {
+      "name": "collision",
+      "ok": true,
+      "duration_s": 3.2053869999945164,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "collision",
+          "name": "collision.transform",
+          "value": 404377.95752562454,
+          "unit": "ops/s",
+          "note": "полигон из 4 вершин"
+        },
+        {
+          "scenario": "collision",
+          "name": "collision.overlap",
+          "value": 105462.22616858411,
+          "unit": "checks/s",
+          "note": "предвычисленные полигоны"
+        },
+        {
+          "scenario": "collision",
+          "name": "collision.pipeline",
+          "value": 49782.37138561222,
+          "unit": "pairs/s",
+          "note": "2 трансформа + SAT"
+        }
+      ],
+      "checks": [
+        {
+          "name": "SAT detects overlap",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "SAT rejects gap",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "collision pipeline produced both outcomes",
+          "ok": true,
+          "detail": "56111/100000 overlaps"
+        }
+      ]
+    },
+    {
+      "name": "render",
+      "ok": true,
+      "duration_s": 0.7921714000403881,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "render",
+          "name": "render.interpolation.frames",
+          "value": 483.3743396238186,
+          "unit": "frames/s",
+          "note": "1000 объектов"
+        },
+        {
+          "scenario": "render",
+          "name": "render.interpolation.objects",
+          "value": 483374.33962381864,
+          "unit": "objects/s",
+          "note": "1000 объектов x 60 кадров"
+        },
+        {
+          "scenario": "render",
+          "name": "render.interpolation.frame_p95",
+          "value": 2.3710000095888972,
+          "unit": "ms/frame",
+          "note": ""
+        },
+        {
+          "scenario": "render",
+          "name": "render.interpolation.static_frame_p95",
+          "value": 0.00016499931613604227,
+          "unit": "ms/frame",
+          "note": "1000 статических объектов"
+        }
+      ],
+      "checks": [
+        {
+          "name": "linear interpolation",
+          "ok": true,
+          "detail": "(5.0, 10.0)"
+        },
+        {
+          "name": "clamp before history",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "clamp after history",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "sprites updated",
+          "ok": true,
+          "detail": "center=(5.5, -2.75)"
+        },
+        {
+          "name": "history bounded",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "static sprites untouched",
+          "ok": true,
+          "detail": "center=(-12345.0, -54321.0)"
+        }
+      ]
+    },
+    {
+      "name": "registration",
+      "ok": true,
+      "duration_s": 1.8915622000349686,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "registration",
+          "name": "registration.objects",
+          "value": 1202.9131670477916,
+          "unit": "objects/s",
+          "note": "1000 объектов, 1 рабочих"
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p50",
+          "value": 0.8139000274240971,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p95",
+          "value": 0.97510009072721,
+          "unit": "ms/object",
+          "note": ""
+        },
+        {
+          "scenario": "registration",
+          "name": "registration.p99",
+          "value": 1.0661999695003033,
+          "unit": "ms/object",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "all objects created",
+          "ok": true,
+          "detail": "1000/1000"
+        },
+        {
+          "name": "object ids unique",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "registered generation published",
+          "ok": true,
+          "detail": "generation=1"
+        },
+        {
+          "name": "stream registry contains objects",
+          "ok": true,
+          "detail": "{'objects': 1005, 'rendered': 1004}"
+        },
+        {
+          "name": "visual cache updated",
+          "ok": true,
+          "detail": "x=99.0, y=9.0"
+        },
+        {
+          "name": "identity cache updated",
+          "ok": true,
+          "detail": "'stress_reg_999'"
+        },
+        {
+          "name": "render add commands",
+          "ok": true,
+          "detail": "1000/1000"
+        }
+      ]
+    },
+    {
+      "name": "batch",
+      "ok": true,
+      "duration_s": 0.13251110003329813,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "batch",
+          "name": "batch.objects",
+          "value": 7917.098473943225,
+          "unit": "objects/s",
+          "note": "один вызов create_object(list)"
+        },
+        {
+          "scenario": "batch",
+          "name": "batch.per_object",
+          "value": 0.12630890007130802,
+          "unit": "ms/object",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "batch returned every object",
+          "ok": true,
+          "detail": "1000/1000"
+        },
+        {
+          "name": "all objects registered",
+          "ok": true,
+          "detail": "objects_cache=1000"
+        },
+        {
+          "name": "render ids unique",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "first visual cache entry",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "last identity cache entry",
+          "ok": true,
+          "detail": "'stress_batch_999'"
+        },
+        {
+          "name": "registration commands emitted",
+          "ok": true,
+          "detail": "register_many=1, render=1000"
+        }
+      ]
+    },
+    {
+      "name": "scripts",
+      "ok": true,
+      "duration_s": 3.1178456000052392,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "scripts",
+          "name": "scripts.updates",
+          "value": 99.97674541234694,
+          "unit": "updates/s",
+          "note": "среднее по 1, 100 итераций/обновление"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.target",
+          "value": 100.0,
+          "unit": "updates/s",
+          "note": "SCRIPT_UPDATE_HZ"
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.efficiency",
+          "value": 99.97674541234694,
+          "unit": "% от цели",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.min_updates",
+          "value": 99.97674541234694,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.max_updates",
+          "value": 99.97674541234694,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "scripts",
+          "name": "scripts.update_period",
+          "value": 10.002325999666937,
+          "unit": "ms/update",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "component loops started",
+          "ok": true,
+          "detail": "rotations=[5.0]"
+        },
+        {
+          "name": "updates observed",
+          "ok": true,
+          "detail": "rates=[100.0]"
+        },
+        {
+          "name": "rotation advanced",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "keyboard callback delivered",
+          "ok": true,
+          "detail": "scales=[2.0]"
+        }
+      ]
+    },
+    {
+      "name": "motion",
+      "ok": true,
+      "duration_s": 4.964090300025418,
+      "error": null,
+      "metrics": [
+        {
+          "scenario": "motion",
+          "name": "motion.objects",
+          "value": 16.0,
+          "unit": "objects",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.frames",
+          "value": 99.98905120282565,
+          "unit": "frames/s",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.updates_mean",
+          "value": 99.98905120282565,
+          "unit": "updates/s",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.updates_min",
+          "value": 99.98905120282565,
+          "unit": "updates/s",
+          "note": "цель 100"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.gap_p95",
+          "value": 20.304600009694695,
+          "unit": "ms",
+          "note": "16 объектов"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.gap_max",
+          "value": 20.53189999423921,
+          "unit": "ms",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_step_std",
+          "value": 0.028107364953674642,
+          "unit": "ticks",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_frozen",
+          "value": 0.0,
+          "unit": "% от кадров",
+          "note": ""
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_big_jumps",
+          "value": 0.0,
+          "unit": "frames",
+          "note": "шаг > 2 тиков"
+        },
+        {
+          "scenario": "motion",
+          "name": "motion.render_max_step",
+          "value": 1.0733900009654462,
+          "unit": "ticks",
+          "note": ""
+        }
+      ],
+      "checks": [
+        {
+          "name": "moving objects advance",
+          "ok": true,
+          "detail": "min=100.0/s, target>=30.0/s"
+        },
+        {
+          "name": "shared render tick stays smooth",
+          "ok": true,
+          "detail": "frozen=0/199, backward=0"
+        },
+        {
+          "name": "no multi-tick render jumps",
+          "ok": true,
+          "detail": "max_step=1.07 ticks (delay=4.0)"
+        },
+        {
+          "name": "heartbeats stay inside interpolation window",
+          "ok": true,
+          "detail": "p95=20.3ms, delay=40.0ms"
+        }
+      ]
+    }
+  ]
+}

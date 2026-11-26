@@ -4,7 +4,6 @@ import json
 import multiprocessing
 import os
 from collections import deque
-from multiprocessing.managers import SyncManager
 from pathlib import Path
 import queue
 import threading
@@ -39,121 +38,31 @@ from radon.visitors import ComplexityVisitor
 SCENE_FILE = os.environ.get("PYENGINE_SCENE") or "scene1.json"
 
 
-# Небольшие buckets идентичности остаются обычными списками: создание
-# manager.list стоит нового подключения к Manager (~3 мс в Windows), что
-# дороже копирования короткого списка. Когда значение разделяют достаточно
-# объектов, bucket один раз повышается, и каждое следующее добавление — O(1).
-INDEX_BUCKET_PROMOTE_AT = 16
-
-
 class Stream:
     INDEX_PREFIX = "__engine_index__"
 
-    @staticmethod
-    def __connect_index_manager(address, authkey):
-        """Создать клиент Manager для buckets индекса идентичности.
-
-        Процесс Stream получает прокси, созданные рендерером, но не может
-        создавать через них новые *серверные* объекты: прокси, созданный в
-        процессе Stream, был бы его собственностью и исчез бы с его выходом.
-        Второй клиент, подключённый к тому же серверу, создаёт buckets
-        ``manager.list``, которые живут в сервере Manager и остаются
-        действительными для всех читателей.
-        """
-
-        if address is None or authkey is None:
-            return None
-        try:
-            manager = SyncManager(address=address, authkey=authkey)
-            manager.connect()
-            return manager
-        except Exception as error:
-            print(
-                f"[STREAM  ] Manager недоступен для индексов, "
-                f"используется совместимый режим: {error}",
-                flush=True,
-            )
-            return None
-
     def __add_index_value(self, key, object_id):
-        """Добавить в bucket идентичности, не переписывая большие buckets.
+        """Добавить id в локальный bucket идентичности.
 
-        Небольшие buckets — обычные списки: создание прокси ``manager.list``
-        стоит нового подключения к Manager, что медленнее копирования
-        нескольких id. Когда значение становится общим, bucket один раз
-        повышается, и каждое следующее добавление переносит только один id
-        вместо всего списка.
+        Реестр принадлежит только процессу Stream, поэтому bucket — обычный
+        список: прокси Manager, повышение маленьких списков и повторные
+        серверные вызовы больше не нужны.
         """
 
-        manager = getattr(self, "_index_manager", None)
-        if manager is None:
-            # Запасной путь в процессе для unit-тестов и нестандартных встраиваний.
-            bucket = list(self.objects_cache.get(key, ()))
-            if object_id not in bucket:
-                bucket.append(object_id)
-            self.objects_cache[key] = bucket
-            return
-
-        # Stream — единственный писатель, поэтому он может сам хранить
-        # повышенные прокси и обходиться без одного запроса к Manager на объект.
-        buckets = getattr(self, "_index_buckets", None)
-        if buckets is None:
-            buckets = {}
-            self._index_buckets = buckets
-
-        bucket = buckets.get(key)
-        if bucket is not None:
-            bucket.append(object_id)
-            return
-
-        values = self.objects_cache.get(key)
-        if values is None:
+        bucket = self.objects_cache.get(key)
+        if bucket is None:
             self.objects_cache[key] = [object_id]
             return
-
-        if not isinstance(values, list):
-            # Уже повышено, но этот процесс потерял свой локальный кэш.
-            buckets[key] = values
-            values.append(object_id)
-            return
-
-        values = list(values)
-        values.append(object_id)
-        if len(values) >= INDEX_BUCKET_PROMOTE_AT:
-            bucket = manager.list(values)
-            # Публикуем повышенный bucket до отказа от обычного списка.
-            self.objects_cache[key] = bucket
-            buckets[key] = bucket
-        else:
-            self.objects_cache[key] = values
+        if object_id not in bucket:
+            bucket.append(object_id)
 
     def __remove_index_value(self, key, object_id):
-        manager = getattr(self, "_index_manager", None)
-        buckets = getattr(self, "_index_buckets", None) or {}
-        bucket = buckets.get(key)
-        if bucket is None:
-            bucket = self.objects_cache.get(key)
-        if bucket is None:
+        bucket = self.objects_cache.get(key)
+        if bucket is None or object_id not in bucket:
             return
-
-        if manager is None or isinstance(bucket, list):
-            bucket = list(bucket)
-            if object_id not in bucket:
-                return
-            bucket.remove(object_id)
-            if bucket:
-                self.objects_cache[key] = bucket
-            else:
-                self.objects_cache.pop(key, None)
-            return
-
-        try:
-            bucket.remove(object_id)
-        except ValueError:
-            return
+        bucket.remove(object_id)
         if not bucket:
             self.objects_cache.pop(key, None)
-            buckets.pop(key, None)
 
     def __add_identity_indexes(self, object_id, identity, object_type):
         if identity is None:
@@ -174,15 +83,6 @@ class Stream:
         render_key = (self.INDEX_PREFIX, "render_id", render_id)
         if self.objects_cache.get(render_key) == object_id:
             self.objects_cache.pop(render_key, None)
-        # Тесты и клиенты совместимости могут собрать Stream без визуального
-        # кэша; buckets слоёв существуют, только если он был зарегистрирован.
-        visual_cache = getattr(self, "visual_cache", None)
-        if visual_cache is not None:
-            layer = visual_cache.get(render_id, "layer")
-            if layer is not None:
-                self.__remove_index_value(
-                    (self.INDEX_PREFIX, "layer", float(layer)), object_id
-                )
         for field_name in ("name", "class", "type"):
             value = self.id_cache.get(render_id, field_name)
             if value is None:
@@ -224,9 +124,262 @@ class Stream:
                     case "input":
                         self.__register_input_button(data)
 
+                    case "find_object":
+                        self.__find_object(data)
+
+                    case "camera_targets":
+                        self.__camera_targets(data)
+
+                    case "clear":
+                        self.__clear(data)
+
+                    case "stats":
+                        self.__stats(data)
+
+                    case "net_objects":
+                        self.__net_objects(data)
+
             except Exception:
                 traceback.print_exc()
                 self.print('Ошибка очереди')
+
+    def __respond(self, data, payload):
+        """Отправить ответ на команду в очередь, указанную отправителем."""
+
+        request_id = data.get("request_id")
+        if request_id is None:
+            return
+        if data.get("reply") == "console":
+            stream = self.console_out_stream
+        else:
+            stream = self.main_out_stream
+        if stream is not None:
+            stream.put({request_id: payload})
+
+    @staticmethod
+    def __is_object_record(key, record):
+        return isinstance(key, str) and isinstance(record, dict) and (
+            "_render_id" in record
+        )
+
+    def __object_source(self, object_key, record):
+        """Собрать описание объекта так, как его ожидает ``GameObject``."""
+
+        render_id = record["_render_id"]
+        identity = {
+            name: self.id_cache.get(render_id, name)
+            for name in ("name", "class", "type", "id")
+        }
+        if not identity["id"]:
+            return None
+
+        source = {
+            "object_type": identity["type"],
+            "_id": identity["id"],
+            "object_id": record["_object_id"],
+            "render_id": render_id,
+            "_generation": record.get("_generation", 0),
+            "id": {key: identity[key] for key in ("name", "class", "type")},
+        }
+        components = record.get("dict_data", {})
+        component_names = components.get("_components", ())
+        if "transform" in component_names:
+            source["transform"] = components["transform"]
+        if "components" in component_names:
+            source["components"] = components["components"]
+        if "scripting" in component_names:
+            source["scripting"] = components["scripting"]
+        for custom_name in custom_component_names(components):
+            source[custom_name] = components[custom_name]
+        if "visual" in component_names:
+            visual = self.visual_cache.get_many(
+                render_id,
+                ("sprite", "x", "y", "scale", "rotation", "alpha", "layer"),
+            )
+            source["visual"] = {
+                "sprite": visual["sprite"],
+                "position": [visual["x"], visual["y"]],
+                "scale": visual["scale"],
+                "rotation": visual["rotation"],
+                "alpha": visual["alpha"],
+                "layer": visual["layer"],
+            }
+        return source
+
+    def __find_object(self, data):
+        """Найти объект в локальном реестре и вернуть его описание."""
+
+        field = data.get("field")
+        value = data.get("value")
+        try:
+            if field not in {"name", "class", "type", "layer"}:
+                raise ValueError(
+                    "Поле поиска должно быть name, class, type или layer"
+                )
+
+            with self.object_lock:
+                if field == "layer":
+                    object_ids = [
+                        object_key
+                        for object_key, record in self.objects_cache.items()
+                        if self.__is_object_record(object_key, record)
+                        and self.visual_cache.get(
+                            record["_render_id"], "layer"
+                        ) == value
+                    ]
+                else:
+                    object_ids = list(self.objects_cache.get(
+                        (self.INDEX_PREFIX, field, value), ()
+                    ))
+
+                source = None
+                for object_key in object_ids:
+                    record = self.objects_cache.get(object_key)
+                    if not self.__is_object_record(object_key, record):
+                        continue
+                    source = self.__object_source(object_key, record)
+                    if source is not None:
+                        break
+
+            self.__respond(data, {"source": source})
+        except Exception as error:
+            traceback.print_exc()
+            self.__respond(data, {"error": str(error)})
+
+    def __camera_targets(self, data):
+        """Вернуть имена и render_id всех объектов типа camera."""
+
+        try:
+            with self.object_lock:
+                targets = []
+                for object_key in list(self.objects_cache.get(
+                    (self.INDEX_PREFIX, "type", "camera"), ()
+                )):
+                    record = self.objects_cache.get(object_key)
+                    if not self.__is_object_record(object_key, record):
+                        continue
+                    render_id = record["_render_id"]
+                    name = self.id_cache.get(render_id, "name")
+                    if not name:
+                        continue
+                    targets.append({
+                        "name": name,
+                        "render_id": render_id,
+                        "generation": record.get("_generation", 0),
+                    })
+            self.__respond(data, {"targets": targets})
+        except Exception as error:
+            traceback.print_exc()
+            self.__respond(data, {"error": str(error)})
+
+    def __clear(self, data):
+        """Удалить все объекты, совпадающие по идентичности или слою."""
+
+        field = data.get("field")
+        value = data.get("value")
+        try:
+            if field not in {"name", "class", "type", "layer"}:
+                raise ValueError(
+                    "Поле удаления должно быть name, class, type или layer"
+                )
+
+            with self.object_lock:
+                object_ids = []
+                for object_key, record in self.objects_cache.items():
+                    if not self.__is_object_record(object_key, record):
+                        continue
+                    dict_data = record.get("dict_data", {})
+                    if field == "layer":
+                        if "visual" not in dict_data.get("_components", ()):
+                            continue
+                        current = self.visual_cache.get(
+                            record["_render_id"], "layer"
+                        )
+                        if current != value:
+                            continue
+                    else:
+                        identity = dict_data.get("_identity")
+                        if not isinstance(identity, dict):
+                            continue
+                        current = identity.get(field)
+                        if field == "type":
+                            current = current or dict_data.get("object_type")
+                        if current != value:
+                            continue
+                    object_ids.append(object_key)
+
+            removed = 0
+            for object_key in object_ids:
+                record = self.objects_cache.get(object_key)
+                generation = (
+                    record.get("_generation")
+                    if isinstance(record, dict) else None
+                )
+                self.__remove({
+                    "id": object_key,
+                    "generation": generation,
+                })
+                removed += 1
+            self.__respond(data, {"removed": removed})
+        except Exception as error:
+            traceback.print_exc()
+            self.__respond(data, {"error": str(error)})
+
+    def __net_objects(self, data):
+        """Объекты с директивами ``scripting.network`` для сетевого режима.
+
+        Серверному процессу нужны render_id реплицируемых объектов и слоты
+        игроков; роли остаются частью сцены, а не отдельным протоколом.
+        """
+
+        try:
+            objects = []
+            with self.object_lock:
+                for object_key, record in self.objects_cache.items():
+                    if not self.__is_object_record(object_key, record):
+                        continue
+                    dict_data = record.get("dict_data", {})
+                    scripting = dict_data.get("scripting")
+                    if not isinstance(scripting, dict):
+                        continue
+                    roles = scripting.get("network") or ()
+                    if not roles:
+                        continue
+                    components = dict_data.get("_components") or ()
+                    objects.append({
+                        "render_id": int(record["_render_id"]),
+                        "network": list(roles),
+                        # В headless-режиме рендерера нет, поэтому ``_is_render``
+                        # остаётся False. Наличие визуального компонента —
+                        # единственный надёжный признак объекта мира.
+                        "has_visual": "visual" in components,
+                        "rendered": bool(record.get("_is_render")),
+                    })
+            objects.sort(key=lambda item: item["render_id"])
+            self.__respond(data, {"objects": objects})
+        except Exception as error:
+            traceback.print_exc()
+            self.__respond(data, {"error": str(error)})
+
+    def __stats(self, data):
+        """Краткая статистика локального реестра для консоли."""
+        try:
+            with self.object_lock:
+                total = sum(
+                    1
+                    for object_key, record in self.objects_cache.items()
+                    if self.__is_object_record(object_key, record)
+                )
+                rendered = sum(
+                    1
+                    for object_key, record in self.objects_cache.items()
+                    if self.__is_object_record(object_key, record)
+                    and record.get("_is_render")
+                )
+            self.__respond(data, {"objects": total, "rendered": rendered})
+        except Exception as error:
+            traceback.print_exc()
+            self.__respond(data, {"error": str(error)})
 
     def __register_input_button(self, data):
         event_type = data.get("type", "")
@@ -253,7 +406,7 @@ class Stream:
             if not data.get("pointer_published"):
                 self.__publish_pointer(event, is_motion)
 
-            state = dict(self.objects_cache.get(state_key) or {})
+            state = dict(self.input_cache.get(state_key) or {})
             buttons = set(state.get("buttons", ()))
             if event_type == "mouse_down" and event["button"]:
                 buttons.add(event["button"])
@@ -265,7 +418,7 @@ class Stream:
                 "hovered_render_id": event["render_id"],
                 "buttons": tuple(buttons),
             })
-            self.objects_cache[state_key] = state
+            self.input_cache[state_key] = state
 
             if is_motion and self.motion_cache is not None:
                 # Движение передаётся через shared memory; вне списка событий
@@ -273,7 +426,7 @@ class Stream:
                 # скрипт копировать события.
                 return
 
-            events = list(self.objects_cache.get(events_key) or ())
+            events = list(self.input_cache.get(events_key) or ())
             sequence = events[-1]["sequence"] + 1 if events else 1
             event["sequence"] = sequence
             # Скриптам нужна только новейшая позиция указателя. Хранение
@@ -285,7 +438,7 @@ class Stream:
                     if pending["type"] != "mouse_move"
                 ]
             events.append(event)
-            self.objects_cache[events_key] = events[-128:]
+            self.input_cache[events_key] = events[-128:]
             self.__bump_input_sequence()
             return
 
@@ -301,7 +454,7 @@ class Stream:
                 self.__publish_keyboard_event(data)
             else:
                 events_key = ("__engine_keyboard__", "events")
-                events = list(self.objects_cache.get(events_key) or ())
+                events = list(self.input_cache.get(events_key) or ())
                 sequence = events[-1]["sequence"] + 1 if events else 1
                 events.append({
                     "sequence": sequence,
@@ -309,7 +462,7 @@ class Stream:
                     "key": key,
                     "modifiers": data.get("modifiers", 0),
                 })
-                self.objects_cache[events_key] = events[-128:]
+                self.input_cache[events_key] = events[-128:]
                 self._keyboard_sequence += 1
                 self.__publish_pressed_keys(self._keyboard_sequence)
         self.__bump_input_sequence()
@@ -503,6 +656,9 @@ class Stream:
                     self.id_cache.set(render_id, field_name, value)
             self.id_cache.set(render_id, "id", object_key)
             self.__add_identity_indexes(object_key, identity, object_type)
+        # Поколение слота доступно всем процессам без обращения к реестру
+        # объектов: по нему скрипт проверяет, что его объект ещё жив.
+        self.id_cache.set(render_id, "generation", generation)
 
         if visual is not None:
             position = visual.get("position", [0, 0])
@@ -520,9 +676,6 @@ class Stream:
                 "sprite": str(visual.get("sprite", "")),
                 "layer": layer,
             })
-            self.__add_index_value(
-                (self.INDEX_PREFIX, "layer", layer), object_key
-            )
 
         self.objects_cache[object_key] = object
         self.__add_render_index(object_key, render_id)
@@ -626,6 +779,93 @@ class Stream:
         if request_id is not None:
             self.main_out_stream.put({request_id: payload})
 
+    def __register_scene_objects(self, objects):
+        """Зарегистрировать объекты сцены напрямую в локальном реестре.
+
+        Сцена создаётся внутри процесса Stream. Отправлять её регистрацию
+        через ``main_in_stream`` и ждать ответ в ``main_out_stream`` не нужно:
+        главный поток конкурировал бы за канал ответов с внешними клиентами и
+        скриптами, а потерянный ответ задерживал бы старт на таймаут. Прямой
+        путь короче и не может потерять собственный ответ.
+        """
+
+        records = [game_object._registration_record() for game_object in objects]
+        state = self.engine_state.get_many(0, ("time", "tick"))
+        results = []
+
+        with self.object_lock:
+            prepared = []
+            for index, record in enumerate(records):
+                try:
+                    object_key, cached_object = self.__prepare_registration(
+                        record
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"Объект #{index}: {error}") from error
+                if self.objects_cache.get(object_key) is not None:
+                    raise ValueError(
+                        f"Объект с id {object_key!r} уже зарегистрирован"
+                    )
+                prepared.append((object_key, cached_object))
+
+            capacity = min(self.visual_cache.capacity, self.id_cache.capacity)
+            if len(prepared) > self.__available_render_slots(capacity):
+                raise ValueError(
+                    "Закончились слоты VisualCache/IdCache. "
+                    "Увеличьте размер общего кэша или уменьшите число объектов."
+                )
+
+            for object_key, cached_object in prepared:
+                try:
+                    results.append(
+                        self.__register_one(
+                            object_key,
+                            cached_object,
+                            check_duplicate=False,
+                            state=state,
+                        )
+                    )
+                except Exception as error:
+                    traceback.print_exc()
+                    results.append({
+                        "error": f"Ошибка регистрации: {error}",
+                    })
+
+        failures = []
+        registered = []
+        for game_object, result in zip(objects, results):
+            if isinstance(result, dict) and "error" in result:
+                failures.append(f"{game_object._id}: {result['error']}")
+                continue
+            try:
+                object_id, render_id, generation = (
+                    GameObject._parse_registration_response(
+                        result, game_object._id
+                    )
+                )
+                game_object._apply_registration(
+                    object_id, render_id, generation
+                )
+                registered.append(game_object)
+            except Exception as error:
+                traceback.print_exc()
+                failures.append(f"{game_object._id}: {error}")
+
+        # Публикуем только после того, как все объекты получили render id:
+        # скрипт камеры не должен стартовать раньше остальных объектов сцены.
+        for game_object in registered:
+            try:
+                game_object._publish_registration()
+            except Exception as error:
+                traceback.print_exc()
+                failures.append(f"{game_object._id}: {error}")
+
+        if failures:
+            raise ValueError(
+                "Stream не зарегистрировал объекты сцены: "
+                + "; ".join(failures)
+            )
+
     def __add_script(self, data):
         path = data.get("path")
         if not isinstance(path, str) or not path:
@@ -662,6 +902,7 @@ class Stream:
         try:
             self.worker_queues[worker_id].put({
                 'proc_id': worker_id,
+                "command": "add_script",
                 "path": str(resolved_path),
                 "id": data["id"],
                 "obj_id": data["obj_id"],
@@ -705,6 +946,13 @@ class Stream:
                 or bool(dict_data.get("components"))
                 or bool(custom_component_names(dict_data))
             )
+            identity = dict_data.get("_identity") or {}
+            scripts = list(scripting.get("scripts") or ())
+            transform = dict_data.get("transform")
+            collider = (
+                transform.get("polygon")
+                if isinstance(transform, dict) else None
+            )
 
         visual = self.visual_cache.get_many(
             render_id,
@@ -724,6 +972,14 @@ class Stream:
             "rotation": visual["rotation"],
             "alpha": visual["alpha"],
             "layer": visual["layer"],
+            # Статическая часть объекта едет вместе с командой: рендереру
+            # больше не нужен общий реестр, чтобы нарисовать оверлей или
+            # коллайдер.
+            "object_id": object.get("_id", id),
+            "object_type": dict_data.get("object_type"),
+            "identity": dict(identity),
+            "scripts": scripts,
+            "collider": collider,
         })
 
     def __remove(self, data):
@@ -744,6 +1000,10 @@ class Stream:
             if object is not None:
                 render_id = object["_render_id"]
                 self.__remove_identity_indexes(id, render_id)
+                # Слот освобождён: поколение 0 сообщает скриптам, что объект
+                # больше не жив, даже если реестр им недоступен.
+                self.id_cache.set(render_id, "generation", 0)
+                self.id_cache.set(render_id, "id", "")
                 if self.camera_target_cache.get() == render_id:
                     self.camera_target_cache.set(-1)
 
@@ -781,7 +1041,7 @@ class Stream:
                     self.change_in_stream,
                     self.main_in_stream,
                     self.main_out_stream,
-                    self.objects_cache,
+                    self.input_cache,
                     worker_queue,
                     self.worker_ready,
                     self.lock,
@@ -790,6 +1050,8 @@ class Stream:
                     self.id_cache_data,
                     self.object_lock,
                     self.camera_state,
+                    True,
+                    self.net_executed_tick,
                 ),
                 daemon=True,
             )
@@ -815,7 +1077,7 @@ class Stream:
             "render_in_stream": self.render_in_stream,
             "main_in_stream": self.main_in_stream,
             "main_out_stream": self.main_out_stream,
-            "objects_cache": self.objects_cache,
+            "objects_cache": self.input_cache,
             "lock": self.object_lock,
             "visual_cache": self.visual_cache,
             "id_cache": self.id_cache,
@@ -840,11 +1102,16 @@ class Stream:
                 self.print(f"Объект #{index} не загружен: {error}")
 
         try:
-            # Один проход регистрации вместо одного на каждый объект сцены.
-            GameObject.register_many(objects)
+            # Объекты сцены регистрируются в локальном реестре Stream. Это
+            # короче очереди команд и не отнимает ответы у внешних клиентов.
+            self.__register_scene_objects(objects)
         except Exception as error:
-            self.print(f"Пакетная регистрация не удалась: {error}")
+            self.print(f"Пакетная регистрация сцены не удалась: {error}")
             for index, game_object in enumerate(objects):
+                # Часть объектов могла успеть зарегистрироваться до сбоя.
+                # Повторная регистрация живого объекта не нужна.
+                if getattr(game_object, "_object_id", None) is not None:
+                    continue
                 try:
                     game_object.register()
                 except Exception as register_error:
@@ -876,7 +1143,7 @@ class Stream:
         change_in_stream,
         main_in_stream,
         main_out_stream,
-        objects_cache,
+        input_cache,
         proccess_status_info,
         worker_queues,
         worker_ready,
@@ -887,14 +1154,23 @@ class Stream:
         camera_state,
         motion_cache_data=None,
         keyboard_ring_data=None,
-        manager_address=None,
-        manager_authkey=None,
+        console_out_stream=None,
+        net_executed_tick=None,
+        scene_file=None,
     ):
         self.render_in_stream = render_in_stream
         self.change_in_stream = change_in_stream
         self.main_in_stream = main_in_stream
         self.main_out_stream = main_out_stream
-        self.objects_cache = objects_cache
+        self.console_out_stream = console_out_stream
+        self.net_executed_tick = net_executed_tick
+        self.scene_file = scene_file or SCENE_FILE
+        # Реестр объектов принадлежит процессу Stream.  Другие процессы
+        # получают нужные данные командами и снимками визуального кэша.
+        self.objects_cache = {}
+        # Отдельный небольшой словарь для событий мыши и клавиатуры.  Он
+        # разделяется со скриптами, но регистрация объектов его не касается.
+        self.input_cache = input_cache
         self.proccess_status_info = proccess_status_info
         self.worker_queues = worker_queues
         self.worker_ready = worker_ready
@@ -956,17 +1232,21 @@ class Stream:
         self._render_generations = {}
 
         self._script_complexity_cache = {}
-        self._index_manager = self.__connect_index_manager(
-            manager_address, manager_authkey
-        )
-        # Сообщает find_object("layer") на стороне скриптов, что buckets слоёв есть.
-        self.objects_cache[(self.INDEX_PREFIX, "layer", "__ready__")] = True
 
         self.__start_scripter_runners()
 
         threading.Thread(target=self.__check_queue, daemon=True).start()
 
-        scene_path = Path(__file__).parent / "access" / "scenes" / SCENE_FILE
+        scene_path = Path(self.scene_file)
+        if not scene_path.is_absolute():
+            if scene_path.parent == Path("."):
+                # Исторический формат: PYENGINE_SCENE=scene1.json — файл
+                # лежит в access/scenes.
+                scene_path = Path(__file__).parent / "access" / "scenes" / scene_path
+            else:
+                # Полный или относительный путь от каталога движка — так
+                # сервер может запускать сцены из любого места.
+                scene_path = resolve_project_path(scene_path)
         try:
             self.__init_scene_objects(scene_path)
             while True:

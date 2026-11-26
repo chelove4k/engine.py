@@ -1,5 +1,7 @@
 import math
+import queue
 import threading
+import time
 from memory_lib import ObjectCache
 
 
@@ -52,7 +54,41 @@ def _clear_usage():
     print("Сокращения: c, l, n, t")
 
 
-def _clear_command(args, cache, vcache, main_in_stream):
+def _stream_request(
+    main_in_stream, out_stream, command, payload=None, timeout=2.0
+):
+    """Отправляет команду Stream и ждёт ответ в очереди консоли."""
+
+    request_id = f"console:{command}:{time.monotonic_ns()}"
+    message = {
+        "command": command,
+        "request_id": request_id,
+        "reply": "console",
+    }
+    if payload:
+        message.update(payload)
+    main_in_stream.put(message)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"Stream не ответил на команду {command}")
+            return None
+        try:
+            response = out_stream.get(timeout=min(0.1, remaining))
+        except queue.Empty:
+            continue
+        except (EOFError, BrokenPipeError, OSError) as error:
+            print(f"Очередь консоли закрылась: {error}")
+            return None
+        if isinstance(response, dict) and request_id in response:
+            return response[request_id]
+
+
+def _clear_command(
+    args, cache, vcache, main_in_stream, console_out_stream=None
+):
     """Удаляет все объекты, совпадающие по одному полю идентичности или визуальному слою."""
 
     if not args or args[0].lower() in {"help", "?"}:
@@ -81,6 +117,23 @@ def _clear_command(args, cache, vcache, main_in_stream):
         print("Очередь команд движка недоступна")
         return
 
+    if console_out_stream is not None:
+        payload = _stream_request(
+            main_in_stream,
+            console_out_stream,
+            "clear",
+            {"field": field, "value": value},
+        )
+        if payload is None:
+            return
+        if "error" in payload:
+            print(f"Ошибка clear: {payload['error']}")
+            return
+        removed = payload.get("removed", 0)
+        print(f"clear {field} {raw_value}: удалено объектов — {removed}")
+        return
+
+    # Локальный путь для тестов и встраиваний без процесса Stream.
     removed = 0
     for object_id, record in list(cache.items()):
         if not isinstance(record, dict):
@@ -213,6 +266,7 @@ def console(
     icache_data,
     overlay_settings=None,
     main_in_stream=None,
+    console_out_stream=None,
 ):
     vcache = ObjectCache(*vcache_data)
     icache = ObjectCache(*icache_data)
@@ -235,8 +289,21 @@ def console(
             try:
                 if command == 'show':
                     print('-' * 10)
-                    for key, value in list(cache.items()):
-                        print(key, value)
+                    if main_in_stream is not None and console_out_stream is not None:
+                        payload = _stream_request(
+                            main_in_stream, console_out_stream, "stats"
+                        )
+                        if payload is not None:
+                            if "error" in payload:
+                                print(f"Ошибка stats: {payload['error']}")
+                            else:
+                                print(
+                                    f"Объектов: {payload.get('objects', 0)}, "
+                                    f"отрисовано: {payload.get('rendered', 0)}"
+                                )
+                    else:
+                        for key, value in list(cache.items()):
+                            print(key, value)
                     print('-' * 10)
                 elif command == 'pshow':
                     print(proccess_status_info)
@@ -253,7 +320,10 @@ def console(
                 elif command == 'overlay':
                     _overlay_command(arg, overlay_settings)
                 elif command == 'clear':
-                    _clear_command(raw_parts[1:], cache, vcache, main_in_stream)
+                    _clear_command(
+                        raw_parts[1:], cache, vcache, main_in_stream,
+                        console_out_stream,
+                    )
                 else:
                     shared_queue.put(command)
             except Exception as error:

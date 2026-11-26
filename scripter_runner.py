@@ -5,8 +5,15 @@ import time
 import traceback
 
 from caches import IdCache, VisualCache
-from config import PROJECT_DIR, SCRIPT_UPDATE_PERIOD, resolve_project_path
+from config import (
+    ENGINE_STATE_LOOP_FIELDS,
+    FIXED_DT,
+    PROJECT_DIR,
+    SCRIPT_UPDATE_PERIOD,
+    resolve_project_path,
+)
 from memory_lib import FieldView, ObjectCache
+from net.simulation import ServerSimulation
 
 
 class scripter_runner:
@@ -56,6 +63,8 @@ class scripter_runner:
         id_cache,
         object_lock,
         camera_state,
+        find_object_via_stream=False,
+        net_executed_tick=None,
     ):
         self.engine_state = ObjectCache(*engine_state)
         self.core_time = FieldView(self.engine_state, "time")
@@ -84,6 +93,11 @@ class scripter_runner:
         self.id_cache = id_cache
         self.object_lock = object_lock
         self.camera_state = camera_state
+        self.find_object_via_stream = bool(find_object_via_stream)
+        # Сетевой режим включается командой net_start: тиком управляет сервер,
+        # а ввод приходит кадрами из GameServer.
+        self.net: ServerSimulation | None = None
+        self.net_executed_tick = net_executed_tick
 
         self.worker_ready[id] = True
         try:
@@ -102,25 +116,115 @@ class scripter_runner:
 
     def __loop(self):
         while True:
+            if self.net is None:
+                if not self.__run_timed_until_net():
+                    return
+            if not self.__run_net_until_stopped():
+                return
+
+    def __run_timed_until_net(self) -> bool:
+        """100 Гц по дедлайну, пока не включат серверный режим."""
+
+        # Планировщик держит 100 Гц по дедлайну, а не «работа + sleep».
+        # Иначе время прохода прибавлялось к периоду, и при 500 скриптах
+        # сцена автоматически замедлялась вдвое даже без нехватки CPU.
+        period = SCRIPT_UPDATE_PERIOD
+        next_deadline = time.perf_counter()
+        while self.net is None:
+            next_deadline += period
             try:
                 self.__run_once()
             except (EOFError, BrokenPipeError, OSError):
                 # Manager или общая очередь уже закрыты: штатное завершение.
-                return
-            time.sleep(SCRIPT_UPDATE_PERIOD)
+                return False
+            now = time.perf_counter()
+            delay = next_deadline - now
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -period:
+                # Проход дольше периода: не копим задолженность, иначе
+                # планировщик будет постоянно догонять сам себя.
+                next_deadline = now
+        return True
+
+    def __run_net_until_stopped(self) -> bool:
+        """Серверный режим: проход только по команде ``net_tick``.
+
+        Очередь блокирующая: тик обрабатывается сразу после прихода, без
+        опроса и без лишней задержки.  Если сервер прислал несколько тиков
+        подряд, выполняются только последний (пропущенные тики не
+        моделируются дважды), но ввод из всех кадров сохраняется.
+        """
+
+        while self.net is not None:
+            latest = None
+            inputs: list[tuple[int, bytes]] = []
+            while True:
+                try:
+                    data = self.worker_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except (EOFError, BrokenPipeError, OSError):
+                    return False
+                if data is None or not isinstance(data, dict):
+                    continue
+                if data.get("proc_id") != self.id:
+                    continue
+                if data.get("command") == "net_tick":
+                    latest = data
+                    inputs.extend(data.get("inputs") or ())
+                else:
+                    self.__handle_worker_message(data)
+
+            if latest is not None:
+                self.__step_net(latest, inputs)
+                continue
+
+            try:
+                data = self.worker_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except (EOFError, BrokenPipeError, OSError):
+                return False
+            if data is None or not isinstance(data, dict):
+                continue
+            if data.get("proc_id") != self.id:
+                continue
+            if data.get("command") == "net_tick":
+                self.__step_net(data, list(data.get("inputs") or ()))
+            else:
+                self.__handle_worker_message(data)
+        return True
 
     def __run_once(self):
         """Один проход: принять команды и шагнуть каждый живой скрипт.
+
+        Часы, tick и счётчики ввода читаются один раз на весь проход. Все
+        скрипты видят одинаковый снимок состояния и один и тот же tick, а не
+        шесть полей shared memory на каждый скрипт.
 
         Ошибка одного скрипта отправляет в ``shutdown()`` только его: общий
         поток симуляции и остальные скрипты продолжают работу.
         """
 
         self.__drain_commands()
+        engine_state = getattr(self, "engine_state", None)
+        state = (
+            engine_state.get_many_lockless(0, ENGINE_STATE_LOOP_FIELDS)
+            if engine_state is not None else None
+        )
+        self.__step_scripts(state)
+
+    def __step_scripts(self, state):
         for token, entry in list(self._scripts.items()):
             instance = entry[0]
             try:
-                alive = instance.step()
+                # Тестовые раннеры могут собирать объект без engine_state
+                # и использовать скрипты со старым step() без аргументов.
+                alive = (
+                    instance.step(state) if state is not None
+                    else instance.step()
+                )
             except (EOFError, BrokenPipeError, OSError):
                 raise
             except Exception:
@@ -128,6 +232,26 @@ class scripter_runner:
                 alive = False
             if not alive:
                 self.__stop_script(token)
+
+    def __step_net(self, data, inputs):
+        """Применяет ввод и делает ровно один серверный тик."""
+
+        tick = int(data.get("tick", 0))
+        if tick <= self.net.tick:
+            return
+        for client_id, payload in inputs:
+            self.net.push(int(client_id), payload)
+        self.engine_state.set_many(0, {
+            "time": tick * FIXED_DT,
+            "tick": tick,
+        })
+        self.net.begin_tick(tick)
+        state = self.engine_state.get_many_lockless(
+            0, ENGINE_STATE_LOOP_FIELDS
+        )
+        self.__step_scripts(state)
+        if self.net_executed_tick is not None:
+            self.net_executed_tick.value = tick
 
     def __drain_commands(self):
         while True:
@@ -137,11 +261,74 @@ class scripter_runner:
                 return
             except (EOFError, BrokenPipeError, OSError):
                 return
-            if data is None:
+            if data is None or not isinstance(data, dict):
                 continue
             if data.get("proc_id") != self.id:
                 continue
+            self.__handle_worker_message(data)
+
+    def __handle_worker_message(self, data):
+        command = data.get("command")
+        if command == "add_script":
             self.__start_script(data)
+        elif command == "net_start":
+            self.__start_net(data)
+        elif command == "net_join":
+            self.__join_net(
+                int(data.get("client_id", 0)),
+                int(data.get("render_id", 0) or 0),
+            )
+        elif command == "net_leave":
+            self.__leave_net(int(data.get("client_id", 0)))
+        elif command == "net_input":
+            if self.net is not None:
+                self.net.push(
+                    int(data.get("client_id", 0)),
+                    data.get("payload", b""),
+                )
+        elif command == "net_stop":
+            self.net = None
+        elif command == "net_stats":
+            payload = (
+                self.net.stats() if self.net is not None
+                else {"enabled": False}
+            )
+            payload["enabled"] = self.net is not None
+            request_id = data.get("request_id")
+            if request_id is not None:
+                self.main_out_stream.put({request_id: payload})
+
+    def __start_net(self, data):
+        if self.net is None:
+            self.net = ServerSimulation(
+                repeat_ticks=int(data.get("repeat_ticks", 5) or 0)
+            )
+        for instance, _complexity, _path in self._scripts.values():
+            instance.set_strict_tick(True)
+            source = self.net.source_for_render(
+                getattr(instance.GameObject, "_render_id", 0)
+            )
+            if source is not None:
+                instance.bind_input(source)
+
+    def __join_net(self, client_id, render_id):
+        if self.net is None:
+            return
+        source = self.net.join(client_id, render_id)
+        if not render_id:
+            return
+        for instance, _complexity, _path in self._scripts.values():
+            if getattr(instance.GameObject, "_render_id", 0) == render_id:
+                instance.bind_input(source)
+
+    def __leave_net(self, client_id):
+        if self.net is None:
+            return
+        self.net.leave(client_id)
+        for instance, _complexity, _path in self._scripts.values():
+            if getattr(instance.GameObject, "_render_id", 0) in self.net.bindings:
+                continue
+            instance.bind_input(None)
 
     def __stop_script(self, token):
         entry = self._scripts.pop(token, None)
@@ -218,6 +405,7 @@ class scripter_runner:
                 self.id_cache,
                 self.object_lock,
                 self.camera_state,
+                find_object_via_stream=self.find_object_via_stream,
             )
         except Exception as error:
             if visual_attachment is not None:
@@ -232,4 +420,11 @@ class scripter_runner:
         token = self._next_script_id
         self._next_script_id += 1
         self._scripts[token] = (instance, complexity, str(resolved_path))
+        if self.net is not None:
+            instance.set_strict_tick(True)
+            source = self.net.source_for_render(
+                getattr(instance.GameObject, "_render_id", 0)
+            )
+            if source is not None:
+                instance.bind_input(source)
         self.print(f"Запущен {path}")

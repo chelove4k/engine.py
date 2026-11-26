@@ -22,15 +22,18 @@ from pyengine import (
     IdCache,
     Keyboard,
     Mouse,
+    REGISTRATION_STASH_PREFIX,
     Vector2,
     VisualCache,
     _Camera,
     create_object,
     creat_object,
     script,
+    stash_stream_responses,
+    take_stashed_stream_response,
 )
 from scene import validate_object_data
-from stream import INDEX_BUCKET_PROMOTE_AT, Stream
+from stream import Stream
 from config import (
     ENGINE_STATE_LOOP_FIELDS,
     ENGINE_STATE_SEGMENT_BYTES,
@@ -64,6 +67,7 @@ ID_STRUCT = {
     "type": str,
     "class": str,
     "id": str,
+    "generation": int,
 }
 
 
@@ -474,7 +478,7 @@ class FakeKeyboardRing:
 class MouseEventCoalescingTests(unittest.TestCase):
     def make_stream(self, motion=True):
         stream = Stream.__new__(Stream)
-        stream.objects_cache = {}
+        stream.input_cache = {}
         stream.engine_state = FakeEngineState()
         stream._pressed_keys = set()
         stream._input_sequence = 0
@@ -507,7 +511,7 @@ class MouseEventCoalescingTests(unittest.TestCase):
         register(self.mouse_event("mouse_move", 10))
         register(self.mouse_event("mouse_move", 20))
 
-        self.assertNotIn(Mouse.EVENTS_KEY, stream.objects_cache)
+        self.assertNotIn(Mouse.EVENTS_KEY, stream.input_cache)
         self.assertEqual(stream.motion_cache.values["seq"], 2)
         self.assertEqual(stream.motion_cache.values["x"], 20.0)
         self.assertEqual(stream.motion_cache.values["dx"], 1.0)
@@ -522,7 +526,7 @@ class MouseEventCoalescingTests(unittest.TestCase):
         self.assertEqual(stream.motion_cache.values["hovered"], 7)
         register(self.mouse_event("mouse_move", 20))
 
-        events = stream.objects_cache[Mouse.EVENTS_KEY]
+        events = stream.input_cache[Mouse.EVENTS_KEY]
         self.assertEqual([event["type"] for event in events], ["mouse_down"])
         self.assertEqual(stream.motion_cache.values["seq"], 2)
         self.assertEqual(stream.motion_cache.values["hovered"], -1)
@@ -536,7 +540,7 @@ class MouseEventCoalescingTests(unittest.TestCase):
         stream._Stream__register_input_button(event)
 
         self.assertEqual(stream.motion_cache.writes, [])
-        self.assertNotIn(Mouse.EVENTS_KEY, stream.objects_cache)
+        self.assertNotIn(Mouse.EVENTS_KEY, stream.input_cache)
         self.assertEqual(stream.engine_state.get(0, "input_sequence"), 0)
 
     def test_keyboard_events_still_wake_scripts(self):
@@ -546,7 +550,7 @@ class MouseEventCoalescingTests(unittest.TestCase):
         register({"type": "key_down", "key": "W", "modifiers": 0})
         register({"type": "key_up", "key": "W", "modifiers": 0})
 
-        events = stream.objects_cache[Keyboard.EVENTS_KEY]
+        events = stream.input_cache[Keyboard.EVENTS_KEY]
         self.assertEqual([event["type"] for event in events], ["key_down", "key_up"])
         self.assertEqual(stream.engine_state.get(0, "input_sequence"), 2)
         self.assertEqual(stream.engine_state.get(0, "key_count"), 0)
@@ -564,7 +568,7 @@ class MouseEventCoalescingTests(unittest.TestCase):
         self.assertIn("W", stream._pressed_keys)
         register({"type": "key_up", "key": "W", "modifiers": 0})
 
-        self.assertNotIn(Keyboard.EVENTS_KEY, stream.objects_cache)
+        self.assertNotIn(Keyboard.EVENTS_KEY, stream.input_cache)
         self.assertEqual(stream.engine_state.get(0, "keyboard_sequence"), 2)
         self.assertEqual(stream.engine_state.get(0, "key_count"), 0)
         self.assertNotIn("W", stream._pressed_keys)
@@ -582,12 +586,12 @@ class MouseEventCoalescingTests(unittest.TestCase):
         register = stream._Stream__register_input_button
 
         register(self.mouse_event("mouse_move", 1))
-        first = stream.objects_cache[Mouse.EVENTS_KEY]
+        first = stream.input_cache[Mouse.EVENTS_KEY]
         self.assertEqual(len(first), 1)
         self.assertEqual(first[0]["x"], 1.0)
 
         register(self.mouse_event("mouse_move", 2))
-        second = stream.objects_cache[Mouse.EVENTS_KEY]
+        second = stream.input_cache[Mouse.EVENTS_KEY]
         self.assertEqual(len(second), 1)
         self.assertEqual(second[0]["x"], 2.0)
         self.assertGreater(second[0]["sequence"], first[0]["sequence"])
@@ -724,7 +728,7 @@ class KeyboardRingTests(unittest.TestCase):
 
     def make_stream(self):
         stream = Stream.__new__(Stream)
-        stream.objects_cache = {}
+        stream.input_cache = {}
         stream.engine_state = FakeEngineState()
         stream._pressed_keys = set()
         stream._input_sequence = 0
@@ -858,6 +862,33 @@ class ConsoleClearTests(unittest.TestCase):
         self.assertEqual(self.run_clear("unknown", "x"), [])
         self.assertEqual(self.run_clear("layer", "not-a-number"), [])
         self.assertEqual(self.run_clear("class"), [])
+
+
+class ConsoleStreamClearTests(unittest.TestCase):
+    class InStream:
+        def __init__(self, out):
+            self.out = out
+            self.messages = []
+
+        def put(self, message):
+            self.messages.append(message)
+            self.out.put({message["request_id"]: {"removed": 2}})
+
+    def test_clear_uses_stream_command(self):
+        out = queue.Queue()
+        stream = self.InStream(out)
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            console._clear_command(
+                ["class", "Unit"], {}, None, stream, out
+            )
+
+        self.assertEqual(len(stream.messages), 1)
+        message = stream.messages[0]
+        self.assertEqual(message["command"], "clear")
+        self.assertEqual(message["field"], "class")
+        self.assertEqual(message["value"], "Unit")
+        self.assertEqual(message["reply"], "console")
+        self.assertIn("удалено объектов — 2", captured.getvalue())
 
 
 class ValidationTests(unittest.TestCase):
@@ -1945,60 +1976,36 @@ class MouseHitTestTests(unittest.TestCase):
         self.assertEqual(game.motion_cache.values["seq"], 0)
 
 
-class InfoOverlayCacheTests(unittest.TestCase):
+class InfoOverlayStaticTests(unittest.TestCase):
     def make_game(self):
-        class Cache:
-            def __init__(self, values):
-                self.values = values
-                self.gets = 0
-
-            def get(self, key):
-                self.gets += 1
-                return self.values.get(key)
-
         game = render.Game.__new__(render.Game)
         game._info_static_cache = {}
-        game.object_cache = Cache({
-            ("__engine_index__", "render_id", 4): "object-1",
-            "object-1": {
-                "_id": "object-1",
-                "dict_data": {
-                    "_identity": {
-                        "name": "hero", "class": "Player", "type": "dynamic",
-                    },
-                    "scripting": {
-                        "scripts": [
-                            "access/scripts/move.py", "access/scripts/shoot.py",
-                        ],
-                    },
-                },
-            },
-        })
         return game
 
-    def test_static_info_is_cached_between_frames(self):
+    def test_static_info_comes_from_add_payload(self):
         game = self.make_game()
-        first = game._info_static_for(4, 100.0)
-        self.assertEqual(first, {
+        game._store_static_info(4, {
+            "object_id": "object-1",
+            "object_type": "dynamic",
+            "identity": {
+                "name": "hero", "class": "Player", "type": "dynamic",
+            },
+            "scripts": [
+                "access/scripts/move.py", "access/scripts/shoot.py",
+            ],
+        })
+
+        self.assertEqual(game._info_static_for(4), {
             "object_id": "object-1",
             "name": "hero",
             "class": "Player",
             "type": "dynamic",
             "scripts": "move.py, shoot.py",
         })
-        self.assertEqual(game.object_cache.gets, 2)
 
-        self.assertIs(game._info_static_for(4, 100.5), first)
-        self.assertEqual(game.object_cache.gets, 2)
-
-        game._info_static_for(4, 101.5)
-        self.assertEqual(game.object_cache.gets, 4)
-
-    def test_missing_record_is_retried_next_frame(self):
+    def test_missing_static_info_returns_none(self):
         game = self.make_game()
-        game.object_cache.values.clear()
-        self.assertIsNone(game._info_static_for(4, 100.0))
-        self.assertNotIn(4, game._info_static_cache)
+        self.assertIsNone(game._info_static_for(4))
 
 
 class RenderQueueTests(unittest.TestCase):
@@ -2574,15 +2581,15 @@ class CreateObjectTests(CacheTestCase):
                 for message in requests.messages
             )
 
-        deps["objects_cache"][game_object._id] = {
-            "_generation": game_object._generation,
-        }
+        deps["id_cache"].set(
+            game_object._render_id, "generation", game_object._generation
+        )
         game_object.register()
         self.assertEqual(register_count(), 1)
 
-        # После удаления запись исчезает, и старые идентификаторы нельзя
-        # считать живыми: слот мог достаться другому объекту.
-        deps["objects_cache"].pop(game_object._id)
+        # После удаления поколение слота сбрасывается, и старые идентификаторы
+        # нельзя считать живыми: слот мог достаться другому объекту.
+        deps["id_cache"].set(game_object._render_id, "generation", 0)
         requests.generation = 2
         requests.render_id = 5
         game_object.register()
@@ -2643,55 +2650,7 @@ class CreateObjectTests(CacheTestCase):
         })
         self.assertIn("error", responses.items[-1]["two"])
 
-    def test_registration_populates_and_removes_layer_bucket(self):
-        visual, identity = self.make_caches()
-        responses = FakeResponseQueue()
-        stream_object = Stream.__new__(Stream)
-        stream_object.main_out_stream = responses
-        stream_object.render_in_stream = FakeRequestQueue(responses)
-        stream_object.object_lock = threading.Lock()
-        stream_object.objects_cache = {}
-        stream_object.visual_cache = visual
-        stream_object.id_cache = identity
-        stream_object.engine_state = FakeEngineState()
-        stream_object.camera_target_cache = ValueCache(-1)
-        self.addCleanup(stream_object.camera_target_cache.close)
-        stream_object._next_object_id = 0
-        stream_object._next_render_id = 0
-
-        game_object = GameObject({
-            "object_type": "static_object",
-            "id": {"name": "sky", "class": "Background"},
-            "visual": {
-                "sprite": "img.png",
-                "position": [0, 0],
-                "scale": 1,
-                "rotation": 0,
-                "alpha": 1,
-                "layer": 3,
-            },
-        }, deps={
-            "visual_cache": visual,
-            "id_cache": identity,
-            "objects_cache": stream_object.objects_cache,
-            "lock": stream_object.object_lock,
-        })
-        stream_object._Stream__register({
-            "id": game_object._id,
-            "request_id": "layer",
-            "obj": game_object._GameObject__cache_record(),
-            "script_data": game_object.dict_data,
-        })
-
-        layer_key = (Stream.INDEX_PREFIX, "layer", 3.0)
-        self.assertEqual(
-            stream_object.objects_cache[layer_key], [game_object._id]
-        )
-
-        stream_object._Stream__remove_identity_indexes(game_object._id, 0)
-        self.assertNotIn(layer_key, stream_object.objects_cache)
-
-    def test_visual_layer_change_moves_index_bucket(self):
+    def test_visual_layer_change_updates_shared_cache(self):
         visual, identity = self.make_caches()
         deps, _, _ = self.make_deps(visual, identity)
         game_object = create_object({
@@ -2706,21 +2665,13 @@ class CreateObjectTests(CacheTestCase):
             },
         }, deps=deps)
 
-        old_key = (Stream.INDEX_PREFIX, "layer", 2.0)
-        new_key = (Stream.INDEX_PREFIX, "layer", 4.5)
         visual.set_many(0, {"layer": 2.0})
-        # Регистрация в живом Stream заполняет эту корзину; фиктивный поток
-        # только подтверждает регистрацию.
-        deps["objects_cache"][old_key] = [game_object._id]
-
         game_object.Visual.layer = 4.5
         self.assertEqual(visual.get(0, "layer"), 4.5)
-        self.assertNotIn(old_key, deps["objects_cache"])
-        self.assertEqual(deps["objects_cache"][new_key], [game_object._id])
 
-        # Повторная установка того же слоя не должна дублировать объект.
+        # Повторная установка того же слоя не меняет данные.
         game_object.Visual.layer = 4.5
-        self.assertEqual(deps["objects_cache"][new_key], [game_object._id])
+        self.assertEqual(visual.get(0, "layer"), 4.5)
 
 
 class RenderSlotLifecycleTests(CacheTestCase):
@@ -2853,146 +2804,275 @@ class RenderSlotLifecycleTests(CacheTestCase):
         self.assertEqual(list(stream_object._free_render_ids), [0])
 
 
-class IdentityIndexTests(CacheTestCase):
-    """Индексы идентичности должны быть O(1)-корзинами, а не перезаписью целых списков."""
+class StreamQueryCommandTests(CacheTestCase):
+    """Команды чтения локального реестра без общего Manager-словаря."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.manager = multiprocessing.Manager()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.manager.shutdown()
-
-    def make_stream(self, objects_cache=None, visual_cache=None):
+    def make_stream(self):
+        visual, identity = self.make_caches()
+        responses = FakeResponseQueue()
+        renders = FakeRequestQueue(responses)
         stream_object = Stream.__new__(Stream)
-        stream_object.objects_cache = (
-            objects_cache if objects_cache is not None else self.manager.dict()
+        stream_object.main_out_stream = responses
+        stream_object.console_out_stream = FakeResponseQueue()
+        stream_object.render_in_stream = renders
+        stream_object.object_lock = threading.Lock()
+        stream_object.objects_cache = {}
+        stream_object.visual_cache = visual
+        stream_object.id_cache = identity
+        stream_object.engine_state = FakeEngineState()
+        stream_object.camera_target_cache = ValueCache(-1)
+        self.addCleanup(stream_object.camera_target_cache.close)
+        stream_object._next_object_id = 0
+        stream_object._next_render_id = 0
+        stream_object._object_generation = 0
+        return stream_object, visual, identity, responses
+
+    def register(self, stream_object, responses, data, request_id):
+        game_object = GameObject(data, deps={
+            "visual_cache": stream_object.visual_cache,
+            "id_cache": stream_object.id_cache,
+            "objects_cache": {},
+            "lock": stream_object.object_lock,
+        })
+        stream_object._Stream__register({
+            "id": game_object._id,
+            "request_id": request_id,
+            "obj": game_object._GameObject__cache_record(),
+            "script_data": game_object.dict_data,
+        })
+        return game_object, responses.items[-1][request_id]
+
+    @staticmethod
+    def wall(name, class_name="Wall"):
+        return {
+            "object_type": "static_object",
+            "id": {"name": name, "class": class_name},
+            "visual": {
+                "sprite": "None", "position": [0, 0], "scale": 1,
+                "rotation": 0, "alpha": 1, "layer": 2,
+            },
+        }
+
+    def test_generation_is_published_and_cleared_with_slot(self):
+        stream_object, _, identity, responses = self.make_stream()
+        game_object, payload = self.register(
+            stream_object, responses, self.wall("hero"), "gen"
         )
-        stream_object._index_manager = self.manager
-        stream_object._index_buckets = {}
-        if visual_cache is not None:
-            stream_object.visual_cache = visual_cache
+        render_id = payload["render_id"]
+        self.assertEqual(
+            identity.get(render_id, "generation"), payload["generation"]
+        )
+        self.assertEqual(identity.get(render_id, "id"), game_object._id)
+
+        stream_object._Stream__remove({
+            "id": game_object._id,
+            "generation": payload["generation"],
+        })
+        self.assertEqual(identity.get(render_id, "generation"), 0)
+        self.assertEqual(identity.get(render_id, "id"), "")
+
+    def test_find_object_returns_source_with_components(self):
+        stream_object, _, _, responses = self.make_stream()
+        game_object, _ = self.register(stream_object, responses, {
+            "object_type": "dynamic_object",
+            "id": {
+                "name": "runner", "class": "Runner",
+                "type": "dynamic_object",
+            },
+            "visual": {
+                "sprite": "None", "position": [5, 6], "scale": 2,
+                "rotation": 0, "alpha": 1, "layer": 1,
+            },
+            "transform": {
+                "polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]],
+            },
+            "scripting": {"scripts": ["a.py"]},
+        }, "find")
+
+        stream_object._Stream__find_object({
+            "request_id": "find-request",
+            "field": "name",
+            "value": "runner",
+        })
+        payload = responses.items[-1]["find-request"]
+        source = payload["source"]
+        self.assertEqual(source["_id"], game_object._id)
+        self.assertEqual(source["id"]["name"], "runner")
+        self.assertEqual(source["object_type"], "dynamic_object")
+        self.assertEqual(source["id"]["class"], "Runner")
+        self.assertEqual(source["visual"]["position"], [5.0, 6.0])
+        self.assertEqual(source["transform"]["polygon"][0], [-1, -1])
+        self.assertEqual(source["scripting"]["scripts"], ["a.py"])
+
+        stream_object._Stream__find_object({
+            "request_id": "missing",
+            "field": "name",
+            "value": "nobody",
+        })
+        self.assertIsNone(responses.items[-1]["missing"]["source"])
+
+    def test_find_object_by_layer_scans_local_registry(self):
+        stream_object, visual, _, responses = self.make_stream()
+        game_object, payload = self.register(
+            stream_object, responses, self.wall("hero"), "layer"
+        )
+        self.assertEqual(visual.get(payload["render_id"], "layer"), 2.0)
+
+        stream_object._Stream__find_object({
+            "request_id": "layer-request",
+            "field": "layer",
+            "value": 2.0,
+        })
+        self.assertEqual(
+            responses.items[-1]["layer-request"]["source"]["_id"],
+            game_object._id,
+        )
+
+        stream_object._Stream__find_object({
+            "request_id": "layer-missing",
+            "field": "layer",
+            "value": 9.0,
+        })
+        self.assertIsNone(
+            responses.items[-1]["layer-missing"]["source"]
+        )
+
+    def test_camera_targets_lists_typed_cameras(self):
+        stream_object, _, _, responses = self.make_stream()
+        self.register(stream_object, responses, {
+            "object_type": "camera",
+            "id": {"name": "alpha", "class": "Camera", "type": "camera"},
+            "visual": {
+                "sprite": "None", "position": [0, 0], "scale": 1,
+                "rotation": 0, "alpha": 1, "layer": 1,
+            },
+        }, "camera")
+
+        stream_object._Stream__camera_targets({
+            "request_id": "targets",
+        })
+        targets = responses.items[-1]["targets"]["targets"]
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["name"], "alpha")
+        self.assertEqual(targets[0]["generation"], 1)
+
+    def test_clear_removes_matching_objects(self):
+        stream_object, _, _, responses = self.make_stream()
+        first, _ = self.register(stream_object, responses, self.wall("a"), "a")
+        second, _ = self.register(stream_object, responses, self.wall("b"), "b")
+        third, _ = self.register(
+            stream_object, responses, self.wall("c", "Unit"), "c"
+        )
+
+        stream_object._Stream__clear({
+            "request_id": "clear",
+            "field": "class",
+            "value": "Wall",
+        })
+        self.assertEqual(responses.items[-1]["clear"]["removed"], 2)
+        self.assertNotIn(first._id, stream_object.objects_cache)
+        self.assertNotIn(second._id, stream_object.objects_cache)
+        self.assertIn(third._id, stream_object.objects_cache)
+
+    def test_stats_counts_objects_and_rendered(self):
+        stream_object, _, _, responses = self.make_stream()
+        first, first_payload = self.register(
+            stream_object, responses, self.wall("a"), "a"
+        )
+        self.register(stream_object, responses, self.wall("b"), "b")
+        stream_object._Stream__render({
+            "id": first._id,
+            "generation": first_payload["generation"],
+        })
+
+        stream_object._Stream__stats({"request_id": "stats"})
+        payload = responses.items[-1]["stats"]
+        self.assertEqual(payload["objects"], 2)
+        self.assertEqual(payload["rendered"], 1)
+
+    def test_console_response_uses_separate_queue(self):
+        stream_object, _, _, responses = self.make_stream()
+        console_responses = stream_object.console_out_stream
+        stream_object._Stream__stats({
+            "request_id": "console-stats",
+            "reply": "console",
+        })
+        self.assertIn("console-stats", console_responses.items[-1])
+        self.assertEqual(responses.items, [])
+
+
+class IdentityIndexTests(CacheTestCase):
+    """Локальные индексы идентичности и поиск по реестру Stream."""
+
+    def make_stream(self):
+        stream_object = Stream.__new__(Stream)
+        stream_object.objects_cache = {}
         return stream_object
 
-    def test_small_buckets_stay_lists_and_shared_buckets_promote(self):
-        visual, identity = self.make_caches()
+    def test_identity_buckets_track_add_and_remove(self):
         stream_object = self.make_stream()
-        stream_object.id_cache = identity
-
         class_key = (Stream.INDEX_PREFIX, "class", "Unit")
         type_key = (Stream.INDEX_PREFIX, "type", "dynamic_object")
-        hero_key = (Stream.INDEX_PREFIX, "name", "hero")
+        name_key = (Stream.INDEX_PREFIX, "name", "hero")
 
-        for index in range(INDEX_BUCKET_PROMOTE_AT):
-            stream_object._Stream__add_identity_indexes(
-                f"unit_{index}",
-                {"name": f"unit_{index}", "class": "Unit"},
-                "dynamic_object",
-            )
-
-        # Общие корзины class/type были переведены в прокси manager.list.
-        class_bucket = stream_object.objects_cache[class_key]
-        self.assertNotIsInstance(class_bucket, list)
-        self.assertEqual(
-            class_bucket[:],
-            [f"unit_{index}" for index in range(INDEX_BUCKET_PROMOTE_AT)],
-        )
-        self.assertNotIsInstance(stream_object.objects_cache[type_key], list)
-
-        # Имя, использованное один раз, остаётся обычным списком и не повышается до прокси.
-        self.assertNotIn(hero_key, stream_object.objects_cache)
-        stream_object._Stream__add_identity_indexes(
-            "solo", {"name": "hero", "class": "Unit"}, "dynamic_object"
-        )
-        self.assertIsInstance(stream_object.objects_cache[hero_key], list)
-
-        stream_object._Stream__add_identity_indexes(
-            "extra", {"name": "extra", "class": "Unit"}, "dynamic_object"
-        )
-        self.assertEqual(len(class_bucket), INDEX_BUCKET_PROMOTE_AT + 2)
-
-        added_ids = [
-            f"unit_{index}" for index in range(INDEX_BUCKET_PROMOTE_AT)
-        ] + ["solo", "extra"]
-        for render_id, object_id in enumerate(added_ids):
-            identity.set_many(render_id, {
-                "name": "hero" if object_id == "solo" else object_id,
-                "class": "Unit",
-                "type": "dynamic_object",
-                "id": object_id,
-            })
-
-        # Удаляем из обычной корзины (name) и из повышенных (class/type).
-        stream_object._Stream__remove_identity_indexes("unit_0", 0)
-        stream_object._Stream__remove_identity_indexes("solo", 16)
-        self.assertEqual(class_bucket[:], added_ids[1:16] + ["extra"])
-        self.assertNotIn(hero_key, stream_object.objects_cache)
-
-        # Пустые повышенные корзины удаляются из индекса и локального кэша.
-        for render_id, object_id in enumerate(added_ids):
-            if object_id in {"unit_0", "solo"}:
-                continue
-            stream_object._Stream__remove_identity_indexes(object_id, render_id)
-        self.assertNotIn(class_key, stream_object.objects_cache)
-        self.assertNotIn(type_key, stream_object.objects_cache)
-        self.assertNotIn(class_key, stream_object._index_buckets)
-
-    def test_layer_buckets_track_add_and_remove(self):
-        visual, identity = self.make_caches()
-        stream_object = self.make_stream(visual_cache=visual)
-        stream_object.id_cache = identity
-
-        layers = {0: 0.0, 1: 2.0, 2: 2.0, 3: 5.0}
-        for render_id, layer in layers.items():
-            object_id = f"unit_{render_id}"
-            visual.set_many(render_id, {"layer": layer})
-            identity.set_many(render_id, {
-                "name": object_id,
-                "class": "Unit",
-                "type": "dynamic_object",
-                "id": object_id,
-            })
+        for index in range(3):
             stream_object._Stream__add_index_value(
-                (Stream.INDEX_PREFIX, "layer", layer), object_id
+                class_key, f"unit_{index}"
             )
+            stream_object._Stream__add_index_value(
+                type_key, f"unit_{index}"
+            )
+        stream_object._Stream__add_index_value(name_key, "solo")
 
-        layer_two = (Stream.INDEX_PREFIX, "layer", 2.0)
         self.assertEqual(
-            stream_object.objects_cache[layer_two], ["unit_1", "unit_2"]
+            stream_object.objects_cache[class_key],
+            ["unit_0", "unit_1", "unit_2"],
         )
-
-        stream_object._Stream__remove_identity_indexes("unit_1", 1)
-        self.assertEqual(stream_object.objects_cache[layer_two], ["unit_2"])
-
-        stream_object._Stream__remove_identity_indexes("unit_2", 2)
-        self.assertNotIn(layer_two, stream_object.objects_cache)
-        # Остальные слои не затрагиваются.
         self.assertEqual(
-            stream_object.objects_cache[
-                (Stream.INDEX_PREFIX, "layer", 5.0)
-            ],
-            ["unit_3"],
+            stream_object.objects_cache[type_key],
+            ["unit_0", "unit_1", "unit_2"],
         )
+        self.assertEqual(stream_object.objects_cache[name_key], ["solo"])
 
-    def test_find_object_layer_uses_index_bucket(self):
+        # Повторное добавление не дублирует id.
+        stream_object._Stream__add_index_value(class_key, "unit_1")
+        self.assertEqual(len(stream_object.objects_cache[class_key]), 3)
+
+        stream_object._Stream__remove_index_value(class_key, "unit_0")
+        stream_object._Stream__remove_index_value(name_key, "solo")
+        self.assertEqual(
+            stream_object.objects_cache[class_key], ["unit_1", "unit_2"]
+        )
+        self.assertNotIn(name_key, stream_object.objects_cache)
+
+        for object_id in ("unit_1", "unit_2"):
+            stream_object._Stream__remove_index_value(class_key, object_id)
+        self.assertNotIn(class_key, stream_object.objects_cache)
+
+    def test_find_object_uses_identity_bucket(self):
         visual, identity = self.make_caches()
-        visual.set_many(0, {"layer": 2.0})
         identity.set_many(0, {
-            "name": "wall", "class": "Wall",
-            "type": "static_object", "id": "wall",
+            "name": "hero", "class": "Unit", "type": "dynamic_object",
+            "id": "a", "generation": 1,
         })
-        objects_cache = self.manager.dict()
-        objects_cache[(Stream.INDEX_PREFIX, "layer", "__ready__")] = True
-        objects_cache[(Stream.INDEX_PREFIX, "layer", 2.0)] = (
-            self.manager.list(["wall"])
-        )
-        objects_cache["wall"] = {
-            "_object_id": 0,
-            "_render_id": 0,
-            "dict_data": {
-                "object_type": "static_object",
-                "_components": ["id", "visual"],
+        visual.set_many(0, {
+            "sprite": "None", "x": 0.0, "y": 0.0, "scale": 1.0,
+            "rotation": 0.0, "alpha": 1.0, "layer": 0.0,
+        })
+        objects_cache = {
+            (Stream.INDEX_PREFIX, "class", "Unit"): ["a"],
+            "a": {
+                "_object_id": 0,
+                "_render_id": 0,
+                "_generation": 1,
+                "dict_data": {
+                    "object_type": "dynamic_object",
+                    "_components": ["id", "visual"],
+                    "_identity": {
+                        "name": "hero", "class": "Unit",
+                        "type": "dynamic_object",
+                    },
+                },
             },
         }
         probe = script.__new__(script)
@@ -3001,29 +3081,31 @@ class IdentityIndexTests(CacheTestCase):
         probe.__dict__["_script__visual_cache"] = visual
         probe.__dict__["_script__dependencies"] = {
             "objects_cache": objects_cache,
-            "lock": self.manager.Lock(),
+            "lock": threading.Lock(),
             "visual_cache": visual,
             "id_cache": identity,
         }
 
-        found = script.find_object(probe, "layer", 2.0)
+        found = script.find_object(probe, "class", "Unit")
         self.assertIsNotNone(found)
-        self.assertEqual(found._id, "wall")
+        self.assertEqual(found._object_id, 0)
 
-    def test_find_object_layer_falls_back_without_index_marker(self):
+    def test_find_object_layer_scans_registry(self):
         visual, identity = self.make_caches()
         visual.set_many(0, {"layer": 2.0})
         identity.set_many(0, {
             "name": "wall", "class": "Wall",
-            "type": "static_object", "id": "wall",
+            "type": "static_object", "id": "wall", "generation": 1,
         })
         objects_cache = {
             "wall": {
                 "_object_id": 0,
                 "_render_id": 0,
+                "_generation": 1,
                 "dict_data": {
                     "object_type": "static_object",
                     "_components": ["id", "visual"],
+                    "_identity": {"name": "wall", "class": "Wall"},
                 },
             },
         }
@@ -3043,42 +3125,234 @@ class IdentityIndexTests(CacheTestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found._id, "wall")
 
-    def test_find_object_snapshots_manager_list_bucket(self):
+
+class StreamSceneRegistrationTests(CacheTestCase):
+    """Сцена регистрируется в локальном реестре Stream без обмена по очереди."""
+
+    class RecordingRequests:
+        """Запоминает команды и число уже зарегистрированных объектов."""
+
+        def __init__(self, objects_cache):
+            self.objects_cache = objects_cache
+            self.messages = []
+            self.registered_counts = []
+
+        def put(self, message):
+            self.messages.append(message)
+            self.registered_counts.append(
+                (message.get("command"), self.registered_count())
+            )
+
+        def registered_count(self):
+            """Число объектов сцены в реестре, без служебных индексных ключей.
+
+            Реестр содержит не только записи объектов, но и tuple-ключи
+            ``__engine_index__`` для поиска по идентичности. Считаем только
+            записи-словари с ``_render_id``.
+            """
+
+            return sum(
+                1
+                for value in self.objects_cache.values()
+                if isinstance(value, dict) and "_render_id" in value
+            )
+
+    def make_stream(self):
         visual, identity = self.make_caches()
-        identity.set_many(0, {
-            "name": "hero", "class": "Unit", "type": "dynamic_object", "id": "a",
+        requests = self.RecordingRequests({})
+        responses = FakeResponseQueue()
+        stream_object = Stream.__new__(Stream)
+        stream_object.main_in_stream = requests
+        stream_object.main_out_stream = responses
+        stream_object.render_in_stream = FakeRequestQueue(responses)
+        stream_object.console_out_stream = FakeResponseQueue()
+        stream_object.object_lock = threading.Lock()
+        stream_object.objects_cache = requests.objects_cache
+        stream_object.visual_cache = visual
+        stream_object.id_cache = identity
+        stream_object.engine_state = FakeEngineState()
+        stream_object.camera_target_cache = ValueCache(-1)
+        self.addCleanup(stream_object.camera_target_cache.close)
+        stream_object._next_object_id = 0
+        stream_object._next_render_id = 0
+        stream_object._free_render_ids = deque()
+        stream_object._render_generations = {}
+        return stream_object, visual, identity, requests
+
+    def make_object(self, stream_object, name, class_name="Wall"):
+        return GameObject({
+            "object_type": "static_object",
+            "id": {"name": name, "class": class_name},
+            "visual": {
+                "sprite": "None", "position": [0, 0], "scale": 1,
+                "rotation": 0, "alpha": 1, "layer": 0,
+            },
+        }, deps={
+            "main_in_stream": stream_object.main_in_stream,
+            "main_out_stream": stream_object.main_out_stream,
+            "objects_cache": stream_object.objects_cache,
+            "lock": stream_object.object_lock,
+            "visual_cache": stream_object.visual_cache,
+            "id_cache": stream_object.id_cache,
         })
-        visual.set_many(0, {
-            "sprite": "None", "x": 0.0, "y": 0.0, "scale": 1.0,
-            "rotation": 0.0, "alpha": 1.0, "layer": 0.0,
-        })
-        objects_cache = self.manager.dict()
-        objects_cache[(Stream.INDEX_PREFIX, "class", "Unit")] = (
-            self.manager.list(["a"])
+
+    def test_scene_objects_register_without_queue_round_trip(self):
+        stream_object, _visual, identity, requests = self.make_stream()
+        objects = [
+            self.make_object(stream_object, "first"),
+            self.make_object(stream_object, "second"),
+        ]
+
+        stream_object._Stream__register_scene_objects(objects)
+
+        commands = [message["command"] for message in requests.messages]
+        self.assertNotIn("register_many", commands)
+        self.assertNotIn("register", commands)
+        self.assertEqual(commands.count("render"), 2)
+        self.assertEqual([obj._object_id for obj in objects], [0, 1])
+        self.assertEqual([obj._render_id for obj in objects], [0, 1])
+        self.assertEqual(identity.get(0, "name"), "first")
+        self.assertEqual(identity.get(1, "name"), "second")
+        self.assertIn(objects[0]._id, stream_object.objects_cache)
+        self.assertIn(objects[1]._id, stream_object.objects_cache)
+
+        # Скрипты и рендер публикуются только после регистрации всех
+        # объектов сцены: камера не должна стартовать раньше остальных.
+        published = [
+            count for command, count in requests.registered_counts
+            if command in {"render", "add_script"}
+        ]
+        self.assertTrue(published)
+        self.assertTrue(all(count == 2 for count in published))
+
+    def test_duplicate_scene_object_is_rejected(self):
+        stream_object, _visual, _identity, _requests = self.make_stream()
+        objects = [self.make_object(stream_object, "wall")]
+        stream_object._Stream__register_scene_objects(objects)
+
+        with self.assertRaises(ValueError):
+            stream_object._Stream__register_scene_objects(objects)
+
+
+class StreamResponseRoutingTests(unittest.TestCase):
+    """Чужие ответы Stream возвращаются в общий кэш по request_id."""
+
+    def test_foreign_response_is_stashed_and_returned(self):
+        cache = {}
+        lock = threading.Lock()
+
+        stash_stream_responses(
+            cache, lock, {"other": {"objects": 5}, "mine": {"objects": 1}}
         )
-        objects_cache["a"] = {
-            "_object_id": 0,
-            "_render_id": 0,
-            "dict_data": {
-                "object_type": "dynamic_object",
-                "_components": ["id", "visual"],
+        self.assertIn((REGISTRATION_STASH_PREFIX, "other"), cache)
+        self.assertIn((REGISTRATION_STASH_PREFIX, "mine"), cache)
+
+        self.assertEqual(
+            take_stashed_stream_response(cache, lock, "other"),
+            {"objects": 5},
+        )
+        self.assertIsNone(
+            take_stashed_stream_response(cache, lock, "other")
+        )
+
+    def test_non_dict_and_missing_cache_are_ignored(self):
+        stash_stream_responses(None, None, {"other": 1})
+        cache = {}
+        stash_stream_responses(cache, None, "not-a-dict")
+        self.assertEqual(cache, {})
+
+
+class StreamQueryClientTests(CacheTestCase):
+    """Клиентские обёртки ходят в Stream командами, а не в общий реестр."""
+
+    def test_find_object_uses_stream_command(self):
+        visual, identity = self.make_caches()
+        responses = queue.Queue()
+        requests = []
+        source = {
+            "object_type": "dynamic_object",
+            "_id": "object-id",
+            "object_id": 3,
+            "render_id": 0,
+            "_generation": 1,
+            "id": {"name": "hero", "class": "Unit", "type": "dynamic_object"},
+            "visual": {
+                "sprite": "None", "position": [10.0, 20.0], "scale": 1,
+                "rotation": 0, "alpha": 1, "layer": 0,
             },
         }
-        deps = {
-            "objects_cache": objects_cache,
-            "lock": self.manager.Lock(),
-            "visual_cache": visual,
-            "id_cache": identity,
-        }
+
+        class InStream:
+            def put(self, message):
+                requests.append(message)
+                responses.put({
+                    message["request_id"]: {"source": source},
+                })
+
+        class Waiter:
+            def _wait_stream_response(
+                self, request_id, description, legacy_key=None
+            ):
+                return responses.get(timeout=1.0)[request_id]
+
         probe = script.__new__(script)
-        probe.__dict__["_script__objects_cache"] = objects_cache
-        probe.__dict__["_script__id_cache"] = identity
-        probe.__dict__["_script__visual_cache"] = visual
-        probe.__dict__["_script__dependencies"] = deps
+        probe.GameObject = Waiter()
+        probe.__dict__.update({
+            "_script__find_object_via_stream": True,
+            "_script__main_in_stream": InStream(),
+            "_script__stream_request_id": 0,
+            "_script__dependencies": {
+                "objects_cache": {},
+                "lock": threading.Lock(),
+                "visual_cache": visual,
+                "id_cache": identity,
+            },
+        })
 
         found = script.find_object(probe, "class", "Unit")
+
         self.assertIsNotNone(found)
-        self.assertEqual(found._object_id, 0)
+        self.assertEqual(found._id, "object-id")
+        self.assertEqual(found._object_id, 3)
+        self.assertEqual(found._generation, 1)
+        self.assertEqual(requests[0]["command"], "find_object")
+        self.assertEqual(requests[0]["field"], "class")
+        self.assertEqual(requests[0]["value"], "Unit")
+
+    def test_camera_targets_use_stream_and_generation(self):
+        visual, identity = self.make_caches()
+        visual.set_many(0, {"x": 10.0, "y": 20.0})
+        identity.set(0, "generation", 1)
+        target_cache = ValueCache(-1)
+        scale_cache = ValueCache(1.0)
+        self.addCleanup(target_cache.close)
+        self.addCleanup(scale_cache.close)
+        commands = []
+
+        def request(command, payload):
+            commands.append(command)
+            return {
+                "targets": [{
+                    "name": "alpha", "render_id": 0, "generation": 1,
+                }],
+            }
+
+        owner = types.SimpleNamespace()
+        owner.__dict__["_script__id_cache"] = identity
+        owner.__dict__["_script__objects_cache"] = {}
+        owner.__dict__["_script__visual_cache"] = visual
+        owner.__dict__["_script__rawTick"] = None
+        owner.__dict__["_simulation_tick"] = 0
+
+        camera = _Camera(owner, target_cache, scale_cache, request)
+
+        self.assertIn("camera_targets", commands)
+        self.assertEqual(camera.targets, {"alpha": 0})
+        self.assertEqual(camera.target_id, 0)
+        self.assertEqual((camera.position_x, camera.position_y), (10.0, 20.0))
+
+        identity.set(0, "generation", 0)
+        self.assertFalse(camera._is_valid_target(0))
 
 
 class FindObjectComponentTests(CacheTestCase):
@@ -3188,7 +3462,16 @@ class ScriptStepTests(unittest.TestCase):
         def stop(self):
             self.stopped += 1
 
-    def make_probe(self, engine_state=None, objects_cache=None,
+    class GenerationCache:
+        def __init__(self, generation):
+            self.values = {0: generation}
+
+        def get(self, render_id, field):
+            if field != "generation":
+                raise KeyError(field)
+            return self.values.get(render_id, 0)
+
+    def make_probe(self, engine_state=None, id_cache=None,
                    object_id="obj", generation=1, last_fixed_tick=None):
         state = engine_state if engine_state is not None else FakeEngineState()
         probe = self.Probe.__new__(self.Probe)
@@ -3198,12 +3481,14 @@ class ScriptStepTests(unittest.TestCase):
         probe.stopped = 0
         probe.GlobalTime = 0.0
         probe.GameObject = types.SimpleNamespace(
-            _id=object_id, _generation=generation
+            _id=object_id, _render_id=0, _generation=generation
         )
         probe.__dict__.update({
             "_script__engine_state": state,
-            "_script__objects_cache": (
-                objects_cache if objects_cache is not None else {}
+            "_script__objects_cache": {},
+            "_script__id_cache": (
+                id_cache if id_cache is not None
+                else self.GenerationCache(generation)
             ),
             "_script__dependencies": {},
             "_script__last_object_generation": state.values[
@@ -3241,26 +3526,100 @@ class ScriptStepTests(unittest.TestCase):
         self.assertTrue(probe.step())
         self.assertEqual(len(probe.fixed), 2)
 
+    def test_strict_tick_runs_exactly_one_fixed_update(self):
+        state = FakeEngineState(time=0.2, tick=2)
+        probe = self.make_probe(state, last_fixed_tick=0)
+        probe.set_strict_tick()
+
+        self.assertTrue(probe.step())
+        self.assertEqual([entry[1] for entry in probe.fixed], [2])
+
+        # Тот же тик повторно не моделируется.
+        self.assertTrue(probe.step())
+        self.assertEqual([entry[1] for entry in probe.fixed], [2])
+
+        # Пропущенные тики не догоняются: один проход — один fixed_update.
+        state.values["tick"] = 7
+        state.values["time"] = 0.7
+        self.assertTrue(probe.step())
+        self.assertEqual([entry[1] for entry in probe.fixed], [2, 7])
+
+    def test_bound_input_overrides_keys_and_dispatches_events(self):
+        from net.input_source import InputSnapshot
+
+        state = FakeEngineState(time=0.1, tick=1)
+        probe = self.make_probe(state, last_fixed_tick=0)
+        probe.pressed_events = []
+        probe.released_events = []
+        probe.on_key_press = lambda event: probe.pressed_events.append(event.key)
+        probe.on_key_release = lambda event: probe.released_events.append(event.key)
+        probe.__dict__["_script__wants_keyboard_events"] = True
+        snapshot = InputSnapshot(
+            tick=1,
+            pressed=frozenset({"W", "D"}),
+            pressed_down=frozenset({"W"}),
+            pressed_up=frozenset({"A"}),
+        )
+        probe.__dict__["_script__input_source"] = types.SimpleNamespace(
+            current=snapshot
+        )
+
+        self.assertTrue(probe.step())
+        self.assertEqual(probe.get_pressed_keys(), frozenset({"W", "D"}))
+        self.assertTrue(probe.is_pressed("w"))
+        self.assertFalse(probe.is_pressed("A"))
+        self.assertEqual(probe.pressed_events, ["W"])
+        self.assertEqual(probe.released_events, ["A"])
+
+    def test_bind_input_switches_keyboard_and_mouse(self):
+        from net.input_source import InputSnapshot
+
+        class FakeDevice:
+            def __init__(self):
+                self.bound = None
+
+            def set_input_source(self, source):
+                self.bound = source
+
+        probe = self.make_probe()
+        probe.Mouse = FakeDevice()
+        probe.Keyboard = FakeDevice()
+        source = types.SimpleNamespace(
+            current=InputSnapshot(pressed=frozenset({"SPACE"}))
+        )
+
+        probe.bind_input(source)
+
+        self.assertIs(probe.Mouse.bound, source)
+        self.assertIs(probe.Keyboard.bound, source)
+        self.assertTrue(probe.is_pressed("space"))
+        self.assertEqual(probe.get_pressed_keys(), frozenset({"SPACE"}))
+
+        probe.bind_input(None)
+        self.assertIsNone(probe.Mouse.bound)
+        self.assertIsNone(probe.Keyboard.bound)
+
     def test_step_stops_when_object_is_removed_or_slot_is_reused(self):
         state = FakeEngineState(object_generation=0)
-        objects = {"obj": {"_generation": 1}}
-        probe = self.make_probe(state, objects)
+        generation_cache = self.GenerationCache(1)
+        probe = self.make_probe(state, generation_cache)
         probe.__dict__["_script__last_object_generation"] = None
 
         self.assertTrue(probe.step())
         self.assertEqual(len(probe.updates), 1)
 
-        # Объект удалён: следующий шаг должен завершить цикл скрипта.
-        objects.pop("obj")
+        # Объект удалён: поколение слота сброшено, следующий шаг должен
+        # завершить цикл скрипта.
+        generation_cache.values[0] = 0
         state.values["object_generation"] = 1
         self.assertFalse(probe.step())
         self.assertEqual(len(probe.updates), 1)
 
         # Слот переиспользован объектом нового поколения: старый скрипт
         # не должен продолжать работу с чужими данными.
-        objects["obj"] = {"_generation": 2}
+        generation_cache.values[0] = 2
         state.values["object_generation"] = 2
-        stale = self.make_probe(state, objects)
+        stale = self.make_probe(state, generation_cache)
         stale.__dict__["_script__last_object_generation"] = None
         self.assertFalse(stale.step())
         self.assertEqual(stale.updates, [])
@@ -3316,6 +3675,8 @@ class CooperativeSchedulerTests(unittest.TestCase):
         runner.lock = threading.Lock()
         runner._scripts = dict(scripts or {})
         runner._next_script_id = len(runner._scripts)
+        runner.net = None
+        runner.net_executed_tick = None
         return runner
 
     def test_error_in_one_script_does_not_stop_others(self):
@@ -3357,8 +3718,12 @@ class CooperativeSchedulerTests(unittest.TestCase):
         received = []
         runner = self.make_runner()
         runner._scripter_runner__start_script = received.append
-        runner.worker_queue.put({"proc_id": 1, "path": "other.py"})
-        runner.worker_queue.put({"proc_id": 0, "path": "mine.py"})
+        runner.worker_queue.put({
+            "proc_id": 1, "command": "add_script", "path": "other.py"
+        })
+        runner.worker_queue.put({
+            "proc_id": 0, "command": "add_script", "path": "mine.py"
+        })
         runner.worker_queue.put(None)
 
         runner._scripter_runner__drain_commands()
@@ -3366,6 +3731,232 @@ class CooperativeSchedulerTests(unittest.TestCase):
         self.assertEqual(
             [message["path"] for message in received], ["mine.py"]
         )
+
+    def test_net_mode_binds_owner_script_and_applies_tick(self):
+        class FakeNetScript:
+            def __init__(self, render_id):
+                self.GameObject = types.SimpleNamespace(_render_id=render_id)
+                self.bound = None
+                self.strict = False
+                self.ticks = []
+                self.steps = 0
+
+            def set_strict_tick(self, enabled=True):
+                self.strict = bool(enabled)
+
+            def bind_input(self, source):
+                self.bound = source
+
+            def step(self, state):
+                self.steps += 1
+                self.ticks.append(int(state["tick"]))
+                return True
+
+            def shutdown(self):
+                pass
+
+        owner = FakeNetScript(100)
+        other = FakeNetScript(200)
+        runner = self.make_runner({
+            0: (owner, 0, "owner.py"),
+            1: (other, 0, "other.py"),
+        })
+        runner.engine_state = FakeEngineState()
+        runner.net_executed_tick = types.SimpleNamespace(value=0)
+
+        runner._scripter_runner__handle_worker_message({"command": "net_start"})
+        self.assertTrue(owner.strict)
+        self.assertTrue(other.strict)
+        self.assertIsNone(owner.bound)
+
+        runner._scripter_runner__handle_worker_message({
+            "command": "net_join", "client_id": 1, "render_id": 100,
+        })
+        self.assertIsNotNone(owner.bound)
+        self.assertIsNone(other.bound)
+        self.assertEqual(runner.net.owner_of(100), 1)
+
+        from net import protocol
+        payload = protocol.encode_input_message(
+            protocol.make_input_frame(0, 0, {"D"})
+        )
+        runner._scripter_runner__step_net(
+            {"tick": 1}, [(1, payload)]
+        )
+        self.assertEqual(owner.ticks, [1])
+        self.assertEqual(other.ticks, [1])
+        self.assertIn("D", owner.bound.current.pressed)
+        self.assertEqual(runner.net_executed_tick.value, 1)
+        self.assertEqual(runner.engine_state.values["tick"], 1)
+
+        runner._scripter_runner__handle_worker_message({
+            "command": "net_leave", "client_id": 1,
+        })
+        self.assertIsNone(owner.bound)
+        self.assertIsNone(runner.net.owner_of(100))
+
+
+class NetRenderTests(unittest.TestCase):
+    """Сетевой путь рендера: отправка ввода, снапшоты, поправки."""
+
+    class _Sprite:
+        def __init__(self):
+            self.position = (0.0, 0.0)
+            self.angle = 0.0
+            self.scale = 1.0
+            self.alpha = 255
+            self.texture = None
+            self._engine_sort_key = None
+
+    class _NetClient:
+        def __init__(self, snapshot=None, state=None, corrections=()):
+            self.last_snapshot = snapshot
+            self.state = state
+            self._corrections = list(corrections)
+            self.frames = []
+
+        def next_tick(self):
+            return 105
+
+        def send_input(self, frame):
+            self.frames.append(frame)
+
+        def drain_corrections(self):
+            items = self._corrections
+            self._corrections = []
+            return items
+
+    def _world(self, x=0.0, y=0.0, rotation=0.0):
+        return {
+            "position": (x, y),
+            "scale": 1.0,
+            "rotation": rotation,
+            "alpha": 1.0,
+            "layer": 0.0,
+        }
+
+    def _game(self):
+        game = render.Game.__new__(render.Game)
+        game._net_pressed_keys = set()
+        game._net_buttons = 0
+        game._net_mouse_world = (0.0, 0.0)
+        game._net_pending_clicks = []
+        game._net_owner_render_id = 7
+        game._world_data_by_render_id = {}
+        game._net_authoritative_ids = set()
+        game._net_pending_render_state = {}
+        game._net_sprite_paths = {}
+        game._net_applied_tick = 0
+        game._net_last_sample_tick = 0
+        game._sprites_by_render_id = {}
+        game._position_history_by_render_id = {}
+        game._moving_render_ids = set()
+        game._render_order_dirty = False
+        game._dirty_hits = set()
+        game._hit_mark_dirty = game._dirty_hits.add
+        game._record_position = (
+            lambda render_id, position, tick: (
+                game._position_history_by_render_id
+                .setdefault(render_id, [])
+                .append((tick, position))
+            )
+        )
+        game._texture_for_path = lambda path: ("texture", path)
+        game._current_tick = lambda: 110
+        game._removed = []
+        game._remove_sprite = lambda data: game._removed.append(
+            data["render_id"]
+        )
+        game.print = lambda *args, **kwargs: None
+        return game
+
+    def test_send_input_carries_owner_claim(self):
+        from net.keys import unpack_keys
+        from net.protocol import state_crc
+
+        game = self._game()
+        client = self._NetClient()
+        game._net_pressed_keys = {"D"}
+        game._net_mouse_world = (5.0, 6.0)
+        game._net_buttons = 1
+        game._net_pending_clicks = [(3, 1)]
+        game._world_data_by_render_id[7] = self._world(1.5, 2.5, 33.0)
+
+        game._send_net_input(client)
+
+        self.assertEqual(len(client.frames), 1)
+        frame = client.frames[0]
+        self.assertIn("D", unpack_keys(frame.keys, frame.extra_keys))
+        self.assertEqual(frame.mouse_x, 5.0)
+        self.assertEqual(frame.buttons, 1)
+        self.assertEqual(frame.clicks, ((3, 1),))
+        self.assertEqual(frame.claims[0][:4], (7, 1.5, 2.5, 33.0))
+        self.assertEqual(
+            frame.claims[0][4], state_crc(1.5, 2.5, 33.0)
+        )
+        self.assertEqual(game._net_pending_clicks, [])
+
+    def test_observer_sends_input_without_claim(self):
+        game = self._game()
+        game._net_owner_render_id = 0
+        client = self._NetClient()
+
+        game._send_net_input(client)
+
+        self.assertEqual(client.frames[0].claims, ())
+
+    def test_snapshot_drives_remote_but_not_owner(self):
+        from net.state import ObjectState, SnapshotState
+
+        game = self._game()
+        state = SnapshotState()
+        state.put(7, ObjectState("owner.png", 0, 100.0, 100.0))
+        state.put(8, ObjectState("player.png", 1, 12.0, 4.0))
+        state.put(9, ObjectState("enemy.png", 2, 50.0, 60.0))
+        client = self._NetClient(
+            snapshot=types.SimpleNamespace(tick=100), state=state
+        )
+        game.net_client = client
+        owner_sprite = self._Sprite()
+        remote_sprite = self._Sprite()
+        game._sprites_by_render_id = {7: owner_sprite, 8: remote_sprite}
+        game._world_data_by_render_id = {
+            7: self._world(0.0, 0.0),
+            8: self._world(0.0, 0.0),
+        }
+        game._net_sprite_paths = {8: "player.png"}
+
+        game._apply_net_snapshots()
+
+        self.assertNotIn(7, game._net_authoritative_ids)
+        self.assertIn(8, game._net_authoritative_ids)
+        self.assertEqual(remote_sprite.position, (12.0, 4.0))
+        self.assertEqual(
+            game._world_data_by_render_id[7]["position"], (0.0, 0.0)
+        )
+        # Спрайта 9 ещё нет — состояние ждёт команды add.
+        self.assertIn(9, game._net_pending_render_state)
+        self.assertEqual(game._net_applied_tick, 100)
+
+    def test_correction_becomes_decaying_visual_offset(self):
+        from net.protocol import Correction
+        from net.reconcile import CorrectionBuffer
+
+        game = self._game()
+        game._net_corrections = CorrectionBuffer(decay=60.0)
+        game._world_data_by_render_id[7] = self._world(1.0, 1.0, 10.0)
+        game.net_client = self._NetClient(corrections=[
+            Correction(render_id=7, x=1.5, y=0.5, rotation=12.0),
+            Correction(render_id=99, x=5.0, y=5.0),
+        ])
+
+        game._apply_net_corrections()
+
+        dx, dy, drot = game._net_corrections.sample(7)
+        self.assertAlmostEqual(dx, 0.5, delta=1e-3)
+        self.assertAlmostEqual(dy, -0.5, delta=1e-3)
+        self.assertAlmostEqual(drot, 2.0, delta=1e-3)
+        self.assertEqual(game._net_corrections.sample(99), (0.0, 0.0, 0.0))
 
 
 if __name__ == "__main__":

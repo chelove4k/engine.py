@@ -342,6 +342,12 @@ class ObjectCache:
         return self.segments_count
 
     @property
+    def buffer(self):
+        """Вернуть memoryview сегмента для предвычисленных представлений полей."""
+
+        return self.__memory.buf
+
+    @property
     def dirty_counts(self):
         return self._dirty_counts
 
@@ -409,6 +415,20 @@ class ObjectCache:
             return self._fields[object_name]
         except KeyError as error:
             raise TypeError(f"Запрошен незаданый обьект: {object_name!r}") from error
+
+    def field_view(self, object_name, segment_id=0):
+        """Создать представление одного поля с заранее посчитанной раскладкой.
+
+        ``FieldView`` кэширует смещение и struct, поэтому горячий цикл скрипта
+        не повторяет поиск по словарю полей на каждое обращение к ``Visual``.
+        """
+
+        return FieldView(self, object_name, segment_id)
+
+    def position_view(self, segment_id=0):
+        """Создать представление блока ``x``/``y``/``tick`` одного сегмента."""
+
+        return PositionView(self, segment_id)
 
     def get(self, segment_id: int, object_name: str):
         try:
@@ -952,25 +972,97 @@ class ObjectCache:
 class FieldView:
     """Предоставить доступ к одному полю ObjectCache через небольшой API ValueCache.
 
-    Часы движка, tick и счётчики теперь живут вместе в одном сегменте.
-    Компоненты, которые раньше ожидали отдельный ValueCache, могут продолжать
-    вызывать ``get()``/``set()``; горячий цикл скрипта по-прежнему читает их
-    все одним вызовом ``ObjectCache.get_many()``.
+    Раскладка поля считается один раз при создании представления. Горячий
+    цикл скрипта читает числовые поля без блокировки: запись 4-байтового
+    значения атомарна, поэтому читатель увидит либо старое, либо новое
+    значение. Запись по-прежнему идёт под stripe-блокировкой, чтобы не
+    потерять dirty-бит и не порвать строковое поле.
     """
 
-    __slots__ = ("_cache", "_segment_id", "_field")
+    __slots__ = (
+        "_cache", "_segment_id", "_field", "_struct", "_offset", "_end",
+        "_lock_index", "_bit", "_direct",
+    )
 
     def __init__(self, cache, field, segment_id=0):
-        cache._field(field)
         self._cache = cache
         self._segment_id = segment_id
         self._field = field
+        # Тестовые и встроенные подмены кэша могут не иметь раскладки
+        # shared memory. Для них сохраняем старый путь через get()/set().
+        self._direct = not hasattr(cache, "segments_count")
+        if self._direct:
+            cache._field(field)
+            self._struct = None
+            self._offset = 0
+            self._end = 0
+            self._lock_index = 0
+            self._bit = 0
+            return
+        if segment_id < 0 or segment_id >= cache.segments_count:
+            raise IndexError("Индекс сегмента выходит за границы")
+        bounds, struct_type = cache._field(field)
+        self._struct = struct_type
+        base = cache._mask_bytes + segment_id * cache._field_len
+        self._offset = base + bounds[0]
+        self._end = base + bounds[1]
+        self._lock_index = segment_id % len(cache.locks)
+        self._bit = cache.field_bit_mapping[field]
 
     def get(self):
-        return self._cache.get(self._segment_id, self._field)
+        """Прочитать поле под блокировкой сегмента."""
+
+        if self._direct:
+            return self._cache.get(self._segment_id, self._field)
+        cache = self._cache
+        with cache.locks[self._lock_index]:
+            raw_value = self._struct.unpack_from(
+                cache.buffer, self._offset
+            )[0]
+        if isinstance(raw_value, bytes):
+            return raw_value.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        return raw_value
+
+    def get_lockless(self):
+        """Прочитать числовое поле без блокировки сегмента."""
+
+        if self._direct:
+            return self._cache.get(self._segment_id, self._field)
+        raw_value = self._struct.unpack_from(
+            self._cache.buffer, self._offset
+        )[0]
+        if isinstance(raw_value, bytes):
+            return raw_value.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        return raw_value
 
     def set(self, value):
-        self._cache.set(self._segment_id, self._field, value)
+        """Записать поле и пометить сегмент dirty одной блокировкой."""
+
+        if self._direct:
+            self._cache.set(self._segment_id, self._field, value)
+            return
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+            if len(value) > MAX_CACHE_STRING_BYTES:
+                raise ValueError(
+                    f"Строковое значение превышает {MAX_CACHE_STRING_BYTES} байт"
+                )
+        packed_data = self._struct.pack(value)
+
+        cache = self._cache
+        with cache.locks[self._lock_index]:
+            buf = cache.buffer
+            if buf[self._offset:self._end] == packed_data:
+                return
+            buf[self._offset:self._end] = packed_data
+
+            current_mask = cache._masks[self._segment_id]
+            if current_mask == 0:
+                cache._mark_dirty_locked(self._lock_index)
+                cache._enqueue_dirty_locked(
+                    self._lock_index, self._segment_id
+                )
+            cache._masks[self._segment_id] = current_mask | self._bit
 
     @property
     def name(self):
@@ -979,3 +1071,65 @@ class FieldView:
     def detach(self):
         # Представление не владеет shared memory; его закрывает владелец.
         pass
+
+
+class PositionView:
+    """Представление блока ``x``/``y``/``tick`` с готовыми смещениями."""
+
+    __slots__ = (
+        "_cache", "_segment_id", "_struct", "_offset", "_end",
+        "_lock_index", "_mask",
+    )
+
+    def __init__(self, cache, segment_id=0):
+        if segment_id < 0 or segment_id >= cache.segments_count:
+            raise IndexError("Индекс сегмента выходит за границы")
+        self._cache = cache
+        self._segment_id = segment_id
+        self._struct = cache._position_struct
+        base = cache._mask_bytes + segment_id * cache._field_len
+        self._offset = base + cache._position_offset
+        self._end = self._offset + cache._position_length
+        self._lock_index = segment_id % len(cache.locks)
+        self._mask = cache._position_mask
+
+    def get(self):
+        """Прочитать ``(x, y, tick)`` под блокировкой сегмента."""
+
+        if self._struct is None:
+            return self._cache.get_position(self._segment_id)
+        with self._cache.locks[self._lock_index]:
+            return self._struct.unpack_from(
+                self._cache.buffer, self._offset
+            )
+
+    def get_lockless(self):
+        """Прочитать ``(x, y, tick)`` без блокировки сегмента."""
+
+        if self._struct is None:
+            return self._cache.get_position(self._segment_id)
+        return self._struct.unpack_from(self._cache.buffer, self._offset)
+
+    def set(self, x, y, tick):
+        """Записать ``(x, y, tick)`` одной блокировкой сегмента."""
+
+        cache = self._cache
+        if self._struct is None or tick is None:
+            cache.set_position(self._segment_id, x, y, tick)
+            return
+
+        packed_data = self._struct.pack(float(x), float(y), int(tick))
+        with cache.locks[self._lock_index]:
+            buf = cache.buffer
+            if buf[self._offset:self._end] == packed_data:
+                return
+            buf[self._offset:self._end] = packed_data
+
+            current_mask = cache._masks[self._segment_id]
+            if current_mask == 0:
+                cache._mark_dirty_locked(self._lock_index)
+                cache._enqueue_dirty_locked(
+                    self._lock_index, self._segment_id
+                )
+            cache._masks[self._segment_id] = current_mask | self._mask
+

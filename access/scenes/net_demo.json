@@ -1,0 +1,87 @@
+[
+  {
+    "object_type": "camera",
+    "id": {
+      "name": "cam",
+      "class": "CameraTarget",
+      "type": "camera"
+    },
+    "visual": {
+      "sprite": "None",
+      "layer": 1,
+      "position": [0, 0],
+      "scale": 1,
+      "rotation": 0,
+      "alpha": 1
+    }
+  },
+  {
+    "object_type": "dynamic_object",
+    "id": {
+      "name": "player1",
+      "class": "net_player",
+      "type": "dynamic_object"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "layer": 1,
+      "position": [-80, 0],
+      "scale": 0.2,
+      "rotation": 0,
+      "alpha": 1
+    },
+    "transform": {
+      "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
+    },
+    "scripting": {
+      "scripts": ["access/scripts/net_player.py"],
+      "network": ["owner"]
+    }
+  },
+  {
+    "object_type": "dynamic_object",
+    "id": {
+      "name": "player2",
+      "class": "net_player",
+      "type": "dynamic_object"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "layer": 1,
+      "position": [80, 0],
+      "scale": 0.2,
+      "rotation": 0,
+      "alpha": 1
+    },
+    "transform": {
+      "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
+    },
+    "scripting": {
+      "scripts": ["access/scripts/net_player.py"],
+      "network": ["owner"]
+    }
+  },
+  {
+    "object_type": "dynamic_object",
+    "id": {
+      "name": "arena_wall",
+      "class": "ArenaWall",
+      "type": "dynamic_object"
+    },
+    "visual": {
+      "sprite": "access/resources/img.png",
+      "layer": 3,
+      "position": [0, 160],
+      "scale": 0.4,
+      "rotation": 0,
+      "alpha": 0.6
+    },
+    "transform": {
+      "polygon": [[-90, -20], [90, -20], [90, 20], [-90, 20]]
+    },
+    "scripting": {
+      "scripts": [],
+      "network": ["replicate"]
+    }
+  }
+]
