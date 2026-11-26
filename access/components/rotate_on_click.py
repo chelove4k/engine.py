@@ -28,7 +28,11 @@ class rotate_on_click(Component):
     },
     "scripting": {
       "scripts": ["access\\scripts\\test.py"],
-      "network": []
+      # Активация идёт на сервере, а созданные объекты реплицируются всем.
+      "network": {
+        "authority": "server",
+        "replication": "all"
+      }
     }
   }
         )

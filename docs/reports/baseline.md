@@ -1,5 +1,8 @@
 # Baseline перед рефакторингом
 
+> **Архив.** Замеры «до» рефакторинга. JSON-артефакты лежат рядом, в
+> `docs/reports/`.
+
 Дата: 2026-11-18
 
 ## Окружение
@@ -23,7 +26,7 @@ python -m unittest discover -s tests -p "test_engine.py" -q
 ```powershell
 python tests/stress_test.py --scenario cache,collision `
   --cache-ops 100000 --pairs 100000 --duration 2 `
-  --json docs/baseline.json
+  --json docs/reports/baseline.json
 ```
 
 | Сценарий | Метрика | Значение |
@@ -42,7 +45,7 @@ python tests/stress_test.py --scenario cache,collision `
 
 ```powershell
 python tests/stress_test.py --scenario registration,batch `
-  --objects 500 --timeout 60 --json docs/baseline_live.json
+  --objects 500 --timeout 60 --json docs/reports/baseline_live.json
 ```
 
 | Сценарий | Метрика | Значение |

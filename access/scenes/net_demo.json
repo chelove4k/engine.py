@@ -35,7 +35,12 @@
     },
     "scripting": {
       "scripts": ["access/scripts/net_player.py"],
-      "network": ["owner"]
+      "network": {
+        "authority": "server",
+        "replication": "all",
+        "prediction": "owner",
+        "input": "owner"
+      }
     }
   },
   {
@@ -58,7 +63,12 @@
     },
     "scripting": {
       "scripts": ["access/scripts/net_player.py"],
-      "network": ["owner"]
+      "network": {
+        "authority": "server",
+        "replication": "all",
+        "prediction": "owner",
+        "input": "owner"
+      }
     }
   },
   {
@@ -81,7 +91,10 @@
     },
     "scripting": {
       "scripts": [],
-      "network": ["replicate"]
+      "network": {
+        "authority": "server",
+        "replication": "all"
+      }
     }
   }
 ]

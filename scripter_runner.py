@@ -214,6 +214,9 @@ class scripter_runner:
             if engine_state is not None else None
         )
         self.__step_scripts(state)
+        self.__request_trigger_evaluation(
+            state.get("tick") if isinstance(state, dict) else None
+        )
 
     def __step_scripts(self, state):
         for token, entry in list(self._scripts.items()):
@@ -250,8 +253,79 @@ class scripter_runner:
             0, ENGINE_STATE_LOOP_FIELDS
         )
         self.__step_scripts(state)
+        # Клик доставляем после step(): к этому моменту скрипты уже
+        # активированы (start выполнен), а объект, созданный обработчиком,
+        # успевает зарегистрироваться до подтверждения тика.
+        self.__dispatch_network_clicks()
+        self.__request_trigger_evaluation(tick)
         if self.net_executed_tick is not None:
             self.net_executed_tick.value = tick
+
+    def __dispatch_network_clicks(self):
+        """Раздаёт клики всем объектам, а не только владельцу ввода.
+
+        Компонент может быть прикреплён к реплицируемому объекту без
+        ``owner``; такой объект не получает канал ввода игрока, но клик по
+        нему обязан сработать на сервере один раз для любого клиента.
+        """
+
+        if self.net is None:
+            return
+        clicks = self.net.take_clicks()
+        if not clicks:
+            return
+        for instance, _complexity, _path in list(self._scripts.values()):
+            dispatch = getattr(instance, "dispatch_network_click", None)
+            if dispatch is None:
+                continue
+            for _client_id, snapshot, render_id, button in clicks:
+                dispatch(snapshot, render_id, button)
+
+    def __request_trigger_evaluation(self, tick):
+        """Просит Stream пересчитать триггеры после тика.
+
+        События вернутся командой ``trigger_events`` и будут разосланы только
+        скриптам объекта, который пересёк зону.
+        """
+
+        stream = getattr(self, "main_in_stream", None)
+        if stream is None:
+            return
+        try:
+            stream.put({
+                "command": "trigger_tick",
+                "tick": None if tick is None else int(tick),
+            })
+        except (EOFError, BrokenPipeError, OSError, ValueError):
+            pass
+
+    def __dispatch_trigger_events(self, events):
+        if not events:
+            return
+        scripts = list(getattr(self, "_scripts", {}).values())
+        if not scripts:
+            return
+        for data in events:
+            if not isinstance(data, dict):
+                continue
+            target = data.get("object") or {}
+            try:
+                render_id = int(target.get("render_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not render_id:
+                continue
+            for instance, _complexity, _path in scripts:
+                game_object = getattr(instance, "GameObject", None)
+                if getattr(game_object, "_render_id", 0) != render_id:
+                    continue
+                dispatch = getattr(instance, "dispatch_trigger_event", None)
+                if dispatch is None:
+                    continue
+                try:
+                    dispatch(data)
+                except Exception:
+                    traceback.print_exc()
 
     def __drain_commands(self):
         while True:
@@ -280,6 +354,8 @@ class scripter_runner:
             )
         elif command == "net_leave":
             self.__leave_net(int(data.get("client_id", 0)))
+        elif command == "trigger_events":
+            self.__dispatch_trigger_events(data.get("events") or ())
         elif command == "net_input":
             if self.net is not None:
                 self.net.push(

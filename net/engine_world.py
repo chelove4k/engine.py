@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import queue
 import time
 
+from .directives import parse_network_directives
 from .protocol import encode_input_message
 from .state import ObjectState, SnapshotState
 
@@ -37,6 +39,7 @@ class EngineWorld:
         owner_slots=(),
         replicated_ids=(),
         executed_tick=None,
+        network_events=None,
         tick_timeout: float = 0.25,
     ):
         self.worker_queue = worker_queue
@@ -45,6 +48,10 @@ class EngineWorld:
         self.owner_slots = [int(item) for item in owner_slots]
         self.replicated_ids = {int(item) for item in replicated_ids}
         self.executed_tick = executed_tick
+        # Процесс Stream сообщает о каждом новом объекте с ``scripting.network``.
+        # Так динамически созданные сервером объекты попадают в снапшоты без
+        # периодического опроса всего реестра.
+        self.network_events = network_events
         self.tick_timeout = max(0.01, float(tick_timeout))
         self.owner_by_client: dict[int, int] = {}
         self.client_by_owner: dict[int, int] = {}
@@ -151,6 +158,51 @@ class EngineWorld:
             float(values["scale"]),
             float(values["alpha"]),
         )
+
+    def poll_network_events(self) -> int:
+        """Подхватывает сетевые объекты, созданные скриптами во время игры.
+
+        Возвращает число новых реплицируемых ``render_id``.  События приходят
+        из процесса Stream, поэтому серверу не нужно опрашивать весь реестр
+        объектов каждый тик.
+        """
+
+        if self.network_events is None:
+            return 0
+        updated = 0
+        while True:
+            try:
+                event = self.network_events.get_nowait()
+            except queue.Empty:
+                break
+            except (EOFError, OSError, ValueError):
+                break
+            if not isinstance(event, dict):
+                continue
+            try:
+                render_id = int(event.get("render_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not render_id:
+                continue
+            if event.get("removed"):
+                # Объект уничтожен на сервере: исключаем слот из снапшотов,
+                # иначе клиенты видели бы его вечно, а новый объект в том же
+                # слоте мог бы не иметь сетевой роли.
+                if render_id in self.replicated_ids:
+                    self.replicated_ids.discard(render_id)
+                    updated += 1
+                continue
+            if not event.get("has_visual", True):
+                continue
+            try:
+                role = parse_network_directives(event.get("network"))
+            except (TypeError, ValueError):
+                continue
+            if role.replicated and render_id not in self.replicated_ids:
+                self.replicated_ids.add(render_id)
+                updated += 1
+        return updated
 
     def set_replicated(self, render_ids) -> None:
         self.replicated_ids = {int(item) for item in render_ids}

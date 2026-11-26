@@ -23,8 +23,7 @@
       "type": "manager"
     },
     "scripting": {
-      "scripts": ["access\\scripts\\camera.py"],
-      "network": []
+      "scripts": ["access\\scripts\\camera.py"]
     },
     "stress_scene": {
       "count": 1000,

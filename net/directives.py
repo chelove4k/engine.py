@@ -1,120 +1,148 @@
-"""Разбор директив ``scripting.network``.
+"""Разбор ``scripting.network``.
 
-Директивы — часть данных сцены, а не сети: сервер и клиент разбирают их
-одинаково, поэтому роли объектов совпадают без дополнительного протокола.
+Поле описывает объект целиком, а не отдельный скрипт.  Вместо списка флагов
+используются четыре независимые оси с явными значениями по умолчанию::
 
-Пустой список (или отсутствие поля) сохраняет поведение одиночной игры.
+    {
+      "authority": "server",     # local | server
+      "replication": "all",      # none | all
+      "prediction": "none",      # none | owner
+      "input": "none"            # none | owner
+    }
+
+Отсутствие поля или пустой объект означают локальный объект одиночной игры.
+Сервер и клиент разбирают одну и ту же сцену, поэтому их роли совпадают без
+отдельного протокола.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-KNOWN_DIRECTIVES = (
-    "replicate",
-    "owner",
-    "input",
-    "server",
-    "predict",
-)
 
-SERVER_ALIASES = {
-    "server": "server",
-    "server_only": "server",
-    "serveronly": "server",
+AXIS_VALUES = {
+    "authority": ("local", "server"),
+    "replication": ("none", "all"),
+    "prediction": ("none", "owner"),
+    "input": ("none", "owner"),
+}
+DEFAULT_NETWORK = {
+    "authority": "local",
+    "replication": "none",
+    "prediction": "none",
+    "input": "none",
 }
 
 
 @dataclass(slots=True)
 class NetworkRole:
-    replicate: bool = False
-    owner: bool = False
-    input: bool = False
-    server_only: bool = False
-    predict: bool = False
-    rooms: tuple[str, ...] = ()
-    unknown: tuple[str, ...] = ()
+    authority: str = "local"
+    replication: str = "none"
+    prediction: str = "none"
+    input: str = "none"
 
     @property
     def networked(self) -> bool:
-        return (
-            self.replicate
-            or self.owner
-            or self.input
-            or self.server_only
-            or self.predict
-            or bool(self.rooms)
-        )
+        """Объект существует в серверной симуляции."""
+
+        return self.authority == "server"
 
     @property
     def replicated(self) -> bool:
-        """Объект попадает в снапшоты клиентам."""
+        """Состояние объекта попадает в снапшоты клиентам."""
 
-        return not self.server_only and (
-            self.replicate or self.owner or self.predict
-        )
+        return self.replication == "all"
+
+    @property
+    def owner(self) -> bool:
+        """Объекту нужен слот игрока (предсказание или ввод)."""
+
+        return self.prediction == "owner" or self.input == "owner"
+
+    @property
+    def predict(self) -> bool:
+        """Клиент-владелец предсказывает объект локально."""
+
+        return self.prediction == "owner"
 
     @property
     def takes_input(self) -> bool:
         """Объект читает ввод назначенного игрока."""
 
-        return self.owner or self.input
+        return self.input == "owner"
 
-    def visible_to(self, room: str | None) -> bool:
-        if not self.replicated:
-            return False
-        if not self.rooms:
-            return True
-        return room is not None and room in self.rooms
+    @property
+    def server_only(self) -> bool:
+        return self.authority == "server" and self.replication == "none"
+
+    @property
+    def replicate(self) -> bool:
+        return self.replication == "all"
 
 
 EMPTY_ROLE = NetworkRole()
 
 
 def parse_network_directives(values) -> NetworkRole:
-    """Превращает список строк сцены в структурированные роли."""
+    """Проверяет объект ``scripting.network`` и возвращает роль.
 
-    if not values:
+    ``None`` и ``{}`` дают роль по умолчанию.  Список старого формата намеренно
+    не поддерживается: молчаливое преобразование скрывало бы противоречивые
+    комбинации вроде ``["server", "replicate"]``.
+    """
+
+    if values is None:
         return NetworkRole()
-    if isinstance(values, str):
-        values = (values,)
-    if not isinstance(values, (list, tuple, set, frozenset)):
-        raise TypeError("scripting.network должен быть списком строк")
+    if not isinstance(values, dict):
+        raise TypeError("scripting.network должен быть объектом")
 
-    role = NetworkRole()
-    rooms: list[str] = []
-    unknown: list[str] = []
+    unknown = set(values) - set(AXIS_VALUES)
+    if unknown:
+        raise ValueError(
+            "scripting.network: неизвестные оси: "
+            + ", ".join(sorted(unknown))
+        )
 
-    for raw in values:
+    normalized = {}
+    for axis, allowed in AXIS_VALUES.items():
+        raw = values.get(axis, DEFAULT_NETWORK[axis])
         if not isinstance(raw, str):
-            raise TypeError("Элементы scripting.network должны быть строками")
-        name = raw.strip().lower()
-        if not name:
-            continue
-        if name.startswith("room:"):
-            room = name[5:].strip()
-            if room and room not in rooms:
-                rooms.append(room)
-            continue
-        normalized = SERVER_ALIASES.get(name, name)
-        if normalized == "replicate":
-            role.replicate = True
-        elif normalized == "owner":
-            role.owner = True
-            role.replicate = True
-            role.input = True
-        elif normalized == "input":
-            role.input = True
-        elif normalized == "server":
-            role.server_only = True
-        elif normalized == "predict":
-            role.predict = True
-            role.replicate = True
-        else:
-            unknown.append(raw)
+            raise TypeError(f"scripting.network.{axis} должен быть строкой")
+        value = raw.strip().lower()
+        if value not in allowed:
+            raise ValueError(
+                f"scripting.network.{axis}: допустимые значения "
+                f"{', '.join(allowed)}, получено {raw!r}"
+            )
+        normalized[axis] = value
 
-    role.rooms = tuple(rooms)
-    role.unknown = tuple(unknown)
+    role = NetworkRole(**normalized)
+    if role.authority == "local":
+        if role.replication != "none":
+            raise ValueError(
+                "scripting.network.replication=all требует authority=server"
+            )
+        if role.prediction != "none":
+            raise ValueError(
+                "scripting.network.prediction=owner требует authority=server"
+            )
+        if role.input != "none":
+            raise ValueError(
+                "scripting.network.input=owner требует authority=server"
+            )
+    if role.prediction == "owner":
+        if role.authority != "server":
+            raise ValueError(
+                "scripting.network.prediction=owner требует authority=server"
+            )
+        if role.replication != "all":
+            raise ValueError(
+                "scripting.network.prediction=owner требует replication=all"
+            )
+    if role.input == "owner" and role.authority != "server":
+        raise ValueError(
+            "scripting.network.input=owner требует authority=server"
+        )
     return role
 
 
@@ -124,4 +152,7 @@ def role_from_object(data: dict) -> NetworkRole:
     scripting = data.get("scripting") if isinstance(data, dict) else None
     if not isinstance(scripting, dict):
         return NetworkRole()
-    return parse_network_directives(scripting.get("network") or ())
+    network = scripting.get("network")
+    if network is None:
+        return NetworkRole()
+    return parse_network_directives(network)

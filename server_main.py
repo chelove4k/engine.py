@@ -166,6 +166,9 @@ class Runtime:
         # Тик, который процесс скриптов реально выполнил. Сервер ждёт его,
         # прежде чем проверять заявки и снимать снапшот.
         self.executed_tick = multiprocessing.Value("q", 0)
+        # Динамически созданные сетевые объекты: Stream кладёт сюда событие
+        # при регистрации, GameServer добавляет render_id в снапшоты.
+        self.net_object_events = multiprocessing.Queue()
 
         scene = scene_file or os.environ.get("PYENGINE_SCENE") or "scene1.json"
         self.scene_file = scene
@@ -198,6 +201,12 @@ class Runtime:
                 self.console_out,
                 self.executed_tick,
             ),
+            kwargs={
+                "net_object_events": self.net_object_events,
+                # Headless-сервер не исполняет клиентские (локальные) скрипты:
+                # только объекты с ``scripting.network``.
+                "net_role": "server",
+            },
             daemon=False,
         )
         self.world_visual = VisualCache(*self.visual_data)
@@ -379,7 +388,10 @@ class ServerConsole:
         data = {
             "object_type": "manager",
             "id": {"name": name, "class": name, "type": "manager"},
-            "scripting": {"scripts": [path], "network": ["server"]},
+            "scripting": {
+                "scripts": [path],
+                "network": {"authority": "server"},
+            },
         }
         if json_text.strip():
             extra = json.loads(json_text)
@@ -484,7 +496,7 @@ def main(argv=None) -> int:
         owners = []
         replicated = []
         for item in objects:
-            role = parse_network_directives(item.get("network") or ())
+            role = parse_network_directives(item.get("network"))
             if not item.get("has_visual", False):
                 continue
             if role.owner:
@@ -499,6 +511,7 @@ def main(argv=None) -> int:
             owner_slots=owners,
             replicated_ids=replicated,
             executed_tick=executed_tick,
+            network_events=runtime.net_object_events,
         )
         runtime.worker_queues[0].put({
             "proc_id": 0,

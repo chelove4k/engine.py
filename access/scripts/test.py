@@ -1,30 +1,33 @@
 import time
-import math
 from pyengine import *
 import random
+from math import cos, sin
 
 class test(script):
 
 
-    def start(self):
-        position = self.GameObject.Visual.position
-        position.y = random.randint(0, 400)
-        self.GameObject.Visual.position = position
-        self.k = 1
-        self.tilt_trigger = self.find_object("n", "tilt_trigger")
-        self.is_touching_trigger = False
+    
 
+    def start(self):
+        visual = self.GameObject.Visual
+        if visual is None:
+            return
+        position = visual.position
+        self._center_x = position.x
+        self._center_y = position.y
+        self.radius = 50
+        self.speed = 3
+        self.phase = 0.0
 
     def fixed_update(self):
-        if self.GameObject.Visual.position.x > 300 or self.GameObject.Visual.position.x < -100:
-            self.k *= -1
+        visual = self.GameObject.Visual
+        if visual is None:
+            return
 
-        self.GameObject.Visual.alpha = abs(
-            math.sin(self.k)
-        )
-
-        self.GameObject.Visual.position = (
-            self.GameObject.Visual.position
-            + Vector2(2, 0) * self.k
+        angle = float(self.phase) + float(self.GlobalTime) * float(self.speed)
+        radius = float(self.radius)
+        visual.position = (
+            self._center_x + cos(angle) * radius,
+            self._center_y + sin(angle) * radius,
         )
 

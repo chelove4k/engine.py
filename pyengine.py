@@ -159,6 +159,36 @@ class KeyboardEvent:
         self.modifiers = data.get("modifiers", 0)
 
 
+class TriggerEvent:
+    """Событие входа/выхода для триггер-зоны.
+
+    ``trigger_*`` описывают саму зону, ``object_*`` — объект, который её
+    пересёк.  Поля продублированы верхним уровнем, чтобы типичный обработчик
+    не разбирал вложенные словари.
+    """
+
+    def __init__(self, data):
+        self.type = data.get("type", "enter")
+        self.tick = int(data.get("tick", 0) or 0)
+        self.data = dict(data)
+
+        trigger = data.get("trigger") or {}
+        self.trigger_render_id = int(trigger.get("render_id", 0) or 0)
+        self.trigger_id = trigger.get("id", "")
+        self.trigger_name = trigger.get("name", "")
+        self.trigger_class = trigger.get("class", "")
+        self.trigger_type = trigger.get("type", "")
+
+        target = data.get("object") or {}
+        self.object_render_id = int(target.get("render_id", 0) or 0)
+        self.object_id = target.get("id", "")
+        self.object_name = target.get("name", "")
+        self.object_class = target.get("class", "")
+        self.object_type = target.get("type", "")
+        position = target.get("position") or (0.0, 0.0)
+        self.object_position = Vector2(position[0], position[1])
+
+
 class Keyboard:
     EVENTS_KEY = ("__engine_keyboard__", "events")
 
@@ -886,6 +916,18 @@ class GameObject:
 
 
 
+    class __Trigger:
+        """Локальное описание триггер-зоны для скриптов и отладки."""
+
+        def __init__(self, trigger):
+            self.polygon = [list(point) for point in trigger["polygon"]]
+            position = trigger.get("position", [0, 0])
+            self.position = Vector2(position[0], position[1])
+            self.rotation = float(trigger.get("rotation", 0))
+            self.scale = float(trigger.get("scale", 1))
+            self.activates = copy.deepcopy(trigger.get("activates", {}))
+
+
     class __Scripting:
         def __init__(self,
                      id,
@@ -932,6 +974,7 @@ class GameObject:
         self.Transform = None
         self.Identity = None
         self.Scripting = None
+        self.Trigger = None
 
         self._is_render = False
         self.components = []
@@ -979,9 +1022,14 @@ class GameObject:
             self.Scripting = self.__Scripting(
                 id=self._id,
                 scripts=list(scripting.get("scripts", [])),
-                network=list(scripting.get("network", [])),
+                network=copy.deepcopy(scripting.get("network", {})),
             )
             self.components.append("scripting")
+
+        trigger = source.get("trigger")
+        if trigger is not None:
+            self.Trigger = self.__Trigger(trigger)
+            self.components.append("trigger")
 
         self.__dict__["_initialized"] = True
 
@@ -1375,6 +1423,23 @@ class script:
     def on_key_release(self, event):
         pass
 
+    def on_trigger_enter(self, event):
+        """Объект вошёл в триггер-зону, подходящую под её фильтр."""
+
+    def on_trigger_exit(self, event):
+        """Объект вышел из триггер-зоны или покинул сцену."""
+
+    def dispatch_trigger_event(self, data):
+        """Доставляет серверное событие триггера нужному колбэку."""
+
+        if not self.__dict__.get("_script__wants_trigger_events", True):
+            return
+        event = data if isinstance(data, TriggerEvent) else TriggerEvent(data)
+        if event.type == "enter":
+            self.on_trigger_enter(event)
+        elif event.type == "exit":
+            self.on_trigger_exit(event)
+
     def is_pressed(self, button: str) -> bool:
         normalized = str(button).upper().replace("_", "")
         source = self.__dict__.get("_script__input_source")
@@ -1470,14 +1535,30 @@ class script:
                     self.on_mouse_release(
                         self.__network_button_event(snapshot, bit)
                     )
-        if snapshot.clicks:
-            own_render_id = self.GameObject._render_id
-            for render_id, button in snapshot.clicks:
-                if render_id not in (0, own_render_id):
-                    continue
-                self.on_mouse_click(
-                    self.__network_button_event(snapshot, int(button))
-                )
+
+    def dispatch_network_click(self, snapshot, render_id, button):
+        """Доставляет серверный клик объекту, в который попал указатель.
+
+        Сетевой ввод привязан к владельцу, но клик — событие над конкретным
+        объектом.  Поэтому сервер раздаёт его всем скриптам с совпавшим
+        ``render_id``, а не только владельцу.  Клик по пустому месту
+        (``render_id == 0``) объект не активирует.
+        """
+
+        if self.__dict__.get("_script__stopped"):
+            return
+        if not self.__dict__.get("_script__wants_mouse_actions", False):
+            return
+        try:
+            own_render_id = int(self.GameObject._render_id)
+            render_id = int(render_id)
+        except (TypeError, ValueError, AttributeError):
+            return
+        if not render_id or render_id != own_render_id:
+            return
+        self.on_mouse_click(
+            self.__network_button_event(snapshot, int(button))
+        )
 
     def __handle_mouse_move(self, data):
         own_render_id = self.GameObject._render_id
@@ -1622,6 +1703,8 @@ class script:
                 source["components"] = components["components"]
             if "scripting" in component_names:
                 source["scripting"] = components["scripting"]
+            if "trigger" in component_names:
+                source["trigger"] = components["trigger"]
             for custom_name in custom_component_names(components):
                 source[custom_name] = copy.deepcopy(components[custom_name])
             if "visual" in component_names:
@@ -1778,6 +1861,9 @@ class script:
                 overrides(name) for name in (
                     "on_mouse_move", "on_mouse_enter", "on_mouse_exit",
                 )
+            )
+            self.__dict__["_script__wants_trigger_events"] = (
+                overrides("on_trigger_enter") or overrides("on_trigger_exit")
             )
 
         except Exception:

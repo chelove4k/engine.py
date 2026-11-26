@@ -51,7 +51,10 @@
     },
     "scripting": {
       "scripts": ["access\\scripts\\test.py"],
-      "network": []
+      "network": {
+        "authority": "server",
+        "replication": "all"
+      }
     }
   },
   {
@@ -72,6 +75,13 @@
     "transform": {
       "polygon": [[-45, -45], [45, -45], [45, 45], [-45, 45]]
     },
+    "scripting": {
+      "scripts": [],
+      "network": {
+        "authority": "server",
+        "replication": "all"
+      }
+    },
     "rotate_on_click": {
       "degrees": 90
     }
@@ -84,8 +94,7 @@
       "type": "manager"
     },
     "scripting": {
-      "scripts": ["access\\scripts\\camera.py"],
-      "network": []
+      "scripts": ["access\\scripts\\camera.py"]
     }
   }
 ]

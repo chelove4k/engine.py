@@ -29,6 +29,14 @@ from scene import (
 )
 import scripter_runner
 from memory_lib import FieldView, ObjectCache, ValueCache
+from collision import convex_polygons_overlap, polygon_bounds, transform_polygon
+from triggers import (
+    TriggerTarget,
+    filter_matches,
+    trigger_world_polygon,
+    validate_trigger,
+    convex_polygon_contains_point,
+)
 
 from radon.visitors import ComplexityVisitor
 
@@ -139,6 +147,9 @@ class Stream:
                     case "net_objects":
                         self.__net_objects(data)
 
+                    case "trigger_tick":
+                        self.__evaluate_triggers(data.get("tick"))
+
             except Exception:
                 traceback.print_exc()
                 self.print('Ошибка очереди')
@@ -189,6 +200,8 @@ class Stream:
             source["components"] = components["components"]
         if "scripting" in component_names:
             source["scripting"] = components["scripting"]
+        if "trigger" in component_names:
+            source["trigger"] = components["trigger"]
         for custom_name in custom_component_names(components):
             source[custom_name] = components[custom_name]
         if "visual" in component_names:
@@ -326,7 +339,7 @@ class Stream:
             self.__respond(data, {"error": str(error)})
 
     def __net_objects(self, data):
-        """Объекты с директивами ``scripting.network`` для сетевого режима.
+        """Объекты с ``scripting.network`` для сетевого режима.
 
         Серверному процессу нужны render_id реплицируемых объектов и слоты
         игроков; роли остаются частью сцены, а не отдельным протоколом.
@@ -342,13 +355,13 @@ class Stream:
                     scripting = dict_data.get("scripting")
                     if not isinstance(scripting, dict):
                         continue
-                    roles = scripting.get("network") or ()
-                    if not roles:
+                    network = scripting.get("network")
+                    if not isinstance(network, dict):
                         continue
                     components = dict_data.get("_components") or ()
                     objects.append({
                         "render_id": int(record["_render_id"]),
-                        "network": list(roles),
+                        "network": dict(network),
                         # В headless-режиме рендерера нет, поэтому ``_is_render``
                         # остаётся False. Наличие визуального компонента —
                         # единственный надёжный признак объекта мира.
@@ -638,13 +651,16 @@ class Stream:
         object["dict_data"]["_id"] = object_key
         object["dict_data"]["_components"] = [
             component
-            for component in ("id", "visual", "scripting", "transform", "components")
+            for component in (
+                "id", "visual", "scripting", "transform", "trigger", "components"
+            )
             if component in object["dict_data"]
         ] + custom_component_names(object["dict_data"])
         object_type = object["dict_data"].get("object_type")
         identity = object["dict_data"].pop("id", None)
         object["dict_data"]["_identity"] = identity or {}
         visual = object["dict_data"].pop("visual", None)
+        trigger = object["dict_data"].get("trigger")
 
         if identity is not None:
             for field_name in ("name", "type", "class"):
@@ -679,11 +695,284 @@ class Stream:
 
         self.objects_cache[object_key] = object
         self.__add_render_index(object_key, render_id)
+
+        if object_type == "trigger_object" and isinstance(trigger, dict):
+            self.__remember_trigger(
+                render_id,
+                object_key,
+                generation,
+                identity or {},
+                trigger,
+            )
+
+        scripting = object["dict_data"].get("scripting")
+        if visual is not None:
+            network = (
+                scripting.get("network")
+                if isinstance(scripting, dict) else None
+            )
+            if isinstance(network, dict):
+                self.__publish_net_object(render_id, network)
+
         return {
             "object_id": numeric_object_id,
             "render_id": render_id,
             "generation": generation,
         }
+
+    def __publish_net_object(self, render_id, network) -> None:
+        """Сообщает серверу о созданном объекте с параметрами сети."""
+
+        events = getattr(self, "net_object_events", None)
+        if events is None or not network:
+            return
+        try:
+            events.put({
+                "render_id": int(render_id),
+                "network": dict(network),
+                "has_visual": True,
+            })
+        except (EOFError, OSError, ValueError):
+            pass
+
+    def __publish_net_removal(self, render_id, object) -> None:
+        """Сообщает серверу, что реплицируемый объект удалён."""
+
+        events = getattr(self, "net_object_events", None)
+        if events is None or not isinstance(object, dict):
+            return
+        scripting = object.get("dict_data", {}).get("scripting")
+        network = (
+            scripting.get("network")
+            if isinstance(scripting, dict) else None
+        )
+        if not isinstance(network, dict):
+            return
+        try:
+            events.put({
+                "render_id": int(render_id),
+                "network": {},
+                "has_visual": False,
+                "removed": True,
+            })
+        except (EOFError, OSError, ValueError):
+            pass
+
+    def __remember_trigger(self, render_id, object_key, generation,
+                           identity, trigger) -> None:
+        """Сохраняет нормализованную триггер-зону в реестре Stream."""
+
+        normalized = validate_trigger(trigger)
+        world = trigger_world_polygon(normalized)
+        if not hasattr(self, "_triggers"):
+            self._triggers = {}
+            self._trigger_contacts = {}
+            self._last_trigger_tick = None
+        self._triggers[int(render_id)] = {
+            "render_id": int(render_id),
+            "object_key": object_key,
+            "generation": int(generation),
+            "name": identity.get("name") or object_key,
+            "class": identity.get("class") or "",
+            "type": identity.get("type") or "trigger_object",
+            "activates": normalized["activates"],
+            "world": world,
+            "bounds": polygon_bounds(world) if world else None,
+        }
+
+    def __trigger_targets(self):
+        """Снимок визуальных объектов, которые могут активировать триггер."""
+
+        with self.object_lock:
+            records = list(self.objects_cache.items())
+
+        targets = []
+        for object_key, record in records:
+            if not self.__is_object_record(object_key, record):
+                continue
+            dict_data = record.get("dict_data", {})
+            components = dict_data.get("_components") or ()
+            if "visual" not in components:
+                continue
+            if dict_data.get("object_type") == "trigger_object":
+                continue
+            render_id = int(record["_render_id"])
+            try:
+                visual = self.visual_cache.get_many(
+                    render_id,
+                    ("sprite", "x", "y", "rotation", "scale", "layer"),
+                )
+            except (KeyError, IndexError, ValueError):
+                continue
+            if not visual.get("sprite"):
+                continue
+            identity = {
+                "name": self.id_cache.get(render_id, "name") or "",
+                "class": self.id_cache.get(render_id, "class") or "",
+                "type": (
+                    self.id_cache.get(render_id, "type")
+                    or dict_data.get("object_type")
+                    or ""
+                ),
+                "layer": float(visual["layer"]),
+            }
+            transform = dict_data.get("transform")
+            local_polygon = (
+                transform.get("polygon")
+                if isinstance(transform, dict) else None
+            )
+            polygon = None
+            if local_polygon:
+                polygon = transform_polygon(
+                    local_polygon,
+                    (visual["x"], visual["y"]),
+                    visual["rotation"],
+                    visual["scale"],
+                )
+            targets.append(TriggerTarget(
+                render_id=render_id,
+                object_id=self.id_cache.get(render_id, "id") or object_key,
+                name=identity["name"],
+                class_name=identity["class"],
+                type_name=identity["type"],
+                layer=identity["layer"],
+                x=float(visual["x"]),
+                y=float(visual["y"]),
+                rotation=float(visual["rotation"]),
+                scale=float(visual["scale"]),
+                polygon=polygon,
+            ))
+        return targets
+
+    @staticmethod
+    def __trigger_event(event_type, trigger, target, tick):
+        return {
+            "type": event_type,
+            "tick": int(tick),
+            "trigger": {
+                "render_id": trigger["render_id"],
+                "id": trigger["object_key"],
+                "name": trigger["name"],
+                "class": trigger["class"],
+                "type": trigger["type"],
+            },
+            "object": {
+                "render_id": target.render_id,
+                "id": target.object_id,
+                "name": target.name,
+                "class": target.class_name,
+                "type": target.type_name,
+                "position": [target.x, target.y],
+                "layer": target.layer,
+            },
+        }
+
+    def __send_trigger_events(self, events) -> int:
+        if not events:
+            return 0
+        worker_queues = getattr(self, "worker_queues", None) or ()
+        packed = [dict(event) for event in events]
+        for worker_id, worker_queue in enumerate(worker_queues):
+            try:
+                worker_queue.put({
+                    "proc_id": worker_id,
+                    "command": "trigger_events",
+                    "events": packed,
+                })
+            except (EOFError, OSError, ValueError):
+                continue
+        return len(events)
+
+    def __evaluate_triggers(self, tick=None) -> int:
+        """Сравнивает пересечения зон и объектов и рассылает enter/exit.
+
+        Вызывается процессом скриптов после тика, поэтому позиции уже
+        отражают результат ``fixed_update``.  События отправляются всем
+        воркерам: каждый доставит их только своим объектам по render_id.
+        """
+
+        if not getattr(self, "trigger_evaluation_enabled", True):
+            return 0
+        if tick is None:
+            try:
+                tick = int(self.tick_cache.get())
+            except Exception:
+                tick = 0
+        tick = int(tick)
+        if getattr(self, "_last_trigger_tick", None) == tick:
+            return 0
+        self._last_trigger_tick = tick
+
+        triggers = dict(getattr(self, "_triggers", {}))
+        if not triggers:
+            self._trigger_contacts = {}
+            return 0
+
+        previous = getattr(self, "_trigger_contacts", {})
+        contacts = {}
+        events = []
+        targets = self.__trigger_targets()
+
+        for render_id, trigger in triggers.items():
+            if not trigger.get("world"):
+                contacts[render_id] = {}
+                continue
+            before = previous.get(render_id, {})
+            current = {}
+            for target in targets:
+                if target.render_id == render_id:
+                    continue
+                if not filter_matches(
+                    trigger["activates"], target.identity()
+                ):
+                    continue
+                if target.polygon:
+                    hit = convex_polygons_overlap(
+                        trigger["world"],
+                        target.polygon,
+                        trigger.get("bounds"),
+                        polygon_bounds(target.polygon),
+                    )
+                else:
+                    hit = convex_polygon_contains_point(
+                        (target.x, target.y), trigger["world"]
+                    )
+                if not hit:
+                    continue
+                current[target.render_id] = self.__trigger_event(
+                    "enter", trigger, target, tick
+                )
+                if target.render_id not in before:
+                    events.append(current[target.render_id])
+            for object_render_id, old_event in before.items():
+                if object_render_id in current:
+                    continue
+                exit_event = dict(old_event)
+                exit_event["type"] = "exit"
+                exit_event["tick"] = tick
+                events.append(exit_event)
+            contacts[render_id] = current
+
+        self._trigger_contacts = contacts
+        return self.__send_trigger_events(events)
+
+    def __forget_trigger(self, render_id) -> None:
+        """Убирает зону и сообщает exit для всех её текущих контактов."""
+
+        triggers = getattr(self, "_triggers", {})
+        contacts = getattr(self, "_trigger_contacts", {})
+        trigger = triggers.pop(int(render_id), None)
+        previous = contacts.pop(int(render_id), None)
+        if trigger is None or not previous:
+            return
+        tick = getattr(self, "_last_trigger_tick", 0) or 0
+        events = []
+        for old_event in previous.values():
+            exit_event = dict(old_event)
+            exit_event["type"] = "exit"
+            exit_event["tick"] = int(tick)
+            events.append(exit_event)
+        self.__send_trigger_events(events)
 
     def __register(self, data):
         request_id = data.get("request_id") or data.get("id")
@@ -866,10 +1155,67 @@ class Stream:
                 + "; ".join(failures)
             )
 
+    def __script_network_role(self, script_data):
+        """Возвращает разобранные параметры ``scripting.network`` объекта.
+
+        Параметры описывают объект целиком, поэтому все его скрипты (включая
+        компоненты) получают одну и ту же роль.  Модуль ``net`` подключается
+        лениво: одиночная игра не должна тянуть сетевой слой.
+        """
+
+        if not isinstance(script_data, dict):
+            return None
+        scripting = script_data.get("scripting")
+        if not isinstance(scripting, dict):
+            return None
+        network = scripting.get("network")
+        if network is None:
+            return None
+        from net.directives import parse_network_directives
+
+        return parse_network_directives(network)
+
+    def __should_run_script(self, script_data):
+        """Решает, исполняет ли этот процесс скрипт объекта.
+
+        ``solo``  — одиночная игра, запускаются все скрипты.
+        ``server`` — только объекты с ``authority=server``: локальные
+        клиентские скрипты на сервере не нужны.
+        ``client`` — локальные скрипты и предсказание собственного объекта
+        (``prediction=owner`` с render_id игрока).  Реплицируемые чужие
+        объекты клиент не симулирует: их состояние приходит снапшотами.
+        """
+
+        net_role = getattr(self, "net_role", "solo")
+        if net_role == "solo":
+            return True
+
+        network = self.__script_network_role(script_data)
+        if net_role == "server":
+            return network is not None and network.networked
+
+        if net_role == "client":
+            if network is None or not network.networked:
+                return True
+            if network.prediction == "owner":
+                render_id = int((script_data or {}).get("render_id") or 0)
+                owner_id = int(
+                    getattr(self, "_net_owner_render_id", 0) or 0
+                )
+                return owner_id != 0 and render_id == owner_id
+            # Репликацию, ввод и серверную логику исполняет сервер.
+            return False
+
+        return True
+
     def __add_script(self, data):
         path = data.get("path")
         if not isinstance(path, str) or not path:
             self.print("add_script: не указан путь к скрипту")
+            return
+
+        script_data = data.get("script_data")
+        if not self.__should_run_script(script_data):
             return
 
         try:
@@ -1008,6 +1354,8 @@ class Stream:
                     self.camera_target_cache.set(-1)
 
         if object is not None:
+            self.__forget_trigger(render_id)
+            self.__publish_net_removal(render_id, object)
             self.__bump_object_generation()
             self.render_in_stream.put({
                 "command": "remove",
@@ -1157,6 +1505,9 @@ class Stream:
         console_out_stream=None,
         net_executed_tick=None,
         scene_file=None,
+        net_object_events=None,
+        net_role="solo",
+        net_owner_render_id=0,
     ):
         self.render_in_stream = render_in_stream
         self.change_in_stream = change_in_stream
@@ -1164,7 +1515,23 @@ class Stream:
         self.main_out_stream = main_out_stream
         self.console_out_stream = console_out_stream
         self.net_executed_tick = net_executed_tick
+        # Очередь для серверного процесса: сюда попадает каждый объект,
+        # созданный скриптом с директивами ``scripting.network``.  Без неё
+        # сервер узнал бы о динамических объектах только при перезапуске.
+        self.net_object_events = net_object_events
+        # Роль процесса в мультиплеере: ``solo``, ``server`` или ``client``.
+        # От неё зависит, какие скрипты сцены вообще запускаются: сервер
+        # исполняет только сетевые объекты, клиент — только локальные и своё
+        # предсказание, а не чужие реплицируемые объекты.
+        self.net_role = str(net_role or "solo").lower()
+        self._net_owner_render_id = int(net_owner_render_id or 0)
         self.scene_file = scene_file or SCENE_FILE
+        # Триггеры оценивает только серверный процесс (и одиночная игра).
+        # Клиент получает уже готовые события от сервера.
+        self.trigger_evaluation_enabled = self.net_role in ("solo", "server")
+        self._triggers = {}
+        self._trigger_contacts = {}
+        self._last_trigger_tick = None
         # Реестр объектов принадлежит процессу Stream.  Другие процессы
         # получают нужные данные командами и снимками визуального кэша.
         self.objects_cache = {}

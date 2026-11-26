@@ -5,4 +5,10 @@ venv/
 .env
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 *.log
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/

@@ -1,5 +1,9 @@
 # API скриптов
 
+> Часть проекта **pyengine**. Обзор и быстрый старт — в [README.MD](README.MD),
+> компоненты — в [COMPONENTS.md](COMPONENTS.md), вся документация — в
+> [docs/README.md](docs/README.md).
+
 В этом документе описан API обычных скриптов и компонентов. Для обоих доступны одни и те же объекты движка: `self.GameObject`, `self.Camera`, `self.Mouse`, `self.Keyboard` и `self.GlobalTime`.
 
 ## Подключение скрипта к объекту сцены
@@ -27,10 +31,26 @@ class mover(script):
 
 ```json
 "scripting": {
-  "scripts": ["access\\scripts\\mover.py"],
-  "network": []
+  "scripts": ["access\\scripts\\mover.py"]
 }
 ```
+
+`scripting.network` необязателен. Без него объект локальный: оси
+`authority=local`, `replication=none`, `prediction=none`, `input=none`. Для
+сетевой игры задайте объект осей:
+
+```json
+"network": {
+  "authority": "server",
+  "replication": "all",
+  "prediction": "owner",
+  "input": "owner"
+}
+```
+
+`authority` — `local` или `server`; `replication` — `none` или `all`;
+`prediction` и `input` — `none` или `owner`. `prediction=owner` требует
+`replication=all`, а `prediction`/`input`/`replication` — `authority=server`.
 
 Движок загружает класс с тем же именем, что и файл скрипта. Используйте `start()` для начальной настройки. Не объявляйте собственный `__init__`: движок сам передаёт аргументы конструктору.
 
@@ -137,9 +157,18 @@ if (other is not None and self.GameObject.Transform is not None
 
 Полигон задаётся в локальных координатах в поле `transform.polygon` сцены. Для проверки пересечения движок учитывает позицию, поворот и масштаб обоих объектов. Проверку нужно вызывать из скрипта самостоятельно: автоматический метод обратного вызова о столкновении не вызывается.
 
+### `GameObject.Trigger`
+
+У `trigger_object` нет `Visual`, зато есть `Trigger` с полями `polygon`
+(локальные вершины), `position` (`Vector2`), `rotation`, `scale` и
+`activates` (нормализованный фильтр). У остальных объектов `Trigger`
+равен `None`. Сама зона не имеет визуальной части и не участвует в
+отрисовке; пересечения вычисляет сервер, а скрипты получают события
+`on_trigger_enter`/`on_trigger_exit`.
+
 ### `GameObject.Identity` и другие компоненты
 
-Если у объекта нет компонента `id`, значение `Identity` равно `None`. У `Identity` есть поля `name`, `class_`, `type` и `id`. `GameObject.Scripting` равен `None` либо содержит списки скриптов и сетевых подключений объекта. Методы `GameObject.render()`, `remove()` и `register()` отправляют движку соответствующую команду; `register()` возвращает зарегистрированный объект. Вызывайте `register()` для нового экземпляра `GameObject`: объект, переданный скрипту, уже зарегистрирован. Если у нового объекта есть `Visual`, `register()` автоматически вызывает `render()`, даже когда к объекту подключены скрипты или компоненты.
+Если у объекта нет компонента `id`, значение `Identity` равно `None`. У `Identity` есть поля `name`, `class_`, `type` и `id`. `GameObject.Scripting` равен `None` либо содержит списки скриптов и объект `network` с осями `authority`, `replication`, `prediction`, `input`. Методы `GameObject.render()`, `remove()` и `register()` отправляют движку соответствующую команду; `register()` возвращает зарегистрированный объект. Вызывайте `register()` для нового экземпляра `GameObject`: объект, переданный скрипту, уже зарегистрирован. Если у нового объекта есть `Visual`, `register()` автоматически вызывает `render()`, даже когда к объекту подключены скрипты или компоненты.
 
 ## Создание объектов
 
@@ -224,6 +253,54 @@ def on_mouse_click(self, event):
     if event.button == "left":
         self.GameObject.Visual.rotation += 45
 ```
+
+## API триггеров
+
+Объект типа `trigger_object` задаёт выпуклую зону. Скрипты **объекта,
+который пересёк зону**, получают обратные вызовы:
+
+| Метод | Когда вызывается |
+| --- | --- |
+| `on_trigger_enter(event)` | Объект впервые попал в зону, подходящую под `activates`. |
+| `on_trigger_exit(event)` | Объект вышел из зоны или покинул сцену. |
+
+```python
+def on_trigger_enter(self, event):
+    print("вошёл в", event.trigger_name, "как", event.object_name)
+
+def on_trigger_exit(self, event):
+    print("вышел из", event.trigger_name)
+```
+
+`event` — `TriggerEvent` с полями `type` (`"enter"`/`"exit"`), `tick`,
+`trigger_render_id`, `trigger_id`, `trigger_name`, `trigger_class`,
+`trigger_type`, `object_render_id`, `object_id`, `object_name`,
+`object_class`, `object_type`, `object_position` (`Vector2`).
+
+Триггеры оцениваются на сервере после тика, поэтому вызовы происходят в
+серверной симуляции; события не реплицируются клиентам в первой итерации.
+Контакт определяется по полигону `transform` объекта, а при его отсутствии —
+по точке `(x, y)` из `visual`.
+
+Сцена триггера выглядит так:
+
+```json
+{
+  "object_type": "trigger_object",
+  "id": {"name": "arena", "class": "Zone"},
+  "trigger": {
+    "polygon": [[-100, -100], [100, -100], [100, 100], [-100, 100]],
+    "position": [0, 0],
+    "rotation": 0,
+    "scale": 1,
+    "activates": {"class": ["Player"], "layer": [1]}
+  }
+}
+```
+
+`activates` — фильтр в стиле `find_object`: поля объединяются через AND,
+значения внутри списка — через OR; пустой фильтр пропускает любой объект.
+Доступны `class`, `name`, `type`, `layer`.
 
 ## API клавиатуры
 

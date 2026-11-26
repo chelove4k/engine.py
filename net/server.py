@@ -653,7 +653,20 @@ class GameServer:
             ),
         )
 
+    def _poll_world_network(self) -> None:
+        """Даёт миру подхватить объекты, созданные скриптами между тиками."""
+
+        poll = getattr(self.world, "poll_network_events", None)
+        if poll is None:
+            return
+        try:
+            poll()
+        except Exception as error:  # сеть не должна падать из-за мира
+            if self.verbose:
+                print(f"[NET] poll_network_events упал: {error}", flush=True)
+
     def _send_initial_snapshot(self, session: ClientSession) -> None:
+        self._poll_world_network()
         tick = max(1, self._last_sim_tick)
         state = self.world.snapshot_state().copy()
         state.tick = tick
@@ -662,6 +675,7 @@ class GameServer:
         self._send(session, encode_snapshot_message(snapshot))
 
     def _broadcast_snapshot(self, tick: int) -> None:
+        self._poll_world_network()
         current = self.world.snapshot_state().copy()
         current.tick = tick
         self._history[tick] = current

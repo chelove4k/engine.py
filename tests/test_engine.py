@@ -23,6 +23,7 @@ from pyengine import (
     Keyboard,
     Mouse,
     REGISTRATION_STASH_PREFIX,
+    TriggerEvent,
     Vector2,
     VisualCache,
     _Camera,
@@ -34,6 +35,7 @@ from pyengine import (
 )
 from scene import validate_object_data
 from stream import Stream
+from triggers import filter_matches, validate_trigger
 from config import (
     ENGINE_STATE_LOOP_FIELDS,
     ENGINE_STATE_SEGMENT_BYTES,
@@ -898,6 +900,28 @@ class ValidationTests(unittest.TestCase):
             "id": {"name": "wall", "class": "Wall"},
         })
 
+    def test_static_object_may_carry_network_scripting(self):
+        # Кликабельный триггер остаётся static_object, но ему нужна сетевая
+        # роль, чтобы клик по нему обрабатывался сервером.
+        validate_object_data({
+            "object_type": "static_object",
+            "id": {"name": "trigger", "class": "Trigger"},
+            "visual": {
+                "sprite": "None",
+                "position": [0, 0],
+                "scale": 1,
+                "rotation": 0,
+                "alpha": 1,
+            },
+            "scripting": {
+                "scripts": [],
+                "network": {
+                    "authority": "server",
+                    "replication": "all",
+                },
+            },
+        })
+
     def test_engine_owned_fields_are_rejected(self):
         for field_name in (
             "_id", "object_id", "render_id", "_object_id", "_render_id",
@@ -953,12 +977,18 @@ class ValidationTests(unittest.TestCase):
                 },
             })
 
-    def test_network_must_be_a_list(self):
+    def test_network_must_be_an_object(self):
         with self.assertRaises(ValueError):
             validate_object_data({
                 "object_type": "manager",
                 "id": {"name": "manager", "class": "Manager"},
                 "scripting": {"scripts": [], "network": "tcp"},
+            })
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "manager",
+                "id": {"name": "manager", "class": "Manager"},
+                "scripting": {"scripts": [], "network": ["replicate"]},
             })
 
     def test_top_level_component_is_valid(self):
@@ -1020,6 +1050,62 @@ class ValidationTests(unittest.TestCase):
                 "properties": {"degrees": 90},
             }],
         })
+
+    def test_trigger_object_is_valid(self):
+        validate_object_data({
+            "object_type": "trigger_object",
+            "id": {"name": "arena", "class": "Zone"},
+            "trigger": {
+                "polygon": [[-50, -50], [50, -50], [50, 50], [-50, 50]],
+                "position": [10, 20],
+                "rotation": 0,
+                "scale": 1,
+                "activates": {
+                    "class": ["player", "enemy"],
+                    "name": ["runner"],
+                    "layer": [1, 2],
+                },
+            },
+        })
+
+    def test_trigger_object_requires_polygon(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "trigger_object",
+                "id": {"name": "arena", "class": "Zone"},
+                "trigger": {
+                    "position": [0, 0],
+                    "activates": {},
+                },
+            })
+
+    def test_trigger_object_rejects_unknown_filter_field(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "trigger_object",
+                "id": {"name": "arena", "class": "Zone"},
+                "trigger": {
+                    "polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]],
+                    "activates": {"team": ["red"]},
+                },
+            })
+
+    def test_trigger_object_cannot_have_visual_or_scripting(self):
+        with self.assertRaises(ValueError):
+            validate_object_data({
+                "object_type": "trigger_object",
+                "id": {"name": "arena", "class": "Zone"},
+                "visual": {
+                    "sprite": "None",
+                    "position": [0, 0],
+                    "scale": 1,
+                    "rotation": 0,
+                    "alpha": 1,
+                },
+                "trigger": {
+                    "polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]],
+                },
+            })
 
     def test_stress_motion_scene_is_valid(self):
         scene_path = (
@@ -1532,6 +1618,200 @@ class CollisionTests(unittest.TestCase):
         self.assertFalse(convex_polygons_overlap(
             left, apart, polygon_bounds(left), polygon_bounds(apart)
         ))
+
+
+class TriggerTests(CacheTestCase):
+    square = [[-5, -5], [5, -5], [5, 5], [-5, 5]]
+
+    def make_stream(self):
+        visual, identity = self.make_caches()
+        stream = Stream.__new__(Stream)
+        stream.visual_cache = visual
+        stream.id_cache = identity
+        stream.objects_cache = {}
+        stream.object_lock = threading.Lock()
+        stream.worker_queues = [queue.Queue()]
+        stream.tick_cache = ValueCache(1)
+        self.addCleanup(stream.tick_cache.close)
+        stream.trigger_evaluation_enabled = True
+        stream._triggers = {}
+        stream._trigger_contacts = {}
+        stream._last_trigger_tick = None
+        return stream, visual, identity
+
+    @staticmethod
+    def add_target(stream, visual, identity, render_id, name, class_name,
+                   x, y, layer=1, with_transform=True):
+        identity.set_many(render_id, {
+            "id": name,
+            "name": name,
+            "class": class_name,
+            "type": "dynamic_object",
+            "generation": 1,
+        })
+        visual.set_many(render_id, {
+            "sprite": "img.png",
+            "x": x,
+            "y": y,
+            "rotation": 0.0,
+            "scale": 1.0,
+            "alpha": 1.0,
+            "layer": layer,
+        })
+        dict_data = {
+            "object_type": "dynamic_object",
+            "_components": ["visual"],
+        }
+        if with_transform:
+            dict_data["_components"].append("transform")
+            dict_data["transform"] = {"polygon": TriggerTests.square}
+        stream.objects_cache[name] = {
+            "_render_id": render_id,
+            "_object_id": render_id,
+            "_generation": 1,
+            "dict_data": dict_data,
+        }
+
+    def test_filter_is_and_between_fields_or_inside_lists(self):
+        activates = validate_trigger({
+            "polygon": self.square,
+            "activates": {
+                "class": ["Player", "Enemy"],
+                "name": ["runner"],
+            },
+        })["activates"]
+        self.assertTrue(filter_matches(
+            activates,
+            {"class": "Player", "name": "runner"},
+        ))
+        self.assertTrue(filter_matches(
+            activates,
+            {"class": "Enemy", "name": "runner"},
+        ))
+        self.assertFalse(filter_matches(
+            activates,
+            {"class": "Player", "name": "npc"},
+        ))
+        self.assertTrue(filter_matches({}, {"class": "Anything"}))
+
+    def test_enter_and_exit_events_are_emitted_once(self):
+        stream, visual, identity = self.make_stream()
+        stream._Stream__remember_trigger(
+            10,
+            "arena",
+            1,
+            {"name": "arena", "class": "Zone"},
+            {
+                "polygon": self.square,
+                "activates": {"class": ["Player"]},
+            },
+        )
+        self.add_target(
+            stream, visual, identity, 20, "runner", "Player", 0, 0
+        )
+
+        self.assertEqual(stream._Stream__evaluate_triggers(1), 1)
+        command = stream.worker_queues[0].get_nowait()
+        self.assertEqual(command["command"], "trigger_events")
+        enter = command["events"][0]
+        self.assertEqual(enter["type"], "enter")
+        self.assertEqual(enter["trigger"]["name"], "arena")
+        self.assertEqual(enter["object"]["render_id"], 20)
+
+        self.assertEqual(stream._Stream__evaluate_triggers(2), 0)
+
+        visual.set_many(20, {"x": 100.0, "y": 0.0})
+        self.assertEqual(stream._Stream__evaluate_triggers(3), 1)
+        exit_event = stream.worker_queues[0].get_nowait()["events"][0]
+        self.assertEqual(exit_event["type"], "exit")
+        self.assertEqual(exit_event["object"]["render_id"], 20)
+
+    def test_filter_rejects_wrong_class(self):
+        stream, visual, identity = self.make_stream()
+        stream._Stream__remember_trigger(
+            10,
+            "arena",
+            1,
+            {"name": "arena", "class": "Zone"},
+            {
+                "polygon": self.square,
+                "activates": {"class": ["Player"]},
+            },
+        )
+        self.add_target(
+            stream, visual, identity, 20, "wall", "Wall", 0, 0
+        )
+
+        self.assertEqual(stream._Stream__evaluate_triggers(1), 0)
+
+    def test_target_without_transform_uses_point(self):
+        stream, visual, identity = self.make_stream()
+        stream._Stream__remember_trigger(
+            10,
+            "arena",
+            1,
+            {"name": "arena", "class": "Zone"},
+            {"polygon": self.square},
+        )
+        self.add_target(
+            stream, visual, identity, 20, "runner", "Player", 0, 0,
+            with_transform=False,
+        )
+        self.assertEqual(stream._Stream__evaluate_triggers(1), 1)
+        enter = stream.worker_queues[0].get_nowait()["events"][0]
+        self.assertEqual(enter["type"], "enter")
+
+        visual.set_many(20, {"x": 500.0})
+        self.assertEqual(stream._Stream__evaluate_triggers(2), 1)
+        exit_event = stream.worker_queues[0].get_nowait()["events"][0]
+        self.assertEqual(exit_event["type"], "exit")
+
+    def test_removing_trigger_emits_exit(self):
+        stream, visual, identity = self.make_stream()
+        stream._Stream__remember_trigger(
+            10,
+            "arena",
+            1,
+            {"name": "arena", "class": "Zone"},
+            {"polygon": self.square},
+        )
+        self.add_target(
+            stream, visual, identity, 20, "runner", "Player", 0, 0
+        )
+        self.assertEqual(stream._Stream__evaluate_triggers(1), 1)
+        stream.worker_queues[0].get_nowait()
+
+        stream._Stream__forget_trigger(10)
+        exit_event = stream.worker_queues[0].get_nowait()["events"][0]
+        self.assertEqual(exit_event["type"], "exit")
+        self.assertNotIn(10, stream._triggers)
+        self.assertNotIn(10, stream._trigger_contacts)
+
+    def test_trigger_event_exposes_flat_fields(self):
+        event = TriggerEvent({
+            "type": "enter",
+            "tick": 7,
+            "trigger": {
+                "render_id": 10,
+                "id": "arena",
+                "name": "arena",
+                "class": "Zone",
+                "type": "trigger_object",
+            },
+            "object": {
+                "render_id": 20,
+                "id": "runner",
+                "name": "runner",
+                "class": "Player",
+                "type": "dynamic_object",
+                "position": [1, 2],
+            },
+        })
+        self.assertEqual(event.type, "enter")
+        self.assertEqual(event.trigger_name, "arena")
+        self.assertEqual(event.object_render_id, 20)
+        self.assertEqual((event.object_position.x, event.object_position.y),
+                         (1.0, 2.0))
 
 
 class ApplyUpdateTests(unittest.TestCase):
@@ -2240,6 +2520,49 @@ class SnapshotInterpolationTests(unittest.TestCase):
             (moving_sprite.center_x, moving_sprite.center_y), (10.0, -10.0)
         )
 
+    def test_authoritative_object_uses_longer_interpolation_window(self):
+        probe = self.Probe()
+        sprite = self.Sprite()
+        probe._sprites_by_render_id = {2: sprite}
+        probe._world_data_by_render_id = {2: {"position": (10.0, -10.0)}}
+        probe._position_history_by_render_id[2] = deque(
+            [(0, 0.0, 0.0), (10, 10.0, -10.0)],
+            maxlen=probe.POSITION_HISTORY_SIZE,
+        )
+        probe._moving_render_ids = {2}
+        probe._net_authoritative_ids = {2}
+        probe._net_interp_delay_ticks = 10.0
+        probe._net_extrapolation_ticks = 5.0
+
+        # Локальный объект уже у новейшего отсчёта, а удалённый отстаёт на
+        # задержку интерполяции и плавно идёт между снапшотами.
+        probe._interpolate_sprite_positions(15.0)
+
+        self.assertAlmostEqual(sprite.center_x, 5.0)
+        self.assertAlmostEqual(sprite.center_y, -5.0)
+
+    def test_authoritative_extrapolation_is_capped(self):
+        probe = self.Probe()
+        sprite = self.Sprite()
+        probe._sprites_by_render_id = {2: sprite}
+        probe._world_data_by_render_id = {2: {"position": (10.0, 0.0)}}
+        probe._position_history_by_render_id[2] = deque(
+            [(0, 0.0, 0.0), (10, 10.0, 0.0)],
+            maxlen=probe.POSITION_HISTORY_SIZE,
+        )
+        probe._moving_render_ids = {2}
+        probe._net_authoritative_ids = {2}
+        probe._net_interp_delay_ticks = 0.0
+        probe._net_extrapolation_ticks = 5.0
+
+        probe._interpolate_sprite_positions(13.0)
+        self.assertAlmostEqual(sprite.center_x, 13.0)
+
+        # Потеря пакета не уводит объект бесконечно: экстраполяция ограничена
+        # одним интервалом снапшота.  Свежий снапшот вернёт точную позицию.
+        probe._interpolate_sprite_positions(20.0)
+        self.assertAlmostEqual(sprite.center_x, 15.0)
+
     def test_equal_position_updates_do_not_mark_sprite_moving(self):
         probe = self.Probe()
         sprite = self.Sprite()
@@ -2255,6 +2578,122 @@ class SnapshotInterpolationTests(unittest.TestCase):
             list(probe._position_history_by_render_id[3]),
             [(8, 6.0, 5.0)],
         )
+
+
+class StreamScriptRoleTests(unittest.TestCase):
+    """Клиент и сервер делят скрипты по ``scripting.network``."""
+
+    @staticmethod
+    def _stream(net_role, owner_render_id=0):
+        probe = Stream.__new__(Stream)
+        probe.net_role = net_role
+        probe._net_owner_render_id = owner_render_id
+        return probe
+
+    @staticmethod
+    def _data(network, render_id=5):
+        return {
+            "scripting": {"scripts": [], "network": dict(network)},
+            "render_id": render_id,
+        }
+
+    def test_solo_runs_every_script(self):
+        probe = self._stream("solo")
+
+        self.assertTrue(
+            probe._Stream__should_run_script(self._data({}))
+        )
+        self.assertTrue(
+            probe._Stream__should_run_script(
+                self._data({"authority": "server", "replication": "all"})
+            )
+        )
+
+    def test_server_skips_local_scripts_but_runs_networked(self):
+        probe = self._stream("server")
+
+        self.assertFalse(
+            probe._Stream__should_run_script(self._data({}))
+        )
+        for network in (
+            {"authority": "server"},
+            {"authority": "server", "replication": "all"},
+            {
+                "authority": "server",
+                "replication": "all",
+                "prediction": "owner",
+                "input": "owner",
+            },
+        ):
+            self.assertTrue(
+                probe._Stream__should_run_script(self._data(network)),
+                network,
+            )
+
+    def test_client_skips_remote_replicated_scripts(self):
+        probe = self._stream("client", owner_render_id=5)
+
+        self.assertTrue(
+            probe._Stream__should_run_script(self._data({}))
+        )
+        for network in (
+            {"authority": "server"},
+            {"authority": "server", "replication": "all"},
+        ):
+            self.assertFalse(
+                probe._Stream__should_run_script(self._data(network)),
+                network,
+            )
+
+    def test_client_predicts_only_own_owner_object(self):
+        probe = self._stream("client", owner_render_id=5)
+        owner_network = {
+            "authority": "server",
+            "replication": "all",
+            "prediction": "owner",
+            "input": "owner",
+        }
+
+        self.assertTrue(
+            probe._Stream__should_run_script(
+                self._data(owner_network, render_id=5)
+            )
+        )
+        self.assertFalse(
+            probe._Stream__should_run_script(
+                self._data(owner_network, render_id=6)
+            )
+        )
+
+    def test_observer_runs_no_owner_prediction(self):
+        probe = self._stream("client", owner_render_id=0)
+
+        self.assertFalse(
+            probe._Stream__should_run_script(self._data({
+                "authority": "server",
+                "replication": "all",
+                "prediction": "owner",
+                "input": "owner",
+            }, render_id=5))
+        )
+
+    def test_add_script_returns_before_worker_dispatch_for_client_replica(self):
+        probe = self._stream("client", owner_render_id=5)
+
+        def unexpected(path):
+            raise AssertionError("клиент не должен готовить чужой скрипт")
+
+        probe.get_script_diff = unexpected
+        # Ранний выход происходит до чтения файла и постановки в очередь.
+        probe._Stream__add_script({
+            "path": "access/scripts/test.py",
+            "obj_id": 1,
+            "id": "runner",
+            "script_data": self._data({
+                "authority": "server",
+                "replication": "all",
+            }),
+        })
 
 
 class CreateObjectTests(CacheTestCase):
@@ -3795,6 +4234,109 @@ class CooperativeSchedulerTests(unittest.TestCase):
         self.assertIsNone(owner.bound)
         self.assertIsNone(runner.net.owner_of(100))
 
+    def test_network_click_is_dispatched_to_all_scripts_once(self):
+        class FakeClickScript:
+            def __init__(self, render_id):
+                self.GameObject = types.SimpleNamespace(_render_id=render_id)
+                self.clicks = []
+                self.strict = False
+
+            def set_strict_tick(self, enabled=True):
+                self.strict = bool(enabled)
+
+            def bind_input(self, source):
+                pass
+
+            def dispatch_network_click(self, snapshot, render_id, button):
+                self.clicks.append((int(render_id), int(button)))
+
+            def step(self, state):
+                return True
+
+            def shutdown(self):
+                pass
+
+        trigger = FakeClickScript(55)
+        other = FakeClickScript(66)
+        runner = self.make_runner({
+            0: (trigger, 0, "trigger.py"),
+            1: (other, 0, "other.py"),
+        })
+        runner.engine_state = FakeEngineState()
+        runner.net_executed_tick = types.SimpleNamespace(value=0)
+
+        runner._scripter_runner__handle_worker_message({"command": "net_start"})
+        runner._scripter_runner__handle_worker_message({
+            "command": "net_join", "client_id": 1, "render_id": 55,
+        })
+
+        from net import protocol
+        payload = protocol.encode_input_message(
+            protocol.make_input_frame(
+                0, 0, set(), clicks=((55, 1), (66, 4))
+            )
+        )
+        runner._scripter_runner__step_net({"tick": 1}, [(1, payload)])
+
+        # Клик уходит всем скриптам: фильтрует его сам скрипт по render_id,
+        # а не сервер по владельцу ввода.
+        self.assertEqual(trigger.clicks, [(55, 1), (66, 4)])
+        self.assertEqual(other.clicks, [(55, 1), (66, 4)])
+
+        # Следующий тик не повторяет клик.
+        runner._scripter_runner__step_net({"tick": 2}, [])
+        self.assertEqual(trigger.clicks, [(55, 1), (66, 4)])
+        self.assertEqual(other.clicks, [(55, 1), (66, 4)])
+
+
+class NetworkClickDispatchTests(unittest.TestCase):
+    """Серверный клик доставляется только скрипту своего объекта."""
+
+    class Probe(script):
+        def on_mouse_click(self, event):
+            self.clicks.append((event.render_id, event.button))
+
+    def make_probe(self, render_id=55, *, wants=True, stopped=False):
+        probe = self.Probe.__new__(self.Probe)
+        probe.clicks = []
+        probe.GameObject = types.SimpleNamespace(_render_id=render_id)
+        probe.__dict__.update({
+            "_script__stopped": stopped,
+            "_script__wants_mouse_actions": wants,
+        })
+        return probe
+
+    @staticmethod
+    def snapshot():
+        from net.input_source import InputSnapshot
+        return InputSnapshot(tick=5, mouse_x=3.0, mouse_y=4.0)
+
+    def test_click_reaches_matching_object(self):
+        probe = self.make_probe(55)
+
+        probe.dispatch_network_click(self.snapshot(), 55, 1)
+
+        self.assertEqual(probe.clicks, [(55, "left")])
+
+    def test_click_for_another_object_is_ignored(self):
+        probe = self.make_probe(55)
+
+        probe.dispatch_network_click(self.snapshot(), 66, 1)
+
+        self.assertEqual(probe.clicks, [])
+
+    def test_empty_click_and_disabled_or_stopped_script_are_ignored(self):
+        snapshot = self.snapshot()
+        cases = (
+            (self.make_probe(55), 0),
+            (self.make_probe(55, wants=False), 55),
+            (self.make_probe(55, stopped=True), 55),
+        )
+        for probe, render_id in cases:
+            with self.subTest(render_id=render_id):
+                probe.dispatch_network_click(snapshot, render_id, 1)
+                self.assertEqual(probe.clicks, [])
+
 
 class NetRenderTests(unittest.TestCase):
     """Сетевой путь рендера: отправка ввода, снапшоты, поправки."""
@@ -3957,6 +4499,75 @@ class NetRenderTests(unittest.TestCase):
         self.assertAlmostEqual(dy, -0.5, delta=1e-3)
         self.assertAlmostEqual(drot, 2.0, delta=1e-3)
         self.assertEqual(game._net_corrections.sample(99), (0.0, 0.0, 0.0))
+
+    def test_snapshot_spawns_remote_sprite_for_unknown_id(self):
+        from net.state import ObjectState, SnapshotState
+
+        game = self._game()
+        game.renders = []
+        calls = []
+
+        def fake_add(data):
+            calls.append(data)
+            sprite = self._Sprite()
+            game._sprites_by_render_id[data["render_id"]] = sprite
+            game._world_data_by_render_id[data["render_id"]] = {
+                "position": (data["x"], data["y"]),
+                "scale": data["scale"],
+                "rotation": data["rotation"],
+                "alpha": data["alpha"],
+                "layer": data["layer"],
+            }
+            game._position_history_by_render_id[data["render_id"]] = []
+
+        game._add_sprite = fake_add
+        state = SnapshotState()
+        state.put(
+            42, ObjectState("runner.png", 3.0, 8.0, 9.0, 45.0, 0.2, 0.7)
+        )
+        game.net_client = self._NetClient(
+            snapshot=types.SimpleNamespace(tick=100), state=state
+        )
+
+        game._apply_net_snapshots()
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["__net_spawn__"])
+        self.assertEqual(calls[0]["path"], "runner.png")
+        self.assertIn(42, game._net_authoritative_ids)
+        self.assertNotIn(42, game._net_pending_render_state)
+        sprite = game._sprites_by_render_id[42]
+        self.assertEqual(sprite.position, (8.0, 9.0))
+        self.assertEqual(sprite.angle, 45.0)
+        self.assertEqual(sprite.alpha, int(0.7 * 255))
+
+    def test_late_local_add_does_not_overwrite_authoritative_sprite(self):
+        game = self._game()
+        game.net_client = self._NetClient()
+        game._net_authoritative_ids = {8}
+        game._sprites_by_render_id = {8: self._Sprite()}
+
+        game._add_sprite({
+            "render_id": 8,
+            "path": "local.png",
+            "x": 0.0,
+            "y": 0.0,
+            "scale": 1.0,
+            "rotation": 0.0,
+            "alpha": 1.0,
+            "layer": 0.0,
+        })
+
+        # Ранний выход до _remove_sprite: серверный спрайт не пересоздан.
+        self.assertEqual(game._removed, [])
+        self.assertEqual(len(game._sprites_by_render_id), 1)
+
+    def test_local_click_is_suppressed_in_network_mode(self):
+        game = self._game()
+        self.assertFalse(game._net_suppresses_local_click())
+
+        game.net_client = self._NetClient()
+        self.assertTrue(game._net_suppresses_local_click())
 
 
 if __name__ == "__main__":

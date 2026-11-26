@@ -93,6 +93,24 @@ class ServerSimulation:
             source.advance(tick)
         return skipped
 
+    def take_clicks(self):
+        """Клики всех игроков на текущем тике.
+
+        Клик — событие, а не состояние: повтор кадра его не воспроизводит
+        (``InputQueue`` очищает ``clicks``), поэтому раздавать их нужно ровно
+        один раз.  Источник клика сохраняется, чтобы событие мыши пришло с
+        координатами именно того игрока, который нажал.
+        """
+
+        clicks = []
+        for source in self.sources.values():
+            snapshot = source.current
+            for render_id, button in snapshot.clicks:
+                clicks.append(
+                    (int(source.client_id), snapshot, int(render_id), int(button))
+                )
+        return clicks
+
     def stats(self) -> dict:
         received = sum(source.received for source in self.sources.values())
         dropped = sum(source.dropped for source in self.sources.values())

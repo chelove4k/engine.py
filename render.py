@@ -190,9 +190,34 @@ class Game(arcade.Window):
         self._net_disconnect_reported = False
         self._net_sprite_paths = {}
         self._net_last_sample_tick = 0
+        # Снапшоты приходят реже тиков симуляции.  Короткая задержка
+        # интерполяции упиралась в новейший отсчёт и давала рывок раз в
+        # снапшот; для авторитетных объектов держим буфер размером больше
+        # интервала снапшотов и ограниченную экстраполяцию на потерю пакета.
+        self._net_interp_delay_ticks = 0.0
+        self._net_extrapolation_ticks = 0.0
         if net_client is not None:
+            from net.config import (
+                INTERP_DELAY_TICKS,
+                SNAPSHOT_INTERVAL_TICKS,
+            )
             from net.reconcile import CorrectionBuffer
 
+            # render_tick уже отстаёт на POSITION_INTERPOLATION_DELAY,
+            # поэтому добавляем только разницу до желаемой сетевой задержки.
+            base_ticks = (
+                self.POSITION_INTERPOLATION_DELAY / self.SIMULATION_TICK
+            )
+            total_ticks = max(
+                INTERP_DELAY_TICKS,
+                SNAPSHOT_INTERVAL_TICKS + 2,
+            )
+            self._net_interp_delay_ticks = float(
+                max(0.0, total_ticks - base_ticks)
+            )
+            self._net_extrapolation_ticks = float(
+                max(1, SNAPSHOT_INTERVAL_TICKS)
+            )
             self._net_corrections = CorrectionBuffer()
         else:
             self._net_corrections = None
@@ -568,6 +593,12 @@ class Game(arcade.Window):
         published = self._publish_pointer_snapshot(
             event_type, target_render_id, point, x, y, dx, dy
         )
+        if event_type == "mouse_down" and self._net_suppresses_local_click():
+            # Клик обрабатывает сервер: он крутит ту же сцену и раздаёт
+            # событие по render_id.  Локальная копия не должна сработать
+            # второй раз, иначе эффект применится дважды, а созданные
+            # объекты останутся только на клиенте.
+            return
         if event_type == "mouse_move" and published:
             return
         self.main_in_stream.put({
@@ -585,6 +616,17 @@ class Game(arcade.Window):
             "scroll_y": scroll_y,
             "pointer_published": published,
         })
+
+    def _net_suppresses_local_click(self):
+        """Клик в сетевом режиме авторитетно обрабатывает сервер.
+
+        Сервер выполняет те же скрипты, что и клиент, и сам раздаёт клик
+        объекту по ``render_id``.  Поэтому локальная копия компонента не
+        должна повторять обработчик: иначе вращение применилось бы дважды,
+        а созданные объекты существовали бы только на этом клиенте.
+        """
+
+        return getattr(self, "net_client", None) is not None
 
     def _queue_mouse_motion(self, x, y, dx, dy):
         """Объединяет события движения, чтобы hit-test выполнялся раз в кадр.
@@ -776,8 +818,14 @@ class Game(arcade.Window):
         history.append((tick, x, y))
 
     @staticmethod
-    def _position_from_history(history, query_tick):
-        """Интерполирует одну историю без дополнительного поиска в словаре."""
+    def _position_from_history(history, query_tick, extrapolate_ticks=0.0):
+        """Интерполирует одну историю без дополнительного поиска в словаре.
+
+        ``extrapolate_ticks`` разрешает продолжить движение по скорости
+        последнего отрезка, когда запрос ушёл за новейший отсчёт (например,
+        снапшот задержался).  Без него поведение прежнее: удержание последней
+        позиции.
+        """
 
         if not history:
             return None
@@ -786,6 +834,15 @@ class Game(arcade.Window):
         # новейшего отсчёта, и обычный путь обходится без bisect и проверок диапазона.
         last = history[-1]
         if query_tick >= last[0]:
+            if extrapolate_ticks > 0.0 and len(history) >= 2:
+                previous = history[-2]
+                span = last[0] - previous[0]
+                if span > 0:
+                    ahead = min(query_tick - last[0], extrapolate_ticks)
+                    return (
+                        last[1] + (last[1] - previous[1]) * ahead / span,
+                        last[2] + (last[2] - previous[2]) * ahead / span,
+                    )
             return last[1], last[2]
         first = history[0]
         if query_tick <= first[0]:
@@ -846,7 +903,10 @@ class Game(arcade.Window):
         mark_position = self._hit_mark_position
         corrections = getattr(self, "_net_corrections", None)
         owner_id = getattr(self, "_net_owner_render_id", 0)
-        idle_before = render_tick - self.INTERPOLATION_IDLE_TICKS
+        authoritative = getattr(self, "_net_authoritative_ids", None)
+        net_delay = getattr(self, "_net_interp_delay_ticks", 0.0)
+        net_extrapolation = getattr(self, "_net_extrapolation_ticks", 0.0)
+        idle_ticks = self.INTERPOLATION_IDLE_TICKS
         stale = None
         for render_id in moving:
             history = histories.get(render_id)
@@ -856,9 +916,21 @@ class Game(arcade.Window):
                 stale.append(render_id)
                 continue
 
+            # Локальные объекты и предсказание владельца идут без
+            # дополнительной задержки: ввод должен отзываться сразу.
+            # Чужие реплицируемые объекты живут на 20 Гц, поэтому им нужен
+            # буфер больше интервала снапшотов и небольшая экстраполяция.
+            target_tick = render_tick
+            extrapolate = 0.0
+            if authoritative and render_id in authoritative:
+                target_tick -= net_delay
+                extrapolate = net_extrapolation
+
             sprite = sprites.get(render_id)
             if sprite is not None:
-                position = interpolate(history, render_tick)
+                position = interpolate(
+                    history, target_tick, extrapolate
+                )
                 if corrections is not None and render_id == owner_id:
                     dx, dy, _drot = corrections.sample(render_id)
                     if dx or dy:
@@ -870,7 +942,7 @@ class Game(arcade.Window):
                     # текущий центр каждого движущегося спрайта при запросе.
                     sprite.position = position
 
-            if history[-1][0] < idle_before:
+            if history[-1][0] < target_tick - idle_ticks:
                 if stale is None:
                     stale = []
                 stale.append(render_id)
@@ -1097,6 +1169,21 @@ class Game(arcade.Window):
     def _add_sprite(self, data):
 
         render_id = data['render_id']
+        # Снапшот мог прийти раньше, чем Stream прислал команду add.  Забираем
+        # состояние до _remove_sprite: он очищает тот же словарь ожиданий.
+        pending_net = getattr(self, "_net_pending_render_state", None)
+        network_state = (
+            pending_net.pop(render_id, None) if pending_net else None
+        )
+        # Авторитетный объект уже нарисован по снапшоту.  Запоздавшая
+        # локальная команда add для того же render_id не должна перетирать
+        # серверное состояние; исключение — наш собственный сетевой спавн.
+        authoritative = getattr(self, "_net_authoritative_ids", None)
+        if (not data.get("__net_spawn__")
+                and authoritative is not None
+                and render_id in authoritative
+                and render_id in self._sprites_by_render_id):
+            return
         self._remove_sprite(data, reset_camera=False)
 
         world_data = {
@@ -1107,12 +1194,6 @@ class Game(arcade.Window):
             'layer':    float(data.get('layer', 0.0)),
         }
 
-        # Снапшот мог прийти раньше, чем Stream прислал команду add.  Тогда
-        # спрайт создаётся сразу в серверной позиции, а не в локальной.
-        pending_net = getattr(self, "_net_pending_render_state", None)
-        network_state = (
-            pending_net.pop(render_id, None) if pending_net else None
-        )
         if network_state is not None and render_id != getattr(
             self, "_net_owner_render_id", 0
         ):
@@ -1549,8 +1630,14 @@ class Game(arcade.Window):
                     history.clear()
             sprite = sprites.get(render_id)
             if sprite is None:
-                self._net_pending_render_state[render_id] = object_state
-                continue
+                if not self._net_spawn_remote_sprite(
+                    render_id, object_state, sample_tick
+                ):
+                    self._net_pending_render_state[render_id] = object_state
+                    continue
+                sprite = sprites.get(render_id)
+                if sprite is None:
+                    continue
             self._apply_net_object_state(
                 render_id, sprite, object_state, sample_tick
             )
@@ -1564,6 +1651,54 @@ class Game(arcade.Window):
         ]
         for render_id in missing:
             self._remove_sprite({"render_id": render_id})
+
+    def _net_spawn_remote_sprite(self, render_id, object_state, tick):
+        """Рисует объект, который создан только на сервере.
+
+        Серверный скрипт (например, компонент) может создать реплицируемый
+        объект, которого нет в локальном Stream клиента.  Снапшот уже содержит
+        все поля визуала, поэтому спрайт создаётся сразу, не дожидаясь команды
+        ``add`` — иначе такие объекты оставались бы невидимыми.
+        """
+
+        if not getattr(object_state, "sprite", ""):
+            return False
+        if not hasattr(self, "renders"):
+            return False
+
+        render_id = int(render_id)
+        pending = getattr(self, "_net_pending_render_state", None)
+        if pending is not None:
+            pending.pop(render_id, None)
+        data = {
+            "render_id": render_id,
+            "path": object_state.sprite,
+            "x": float(object_state.x),
+            "y": float(object_state.y),
+            "scale": float(object_state.scale),
+            "rotation": float(object_state.rotation),
+            "alpha": float(object_state.alpha),
+            "layer": float(object_state.layer),
+            "tick": int(tick),
+            "object_id": f"net:{render_id}",
+            "object_type": "dynamic_object",
+            "identity": {},
+            "scripts": (),
+            "scripted": True,
+            "__net_spawn__": True,
+        }
+        try:
+            self._add_sprite(data)
+        except Exception as error:
+            self.print(
+                f"не удалось создать сетевой спрайт {render_id}: {error}"
+            )
+            return False
+        self._net_authoritative_ids.add(render_id)
+        self._net_sprite_paths[render_id] = object_state.sprite
+        if pending is not None:
+            pending.pop(render_id, None)
+        return True
 
     def _apply_net_object_state(self, render_id, sprite, object_state, tick):
         world_data = self._world_data_by_render_id.get(render_id)
@@ -1869,6 +2004,36 @@ def main(argv=None):
     overlay_settings = console.OverlaySettings()
     lock = multiprocessing.Lock()
 
+    net_client = None
+    host_process = None
+    net_owner_render_id = 0
+    # Роль процесса Stream определяется режимом.  В сети сервер — единственный
+    # источник истины, поэтому клиентский Stream не запускает реплицируемые
+    # скрипты: он получает готовое состояние снапшотами.
+    net_role = "solo"
+    if args.mode != "solo":
+        try:
+            if args.mode == "host":
+                host_process = _start_host_server(args, args.scene)
+            net_client, welcome = _connect_net_client(args, args.scene)
+            net_owner_render_id = int(
+                getattr(welcome, "owner_render_id", 0) or 0
+            )
+            net_role = "client"
+            print(
+                f"[NET] клиент {welcome.client_id}, "
+                f"owner_render_id={net_owner_render_id}, "
+                f"max_players={welcome.max_players}",
+                flush=True,
+            )
+        except Exception:
+            if host_process is not None:
+                host_process.terminate()
+            raise
+
+    # Stream стартует после рукопожатия: роль и render_id собственного объекта
+    # должны быть известны до запуска скриптов, иначе клиент успел бы
+    # предсказать чужие объекты или выполнить серверный скрипт локально.
     logic_process = multiprocessing.Process(
         target=stream.Stream,
         args=(
@@ -1890,32 +2055,14 @@ def main(argv=None):
             keyboard_ring_data,
             console_out_stream,
         ),
-        kwargs={"scene_file": args.scene},
+        kwargs={
+            "scene_file": args.scene,
+            "net_role": net_role,
+            "net_owner_render_id": net_owner_render_id,
+        },
         daemon=False,
     )
     logic_process.start()
-
-    net_client = None
-    host_process = None
-    net_owner_render_id = 0
-    if args.mode != "solo":
-        try:
-            if args.mode == "host":
-                host_process = _start_host_server(args, args.scene)
-            net_client, welcome = _connect_net_client(args, args.scene)
-            net_owner_render_id = int(
-                getattr(welcome, "owner_render_id", 0) or 0
-            )
-            print(
-                f"[NET] клиент {welcome.client_id}, "
-                f"owner_render_id={net_owner_render_id}, "
-                f"max_players={welcome.max_players}",
-                flush=True,
-            )
-        except Exception:
-            if host_process is not None:
-                host_process.terminate()
-            raise
 
     threading.Thread(
         target=console.console,

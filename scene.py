@@ -11,11 +11,15 @@ import math
 
 from collision import validate_convex_polygon
 from config import COMPONENTS_DIR, MAX_CACHE_STRING_BYTES, PROJECT_DIR
+from net.directives import parse_network_directives
+from triggers import validate_trigger
 
 
 OBJECT_TYPE_RULES = {
     "static_object": {
-        "allowed": frozenset({"id", "visual", "transform", "components"}),
+        "allowed": frozenset({
+            "id", "visual", "scripting", "transform", "components",
+        }),
         "required": frozenset({"id"}),
     },
     "dynamic_object": {
@@ -34,10 +38,14 @@ OBJECT_TYPE_RULES = {
         "allowed": frozenset({"id", "scripting", "components"}),
         "required": frozenset({"id", "scripting"}),
     },
+    "trigger_object": {
+        "allowed": frozenset({"id", "trigger"}),
+        "required": frozenset({"id", "trigger"}),
+    },
 }
 
 ENGINE_COMPONENT_NAMES = frozenset(
-    {"id", "visual", "scripting", "transform", "components"}
+    {"id", "visual", "scripting", "transform", "trigger", "components"}
 )
 ENGINE_FIELDS = frozenset(
     {"object_type", *ENGINE_COMPONENT_NAMES, "_id", "object_id", "render_id"}
@@ -49,6 +57,7 @@ RESERVED_COMPONENT_PROPERTIES = frozenset({
     "GameObject", "Camera", "Mouse", "Keyboard", "ComponentConfig", "GlobalTime",
     "start", "update", "fixed_update", "stop", "is_pressed",
     "get_mouse_clicks", "find_object", "create_object", "creat_object",
+    "on_trigger_enter", "on_trigger_exit", "dispatch_trigger_event",
 })
 
 
@@ -286,6 +295,9 @@ def validate_object_data(data: dict) -> None:
             raise ValueError("коллайдер transform требует visual для position, rotation и scale")
         validate_convex_polygon(transform["polygon"])
 
+    if "trigger" in data:
+        validate_trigger(data["trigger"])
+
     if "components" in data:
         specs = data["components"]
         if not isinstance(specs, list):
@@ -301,10 +313,13 @@ def validate_object_data(data: dict) -> None:
     if "scripting" in data:
         scripting = data["scripting"]
         scripts = scripting.get("scripts", []) if isinstance(scripting, dict) else None
-        network = scripting.get("network", []) if isinstance(scripting, dict) else None
+        network = scripting.get("network") if isinstance(scripting, dict) else None
         if (not isinstance(scripting, dict)
                 or not isinstance(scripts, list)
                 or any(not isinstance(path, str) or not path for path in scripts)):
             raise ValueError("Компонент 'scripting.scripts' должен быть списком путей")
-        if not isinstance(network, list) or any(not isinstance(item, str) for item in network):
-            raise ValueError("Компонент 'scripting.network' должен быть списком строк")
+        if network is not None:
+            try:
+                parse_network_directives(network)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Компонент 'scripting.network': {error}") from error

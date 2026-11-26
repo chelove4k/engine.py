@@ -666,45 +666,77 @@ class ReconcileTests(unittest.TestCase):
 
 
 class DirectivesTests(unittest.TestCase):
-    def test_empty_keeps_single_player(self):
-        role = parse_network_directives([])
+    def test_default_is_local_object(self):
+        role = parse_network_directives(None)
         self.assertFalse(role.networked)
         self.assertFalse(role.replicated)
+        self.assertFalse(role.owner)
         self.assertFalse(role.takes_input)
-        self.assertEqual(parse_network_directives(None), role)
+        self.assertEqual(role.authority, "local")
+        self.assertEqual(role, parse_network_directives({}))
 
-    def test_owner_implies_replication_and_input(self):
-        role = parse_network_directives(["owner"])
+    def test_replicated_server_object(self):
+        role = parse_network_directives({
+            "authority": "server",
+            "replication": "all",
+        })
+        self.assertTrue(role.networked)
+        self.assertTrue(role.replicated)
+        self.assertFalse(role.owner)
+        self.assertFalse(role.server_only)
+
+    def test_owner_predicts_and_reads_input(self):
+        role = parse_network_directives({
+            "authority": "server",
+            "replication": "all",
+            "prediction": "owner",
+            "input": "owner",
+        })
         self.assertTrue(role.owner)
+        self.assertTrue(role.predict)
         self.assertTrue(role.replicated)
         self.assertTrue(role.takes_input)
         self.assertFalse(role.server_only)
 
     def test_server_only_is_not_replicated(self):
-        role = parse_network_directives(["server", "replicate"])
+        role = parse_network_directives({"authority": "server"})
         self.assertTrue(role.server_only)
         self.assertFalse(role.replicated)
 
-    def test_predict_and_rooms(self):
-        role = parse_network_directives(["predict", "room:arena", "room: lobby "])
-        self.assertTrue(role.predict)
-        self.assertTrue(role.replicated)
-        self.assertEqual(role.rooms, ("arena", "lobby"))
-        self.assertTrue(role.visible_to("arena"))
-        self.assertFalse(role.visible_to("other"))
-        self.assertTrue(parse_network_directives(["replicate"]).visible_to(None))
+    def test_input_owner_gets_owner_slot_without_prediction(self):
+        role = parse_network_directives({
+            "authority": "server",
+            "input": "owner",
+        })
+        self.assertTrue(role.owner)
+        self.assertFalse(role.predict)
+        self.assertTrue(role.takes_input)
+        self.assertFalse(role.replicated)
 
-    def test_unknown_directive_is_kept_for_diagnostics(self):
-        role = parse_network_directives(["replicate", "teleport"])
-        self.assertTrue(role.replicate)
-        self.assertEqual(role.unknown, ("teleport",))
+    def test_invalid_combinations_are_rejected(self):
+        cases = (
+            ({"authority": "local", "replication": "all"}, ValueError),
+            ({"authority": "server", "replication": "none",
+              "prediction": "owner"}, ValueError),
+            ({"authority": "local", "input": "owner"}, ValueError),
+            ({"authority": "client"}, ValueError),
+            ({"teleport": "yes"}, ValueError),
+            ({"authority": 1}, TypeError),
+            (["replicate"], TypeError),
+        )
+        for value, error in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(error):
+                    parse_network_directives(value)
 
     def test_role_from_object(self):
-        data = {"scripting": {"network": ["owner"]}}
-        self.assertTrue(role_from_object(data).owner)
+        data = {
+            "scripting": {
+                "network": {"authority": "server", "replication": "all"}
+            }
+        }
+        self.assertTrue(role_from_object(data).replicated)
         self.assertFalse(role_from_object({}).networked)
-        with self.assertRaises(TypeError):
-            parse_network_directives([1])
 
 
 class InputSourceTests(unittest.TestCase):
@@ -826,6 +858,46 @@ class ServerSimulationTests(unittest.TestCase):
         self.assertIsNone(simulation.owner_of(10))
         self.assertEqual(simulation.owner_of(20), 2)
 
+    def test_take_clicks_returns_each_click_once_with_source(self):
+        simulation = self.make_simulation()
+        simulation.join(1, 10)
+        simulation.join(2, 20)
+        simulation.push(
+            1,
+            protocol.encode_input_message(
+                protocol.make_input_frame(
+                    0, 0, set(),
+                    mouse_x=4.0, mouse_y=5.0,
+                    clicks=((77, 1), (78, 4)),
+                )
+            ),
+        )
+        simulation.push(
+            2,
+            protocol.encode_input_message(
+                protocol.make_input_frame(0, 0, set(), clicks=((79, 1),))
+            ),
+        )
+        simulation.begin_tick(1)
+
+        clicks = simulation.take_clicks()
+
+        self.assertEqual(
+            [
+                (client_id, render_id, button)
+                for client_id, _snapshot, render_id, button in clicks
+            ],
+            [(1, 77, 1), (1, 78, 4), (2, 79, 1)],
+        )
+        first_snapshot = clicks[0][1]
+        self.assertEqual(
+            (first_snapshot.mouse_x, first_snapshot.mouse_y), (4.0, 5.0)
+        )
+
+        # Клик — событие: повтор кадра на следующем тике его не воспроизводит.
+        simulation.begin_tick(2)
+        self.assertEqual(simulation.take_clicks(), [])
+
     def test_stats_are_aggregated(self):
         simulation = self.make_simulation()
         simulation.join(1, 10)
@@ -943,6 +1015,61 @@ class EngineWorldTests(unittest.TestCase):
         world = self.make_world()
         world.set_replicated([20])
         self.assertEqual(set(world.snapshot_state().objects), {20})
+
+    def test_poll_network_events_adds_replicated_objects(self):
+        events = queue.SimpleQueue()
+        world = self.make_world(network_events=events)
+        events.put({
+            "render_id": 20,
+            "network": {"authority": "server", "replication": "all"},
+            "has_visual": True,
+        })
+        events.put({
+            "render_id": 30, "network": {"authority": "server"},
+            "has_visual": True,
+        })
+        events.put({
+            "render_id": 10,
+            "network": {"authority": "server", "replication": "all"},
+            "has_visual": True,
+        })
+        events.put({
+            "render_id": 40,
+            "network": {"authority": "server", "replication": "all"},
+            "has_visual": False,
+        })
+        events.put({
+            "render_id": 0,
+            "network": {"authority": "server", "replication": "all"},
+            "has_visual": True,
+        })
+        events.put("not a dict")
+
+        self.assertEqual(world.poll_network_events(), 1)
+        self.assertEqual(world.replicated_ids, {10, 20})
+        self.assertEqual(set(world.snapshot_state().objects), {10, 20})
+
+        # Повторные события не считаются новыми объектами.
+        events.put({
+            "render_id": 20,
+            "network": {"authority": "server", "replication": "all"},
+            "has_visual": True,
+        })
+        self.assertEqual(world.poll_network_events(), 0)
+
+    def test_poll_network_events_removes_deleted_objects(self):
+        events = queue.SimpleQueue()
+        world = self.make_world(network_events=events)
+        events.put({"render_id": 10, "removed": True})
+        events.put({"render_id": 999, "removed": True})
+
+        self.assertEqual(world.poll_network_events(), 1)
+        self.assertEqual(world.replicated_ids, set())
+        self.assertEqual(world.snapshot_state().objects, {})
+
+    def test_poll_network_events_without_queue_is_noop(self):
+        world = self.make_world()
+        self.assertEqual(world.poll_network_events(), 0)
 
 
 class _TestWorld:
